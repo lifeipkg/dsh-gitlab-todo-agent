@@ -51,7 +51,7 @@ Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再�
 ## 新会话配置
 
 - **新开会话的工作区文件夹**：须为 DSH 已注册的工作区路径（经 `workspaceRegistry` 解析为 `workspaceId` 传给 `session/create`）；未命中会显式报错，留空使用最近使用的工作区，绝不落回 Host 进程目录。它与 **GitLab 工作目录** 相互独立。
-- **新开会话使用的模型**：直接遍历 Host 模型目录返回的全部模型分组；创建 Session 后依次执行 `session/rename`（以 Todo 标题命名）与 `selectModel({ provider, model })`，再提交提示词。选择具体模型（包括“固定当前默认模型”）会固定该路由，不随 DSH 默认模型变化。
+- **新开会话使用的模型**：直接遍历 Host 模型目录返回的全部模型分组；创建 Session 后依次执行 `session/rename`（标题形如 `[协助]-issue-7-note-10`，按目标类型 issue/workitem/mr/epic 与 note ID 命名，非标准链接退回 URL 最后两段）与 `selectModel({ provider, model })`，再提交提示词。选择具体模型（包括“固定当前默认模型”）会固定该路由，不随 DSH 默认模型变化。
 - 设置保存在 `state.json`，不修改已接受的历史 Session。工作区只在创建时确定；pending Session 重试会复用原工作区，但会重新应用当前模型配置。
 
 ## 存储与升级

@@ -156,6 +156,37 @@ export function classifyTodo(todo, currentUserId) {
   return 'other';
 }
 
+const TARGET_PATH_PATTERNS = [
+  [/\/-\/issues\/(\d+)/, 'issue'],
+  [/\/-\/work_items\/(\d+)/, 'workitem'],
+  [/\/-\/merge_requests\/(\d+)/, 'mr'],
+  [/\/-\/epics\/(\d+)/, 'epic'],
+];
+
+/**
+ * 新会话标题：[协助]-<类型短名>-<目标ID>[-note-<noteID>]。
+ * 解析不出类型时退回 URL 路径最后两段，再退回 todo id，
+ * 保证标题永远非空且尽量可定位回源对象。
+ */
+export function buildSessionTitle(todo) {
+  const url = String(todo?.url ?? '');
+  const noteId = String(todo?.noteId ?? '');
+  for (const [pattern, label] of TARGET_PATH_PATTERNS) {
+    const match = url.match(pattern);
+    if (match) {
+      return `[协助]-${label}-${match[1]}${noteId ? `-note-${noteId}` : ''}`;
+    }
+  }
+  if (url) {
+    try {
+      const segments = new URL(url).pathname.split('/').filter(Boolean);
+      const tail = segments.slice(-2).join('-');
+      if (tail) return `[协助]-${tail}${noteId ? `-note-${noteId}` : ''}`;
+    } catch {}
+  }
+  return `[协助]-todo-${todo?.id ?? 'unknown'}`;
+}
+
 export function buildTodoPrompt(todo) {
   const details = JSON.stringify({
     todoId: todo.id,

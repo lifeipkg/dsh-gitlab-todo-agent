@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
+  buildSessionTitle,
   buildTodoPrompt,
   classifyTodo,
   defaultSettings,
@@ -131,6 +132,19 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   assert.match(prompt, /只有实际完成/);
   assert.match(prompt, /#note_10/);
   assert.match(prompt, /other-user/);
+});
+
+test('session titles identify the target type, id and note', () => {
+  const title = (url, extra = {}) => buildSessionTitle(normalizeTodos([{ ...sessionTodo, ...extra, target_url: url }])[0]);
+  assert.equal(title('https://gitlab.local/g/p/-/issues/7#note_10'), '[协助]-issue-7-note-10');
+  assert.equal(title('https://gitlab.local/g/p/-/issues/7'), '[协助]-issue-7');
+  assert.equal(title('https://gitlab.local/g/p/-/work_items/186#note_136301'), '[协助]-workitem-186-note-136301');
+  assert.equal(title('https://gitlab.local/g/p/-/merge_requests/1002#note_132985'), '[协助]-mr-1002-note-132985');
+  assert.equal(title('https://gitlab.local/g/p/-/epics/12'), '[协助]-epic-12');
+  // 非标准路径：退回 URL 最后两段。
+  assert.equal(title('https://gitlab.local/g/p/snippets/99'), '[协助]-snippets-99');
+  // 无 URL：退回 todo id。
+  assert.equal(title('', { target: {} }), `[协助]-todo-${sessionTodo.id}`);
 });
 
 test('state normalization and public projection retain accepted session links', () => {
@@ -333,7 +347,7 @@ test('dispatch resolves workspaceId and applies the fixed model before prompting
   assert.equal(result.ok, true);
   assert.deepEqual(calls.createRequests, [{ workspaceId: 'workspace-work' }]);
   assert.deepEqual(calls.modelSelections, [{ sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-chat' }]);
-  assert.deepEqual(calls.renames, [{ sessionId: 'session-1', title: todo.title }]);
+  assert.deepEqual(calls.renames, [{ sessionId: 'session-1', title: '[协助]-issue-7' }]);
   const methods = calls.invocations.map((call) => call.method);
   assert.ok(methods.indexOf('create') < methods.indexOf('selectModel'));
   assert.ok(methods.indexOf('selectModel') < methods.indexOf('prompt'));

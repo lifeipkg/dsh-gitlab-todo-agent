@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DshHostClient } from './dsh-host.js';
 import {
+  buildSessionTitle,
   buildTodoPrompt,
   classifyTodo,
   initialState,
@@ -606,7 +607,7 @@ export class GitlabTodoRuntime {
           item: todo,
         };
         await this.persistQuietly('pending Session');
-        await this.host.renameSession(sessionId, todo.title);
+        await this.host.renameSession(sessionId, buildSessionTitle(todo));
       }
       if (reserved) {
         this.releaseReservation();
