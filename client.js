@@ -96,8 +96,17 @@ window.__ModuleLoader__.load({
       return todo.handled ? t('dispatched') : t('waiting');
     }
 
+    /**
+     * 模型选项的 value 编码：JSON.stringify({provider, model})。
+     * 必须与 sessionModel 设置的对象形状一一对应（onChange 直接 JSON.parse 回对象），
+     * 不可用数组形式，否则解析结果缺少 provider/model 字段。
+     */
     function sessionModelKey(selection) {
-      return selection ? JSON.stringify([selection.provider, selection.model]) : '';
+      if (!selection) return '';
+      return JSON.stringify({
+        provider: typeof selection.provider === 'string' ? selection.provider : '',
+        model: typeof selection.model === 'string' ? selection.model : '',
+      });
     }
 
     function PanelIcon({ size = 20 }) {
@@ -209,7 +218,9 @@ window.__ModuleLoader__.load({
       const availableModelKeys = new Set(modelGroups.flatMap((group) => group.models.map((model) => sessionModelKey({ provider: group.id ?? group.provider, model: model.id }))));
       const pinnedDefaultKey = sessionModelKey(modelCatalog?.default);
       const modelOptions = (selection) => {
-        const selectedKey = sessionModelKey(selection);
+        const hasFields = typeof selection?.provider === 'string' && selection.provider
+          && typeof selection?.model === 'string' && selection.model;
+        const selectedKey = hasFields ? sessionModelKey(selection) : '';
         return [
           h('option', { value: '' }, `${t('sessionModelDefault')}${modelCatalog?.default ? ` (${modelCatalog.default.model})` : ''}`),
           pinnedDefaultKey && !availableModelKeys.has(pinnedDefaultKey) && h('option', { value: pinnedDefaultKey }, `${t('sessionModelPinDefault')} (${modelCatalog.default.model} · ${modelCatalog.default.provider})`),
