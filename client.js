@@ -1,0 +1,361 @@
+window.__ModuleLoader__.load({
+  id: '@local/dsh-gitlab-todo-agent',
+  factory(require) {
+    const React = require('react');
+    const h = React.createElement;
+    const NS = 'gitlab-todo-agent';
+    const PANEL_ID = 'gitlab-todos';
+    const BRIDGE_PATH = '/api/gitlab-todo-agent';
+    const en = {
+      panel: 'GitLab Todo', title: 'GitLab Todo Watcher',
+      subtitle: 'Read GitLab todos directly and open sessions for direct mentions in comments from other users.',
+      enable: 'Enable polling', disable: 'Disable polling', checkNow: 'Check now', checking: 'Checking…',
+      settings: 'Settings', save: 'Save settings', cancel: 'Cancel', close: 'Close',
+      enabled: 'Enabled', disabled: 'Disabled', running: 'Running', idle: 'Idle',
+      activeSessions: 'Auto sessions running', queuedSessions: 'Queued for dispatch',
+      pending: 'Pending', handled: 'Handled', lastSuccess: 'Last successful poll', never: 'Never',
+      mrDone: 'MR marked done without processing', markDone: 'Mark done',
+      newFound: 'Unaccepted todos in the latest output',
+      todoList: 'Todo list', noTodos: 'No todos. Run a check to refresh.',
+      directMention: 'Comment @ me',
+      process: 'Open session', reprocess: 'Process again', dispatched: 'Accepted', waiting: 'Waiting',
+      openSession: 'Open session',
+      interval: 'Poll interval (seconds)', limit: 'Maximum new sessions per poll', concurrency: 'Automatic dispatch concurrency',
+      cwd: 'GitLab working directory', cwdHint: 'Leave empty to use the Host process directory.',
+      sessionCwd: 'New session workspace folder', sessionCwdHint: 'Example: D:\\agent-workspace. Leave empty for the DSH default workspace.',
+      sessionModel: 'New session model', sessionModelDefault: 'Use the DSH default model',
+      sessionModelUnavailable: 'Currently configured model (not in the available catalog)',
+      modelCatalogError: 'Could not load the available model catalog',
+      autoProcess: 'Automatically open sessions only for direct comment mentions from other users',
+      loading: 'Loading GitLab Todo panel…', renderError: 'The panel failed to render', retry: 'Retry rendering',
+      localError: 'Action failed',
+      defaultPaused: 'Polling starts paused so installation never dispatches your real todos automatically.',
+    };
+    const zh = {
+      panel: 'GitLab Todo', title: 'GitLab Todo 轮询助手',
+      subtitle: '直接读取 GitLab Todo，仅自动处理他人在评论中直接 @ 你的事项。',
+      enable: '启用轮询', disable: '停用轮询', checkNow: '立即检查', checking: '检查中…',
+      settings: '设置', save: '保存设置', cancel: '取消', close: '关闭',
+      enabled: '已启用', disabled: '已停用', running: '运行中', idle: '空闲',
+      activeSessions: '自动会话运行中', queuedSessions: '排队待分派',
+      pending: '待处理', handled: '已处理', lastSuccess: '最近成功轮询', never: '从未',
+      mrDone: 'MR 已直接标记完成', markDone: '标记完成',
+      newFound: '最近一次结果中尚未接受的 Todo',
+      todoList: 'Todo 列表', noTodos: '当前没有 Todo，可点击“立即检查”刷新。',
+      directMention: '评论中 @ 我',
+      process: '开 Session 处理', reprocess: '重新处理', dispatched: '已接受', waiting: '待处理',
+      openSession: '打开 Session',
+      interval: '轮询间隔（秒）', limit: '每轮最多创建 Session 数', concurrency: '自动处理并发数',
+      cwd: 'GitLab 工作目录', cwdHint: '留空使用 Host 进程目录。',
+      sessionCwd: '新开会话的工作区文件夹', sessionCwdHint: '例如 D:\\agent-workspace；留空使用 DSH 默认工作区。',
+      sessionModel: '新开会话使用的模型', sessionModelDefault: '跟随 DSH 默认模型',
+      sessionModelUnavailable: '当前配置模型（不在可用目录中）',
+      modelCatalogError: '无法加载可用模型目录',
+      autoProcess: '仅为其他用户在评论中直接 @ 我的 Todo 自动创建 Session',
+      loading: '正在加载 GitLab Todo 面板…', renderError: '面板渲染失败', retry: '重新渲染',
+      localError: '操作失败',
+      defaultPaused: '插件默认停用，避免安装后立即处理真实 Todo。',
+    };
+
+    async function bridge(action, options = {}) {
+      const method = options.method ?? (action === 'state' ? 'GET' : 'POST');
+      const headers = { Accept: 'application/json' };
+      if (method === 'POST') headers['Content-Type'] = 'application/json';
+      const query = method === 'GET' ? `?action=${encodeURIComponent(action)}` : '';
+      const response = await fetch(`${BRIDGE_PATH}${query}`, {
+        method,
+        headers,
+        body: method === 'POST' ? JSON.stringify({ action, ...(options.payload ?? {}) }) : undefined,
+      });
+      const data = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
+      if (!response.ok || data.ok === false) throw new Error(data.error ?? `HTTP ${response.status}`);
+      return data;
+    }
+
+    const getState = async () => (await bridge('state')).state;
+    const post = (action, payload) => bridge(action, { payload });
+
+    function formatTime(value, fallback) {
+      return value ? new Date(value).toLocaleString() : fallback;
+    }
+
+    function isMergeRequest(todo) {
+      return String(todo.targetType ?? '').toLowerCase().replace(/[^a-z]/g, '') === 'mergerequest'
+        || /\/-\/merge_requests(?:\/|$)/i.test(todo.url ?? '');
+    }
+
+    function sessionModelKey(selection) {
+      return selection ? JSON.stringify([selection.provider, selection.model]) : '';
+    }
+
+    function PanelIcon({ size = 20 }) {
+      return h('svg', {
+        width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
+        stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round',
+        'aria-hidden': true,
+      },
+        h('rect', { x: 4, y: 3, width: 16, height: 18, rx: 3 }),
+        h('path', { d: 'm8 8 1.5 1.5L12 6M8 13l1.5 1.5L12 11M14 8h3M14 13h3M9 18a4 4 0 0 0 6-3M15 12v3h-3' }),
+      );
+    }
+
+    function Button(props) {
+      return h('button', {
+        type: 'button',
+        className: `gta-button ${props.primary ? 'gta-primary' : ''}`,
+        disabled: props.disabled,
+        onClick: props.onClick,
+        title: props.title,
+      }, props.children);
+    }
+
+    class PanelBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { error: null };
+      }
+      static getDerivedStateFromError(error) {
+        return { error };
+      }
+      componentDidCatch(error, info) {
+        console.error('[gitlab-todo-agent] panel render failed', error, info);
+      }
+      render() {
+        if (!this.state.error) return this.props.children;
+        const t = this.props.t;
+        return h('div', { className: 'gta-root' },
+          h('style', { children: CSS }),
+          h('div', { className: 'gta-fatal', role: 'alert' },
+            h('h1', null, t('renderError')),
+            h('p', null, this.state.error.message ?? String(this.state.error)),
+            h(Button, { onClick: () => this.setState({ error: null }) }, t('retry')),
+          ),
+        );
+      }
+    }
+
+    function TodoPanel({ ctx, t }) {
+      const [snapshot, setSnapshot] = React.useState(null);
+      const [busy, setBusy] = React.useState('');
+      const [error, setError] = React.useState(null);
+      const [draft, setDraft] = React.useState(null);
+      const [modelCatalog, setModelCatalog] = React.useState(null);
+      const [modelCatalogError, setModelCatalogError] = React.useState(null);
+
+      React.useEffect(() => {
+        let disposed = false;
+        bridge('models').then((data) => {
+          if (!disposed) setModelCatalog(data.catalog);
+        }).catch((cause) => {
+          if (!disposed) setModelCatalogError(cause.message);
+        });
+        return () => { disposed = true; };
+      }, []);
+
+      React.useEffect(() => {
+        let disposed = false;
+        const load = async () => {
+          try {
+            const next = await getState();
+            if (!disposed) setSnapshot(next);
+          } catch (cause) {
+            if (!disposed) setError(cause.message);
+          }
+        };
+        void load();
+        const timer = setInterval(load, 3000);
+        return () => {
+          disposed = true;
+          clearInterval(timer);
+        };
+      }, []);
+
+      const perform = async (key, operation) => {
+        if (busy) return false;
+        setBusy(key);
+        setError(null);
+        try {
+          const data = await operation();
+          if (data.state) setSnapshot(data.state);
+          if (data.result && data.result.ok === false) throw new Error(data.result.error);
+          return true;
+        } catch (cause) {
+          setError(cause.message);
+          return false;
+        } finally {
+          setBusy('');
+        }
+      };
+
+      const updateSettings = (settings) => perform('settings', () => post('updateSettings', { settings }));
+      const saveGeneralSettings = () => updateSettings(draft);
+      const openSession = (sessionId) => ctx.uiWorkspace.openSession(sessionId);
+      const settings = snapshot?.settings;
+      const modelGroups = (modelCatalog?.groups ?? []).filter((group) => modelCatalog.routableProviders.includes(group.id));
+      const availableModelKeys = new Set(modelGroups.flatMap((group) => group.models.map((model) => sessionModelKey({ provider: group.id, model: model.id }))));
+      const modelOptions = (selection) => {
+        const selectedKey = sessionModelKey(selection);
+        return [
+          h('option', { value: '' }, `${t('sessionModelDefault')}${modelCatalog?.default ? ` (${modelCatalog.default.model})` : ''}`),
+          selectedKey && !availableModelKeys.has(selectedKey) && h('option', { value: selectedKey }, `${t('sessionModelUnavailable')}: ${selection.provider}/${selection.model}`),
+          modelGroups.map((group) => h('optgroup', { key: group.id, label: group.name }, group.models.map((model) =>
+            h('option', { key: model.id, value: sessionModelKey({ provider: group.id, model: model.id }) }, `${model.name} · ${model.id}`),
+          ))),
+        ];
+      };
+      const quickModelKey = sessionModelKey(settings?.sessionModel);
+
+      return h('div', { className: 'gta-root' },
+        h('style', { children: CSS }),
+        h('header', { className: 'gta-header' },
+          h('div', { className: 'gta-heading' },
+            h('div', { className: 'gta-title-row' },
+              h('span', { className: 'gta-title-icon' }, h(PanelIcon, { size: 24 })),
+              h('h1', null, t('title')),
+            ),
+            h('p', null, t('subtitle')),
+          ),
+          h('div', { className: 'gta-actions' },
+            h('label', { className: 'gta-model-quick', title: t('sessionModel') },
+              h('span', null, t('sessionModel')),
+              h('select', {
+                value: quickModelKey,
+                disabled: !snapshot || Boolean(busy) || !modelCatalog,
+                'aria-label': t('sessionModel'),
+                onChange: (event) => updateSettings({ sessionModel: event.target.value ? JSON.parse(event.target.value) : null }),
+              }, modelOptions(settings?.sessionModel)),
+            ),
+            h(Button, {
+              primary: !settings?.enabled,
+              disabled: Boolean(busy) || !snapshot,
+              onClick: () => updateSettings({ enabled: !settings.enabled }),
+            }, settings?.enabled ? t('disable') : t('enable')),
+            h(Button, {
+              disabled: Boolean(busy) || !snapshot,
+              onClick: () => perform('poll', () => post('poll')),
+            }, busy === 'poll' ? t('checking') : t('checkNow')),
+            h(Button, {
+              disabled: !snapshot,
+              onClick: () => setDraft(draft ? null : { ...settings }),
+            }, draft ? t('close') : t('settings')),
+          ),
+        ),
+        h('p', { className: 'gta-muted gta-paused' }, t('defaultPaused')),
+        !snapshot && !error && h('div', { className: 'gta-empty' }, t('loading')),
+        error && h('div', { className: 'gta-banner gta-error', role: 'alert' }, `${t('localError')}：${error}`),
+        snapshot?.lastPollError && h('div', { className: 'gta-banner gta-error', role: 'alert' }, snapshot.lastPollError),
+        snapshot?.lastDispatchError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, snapshot.lastDispatchError),
+        draft && h('section', { className: 'gta-card gta-settings' },
+          h('h2', null, t('settings')),
+          h('div', { className: 'gta-form-grid' },
+            h('label', null, t('interval'), h('input', {
+              type: 'number', min: 30, max: 86400, value: draft.intervalSeconds,
+              onChange: (event) => setDraft({ ...draft, intervalSeconds: Number(event.target.value) }),
+            })),
+            h('label', null, t('limit'), h('input', {
+              type: 'number', min: 1, max: 10, value: draft.maxSessionsPerPoll,
+              onChange: (event) => setDraft({ ...draft, maxSessionsPerPoll: Number(event.target.value) }),
+            })),
+            h('label', null, t('concurrency'), h('input', {
+              type: 'number', min: 1, max: 10, value: draft.maxConcurrentSessions,
+              onChange: (event) => setDraft({ ...draft, maxConcurrentSessions: Number(event.target.value) }),
+            })),
+            h('label', null, t('sessionModel'), h('select', {
+              value: sessionModelKey(draft.sessionModel),
+              onChange: (event) => setDraft({
+                ...draft,
+                sessionModel: event.target.value ? JSON.parse(event.target.value) : null,
+              }),
+            }, modelOptions(draft.sessionModel))),
+            h('label', { className: 'gta-wide' }, t('sessionCwd'), h('input', {
+              type: 'text', value: draft.sessionCwd, placeholder: t('sessionCwdHint'),
+              onChange: (event) => setDraft({ ...draft, sessionCwd: event.target.value }),
+            })),
+            h('label', { className: 'gta-wide' }, t('cwd'), h('input', {
+              type: 'text', value: draft.cwd, placeholder: t('cwdHint'),
+              onChange: (event) => setDraft({ ...draft, cwd: event.target.value }),
+            })),
+          ),
+          modelCatalogError && h('p', { className: 'gta-muted', role: 'status' }, `${t('modelCatalogError')}：${modelCatalogError}`),
+          h('label', { className: 'gta-check' }, h('input', {
+            type: 'checkbox', checked: draft.autoProcess,
+            onChange: (event) => setDraft({ ...draft, autoProcess: event.target.checked }),
+          }), t('autoProcess')),
+          h('div', { className: 'gta-form-actions' },
+            h(Button, { primary: true, disabled: Boolean(busy), onClick: () => saveGeneralSettings().then((saved) => { if (saved) setDraft(null); }) }, t('save')),
+            h(Button, { disabled: Boolean(busy), onClick: () => setDraft(null) }, t('cancel')),
+          ),
+        ),
+        snapshot && h('section', { className: 'gta-stats' },
+          h('div', { className: 'gta-stat' }, h('span', null, t('enabled')), h('strong', { className: snapshot.settings.enabled ? 'gta-success' : 'gta-muted' }, snapshot.settings.enabled ? t('enabled') : t('disabled'))),
+          h('div', { className: 'gta-stat' }, h('span', null, t('running')), h('strong', null, snapshot.running ? t('running') : t('idle'))),
+          h('div', { className: 'gta-stat' }, h('span', null, t('pending')), h('strong', null, snapshot.pendingCount)),
+          h('div', { className: 'gta-stat' }, h('span', null, t('handled')), h('strong', null, snapshot.handledCount)),
+          h('div', { className: 'gta-stat' }, h('span', null, t('activeSessions')), h('strong', { className: snapshot.activeSessions > 0 ? 'gta-success' : '' }, `${snapshot.activeSessions ?? 0}/${snapshot.settings.maxConcurrentSessions}`)),
+          h('div', { className: 'gta-stat' }, h('span', null, t('queuedSessions')), h('strong', null, snapshot.queuedSessions ?? 0)),
+          h('div', { className: 'gta-stat gta-stat-time' }, h('span', null, t('lastSuccess')), h('strong', null, formatTime(snapshot.lastSuccessAt, t('never')))),
+        ),
+        snapshot && h('section', { className: 'gta-section' },
+          h('div', { className: 'gta-section-title' }, h('h2', null, t('todoList')), h('span', { className: 'gta-muted' }, `${t('newFound')}：${snapshot.lastNewCount}`)),
+          snapshot.todos.length === 0
+            ? h('div', { className: 'gta-empty' }, t('noTodos'))
+            : h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('todoList') }, snapshot.todos.map((todo) =>
+                h('article', { className: 'gta-todo', key: todo.id },
+                  h('div', { className: 'gta-todo-main' },
+                    h('div', { className: 'gta-todo-title' },
+                      todo.url
+                        ? h('a', { href: todo.url, target: '_blank', rel: 'noreferrer' }, todo.title)
+                        : h('span', null, todo.title),
+                      todo.directMention && h('span', { className: 'gta-tag gta-tag-mention' }, t('directMention')),
+                      h('span', { className: `gta-tag ${todo.handled ? 'gta-tag-success' : ''}` }, todo.handled ? (todo.outcome === 'merge-request-done' ? t('mrDone') : t('dispatched')) : t('waiting')),
+                    ),
+                    h('div', { className: 'gta-muted gta-meta' }, [`#${todo.id}`, todo.project, todo.targetType, todo.action, todo.author && `@${todo.author}`].filter(Boolean).join(' · ')),
+                  ),
+                  h('div', { className: 'gta-todo-actions' },
+                    todo.sessionId && h(Button, { onClick: () => openSession(todo.sessionId) }, t('openSession')),
+                    (!todo.handled || todo.outcome !== 'merge-request-done') && h(Button, {
+                      primary: !todo.handled,
+                      disabled: Boolean(busy),
+                      onClick: () => perform(`dispatch:${todo.id}`, () => post('dispatch', { id: todo.id })),
+                    }, busy === `dispatch:${todo.id}` ? '…' : todo.handled ? t('reprocess') : isMergeRequest(todo) && !todo.directMention ? t('markDone') : t('process')),
+                  ),
+                ),
+              )),
+        ),
+      );
+    }
+
+    const CSS = `
+      .gta-root{box-sizing:border-box;width:100%;min-width:0;height:100%;min-height:320px;overflow:auto;padding:28px 32px 48px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:14px;line-height:1.55}
+      .gta-root *{box-sizing:border-box}.gta-root h1{font-size:24px;line-height:1.25;margin:0;font-weight:650}.gta-root h2{font-size:16px;margin:0 0 12px;font-weight:600}.gta-root p{margin:6px 0 0}
+      .gta-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;max-width:1180px;margin:0 auto}.gta-title-row{display:flex;align-items:center;gap:12px}.gta-title-icon{color:var(--dsw-alias-brand-primary);display:flex}.gta-heading p{color:var(--dsw-alias-label-secondary)}
+      .gta-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.gta-model-quick{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary)}.gta-model-quick select{width:auto;min-width:200px;max-width:280px}.gta-button{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer;white-space:nowrap}.gta-button:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-brand-primary)}.gta-button:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}.gta-button:disabled{opacity:.45;cursor:default}.gta-primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
+      .gta-paused{max-width:1180px;margin:10px auto 18px!important}.gta-muted{color:var(--dsw-alias-label-secondary);font-size:12px}.gta-success{color:var(--dsw-alias-state-success-primary)}
+      .gta-banner{max-width:1180px;margin:10px auto;padding:10px 12px;border-radius:8px;border:1px solid var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-1)}.gta-warn{border-color:var(--dsw-alias-state-warn-primary)}
+      .gta-card,.gta-stats,.gta-section{max-width:1180px;margin:16px auto}.gta-card{border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);padding:18px}.gta-form-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.gta-form-grid label{display:flex;flex-direction:column;gap:6px;color:var(--dsw-alias-label-secondary);font-size:12px}.gta-wide{grid-column:1/-1}
+      .gta-root input[type=text],.gta-root input[type=number],.gta-root select{width:100%;border:1px solid var(--dsw-alias-border-l2);border-radius:7px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;padding:8px 10px}.gta-check{display:flex;align-items:center;gap:8px;margin:16px 0 0}.gta-form-actions{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap}
+      .gta-stats{display:grid;grid-template-columns:repeat(4,minmax(100px,1fr));gap:10px}.gta-stat{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);padding:12px 14px;display:flex;flex-direction:column;gap:4px}.gta-stat>span{color:var(--dsw-alias-label-secondary);font-size:12px}.gta-stat>strong{font-size:18px}.gta-stat-time{grid-column:span 2}.gta-stat-time>strong{font-size:13px}
+      .gta-section-title{display:flex;align-items:baseline;justify-content:space-between;gap:16px}.gta-list{display:flex;flex-direction:column;gap:8px}.gta-scroll-list{max-height:min(52vh,480px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-gutter:stable;padding:2px 6px 2px 2px}.gta-scroll-list::-webkit-scrollbar{width:8px}.gta-scroll-list::-webkit-scrollbar-track{background:transparent}.gta-scroll-list::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l2);border-radius:4px}.gta-scroll-list::-webkit-scrollbar-thumb:hover{background:var(--dsw-alias-label-tertiary,var(--dsw-alias-border-l2))}.gta-todo{display:flex;align-items:center;gap:16px;padding:14px 16px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}.gta-todo-main{min-width:0;flex:1}.gta-todo-title{display:flex;align-items:center;gap:10px;font-weight:550}.gta-todo-title>a{color:var(--dsw-alias-label-primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-todo-title>a:hover{color:var(--dsw-alias-brand-primary);text-decoration:underline}.gta-tag{flex:none;font-size:11px;padding:1px 7px;border-radius:10px;color:var(--dsw-alias-state-warn-primary);border:1px solid var(--dsw-alias-state-warn-primary)}.gta-tag-success{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}.gta-tag-mention{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}.gta-meta{margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-todo-actions{display:flex;gap:8px;flex:none}
+      .gta-empty{padding:24px;border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;text-align:center;color:var(--dsw-alias-label-secondary)}.gta-fatal{max-width:720px;margin:48px auto;padding:24px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}.gta-fatal p{white-space:pre-wrap;word-break:break-word;margin:12px 0 20px;color:var(--dsw-alias-state-error-primary)}
+      @media(max-width:900px){.gta-root{padding:20px 18px 36px}.gta-header{flex-direction:column}.gta-actions{justify-content:flex-start}.gta-form-grid{grid-template-columns:1fr}.gta-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.gta-scroll-list{max-height:min(60vh,420px)}.gta-todo{align-items:flex-start;flex-direction:column}.gta-todo-actions{width:100%;justify-content:flex-end}}
+    `;
+
+    return {
+      inject: ['slots', 'locale', 'uiWorkspace'],
+      apply(ctx) {
+        ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'gitlab-todo-agent: locale');
+        const t = ctx.locale.bind(NS);
+        function MainPanel() {
+          return h(PanelBoundary, { t }, h(TodoPanel, { ctx, t }));
+        }
+        ctx.slots.inject('main', () => ctx.slots.register({
+          name: 'main', key: PANEL_ID, locale: NS,
+        }, MainPanel));
+        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+          name: 'sidebar.panellist', id: PANEL_ID, order: 20, locale: NS,
+          label: () => t('panel'),
+        }, PanelIcon));
+      },
+    };
+  },
+});

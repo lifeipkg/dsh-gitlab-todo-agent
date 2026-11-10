@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GitLab Todo Watcher",
+    "description": "Reads GitLab todos directly and opens DSH sessions for direct comment mentions from other users."
+  }
+}

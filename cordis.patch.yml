@@ -1,0 +1,6 @@
+- insert:
+    - id: gitlab-todo-agent
+      name: '@local/dsh-gitlab-todo-agent'
+      config:
+        requestTimeoutMs: 90000
+        maxOutputBytes: 2097152

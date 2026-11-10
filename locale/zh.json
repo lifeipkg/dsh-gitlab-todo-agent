@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GitLab Todo 轮询助手",
+    "description": "直接读取 GitLab Todo，并为他人在评论中直接提及你的事项创建 DSH 会话。"
+  }
+}
