@@ -147,6 +147,25 @@ test('session titles identify the target type, id and note', () => {
   assert.equal(title('', { target: {} }), `[协助]-todo-${sessionTodo.id}`);
 });
 
+test('session projection lists dispatched sessions with status', () => {
+  const base = initialState();
+  base.handled.a = {
+    id: 'a', sessionId: 'session-a', acceptedAt: 20, sessionTitle: '[协助]-issue-1-note-2',
+    executionStatus: 'completed', automatic: true, title: 'A', url: 'https://gitlab.local/a', project: 'g/p',
+  };
+  base.handled.b = { id: 'b', sessionId: 'session-b', acceptedAt: 30, executionStatus: 'running', automatic: false, title: 'B', url: '', project: '' };
+  base.handled.mr = { id: 'mr', sessionId: null, outcome: 'merge-request-done', acceptedAt: 40, title: 'MR', url: '', project: '' };
+  base.pending.c = { sessionId: 'session-c', createdAt: 25, automatic: true, item: normalizeTodos([{ ...sessionTodo, id: 'c' }])[0] };
+  const view = publicState(base, false, '106');
+  assert.deepEqual(view.sessions.map((record) => [record.sessionId, record.executionStatus]), [
+    ['session-b', 'running'],
+    ['session-c', 'starting'],
+    ['session-a', 'completed'],
+  ]);
+  assert.equal(view.sessions[2].sessionTitle, '[协助]-issue-1-note-2');
+  assert.equal(view.sessions.some((record) => record.sessionId === null), false);
+});
+
 test('state normalization and public projection retain accepted session links', () => {
   const base = initialState();
   base.handled.a = { id: 'a', sessionId: 'session-a', acceptedAt: 10, title: 'A', url: '', project: '' };

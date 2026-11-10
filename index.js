@@ -567,6 +567,7 @@ export class GitlabTodoRuntime {
   async executeDispatch(todo, force, options = {}) {
     const trackSlot = Boolean(options.trackSlot);
     let sessionId = force ? null : this.state.pending[todo.id]?.sessionId;
+    let sessionTitle = this.state.handled[todo.id]?.sessionTitle ?? '';
     let reserved = false;
     try {
       if (classifyTodo(todo, this.gitlabUserId) === 'merge-request') {
@@ -590,7 +591,10 @@ export class GitlabTodoRuntime {
         this.reserveSlot();
         reserved = true;
       }
-      if (sessionId) this.trackSession(sessionId, todo.id, Date.now(), trackSlot);
+      if (sessionId) {
+        if (!sessionTitle) sessionTitle = buildSessionTitle(todo);
+        this.trackSession(sessionId, todo.id, Date.now(), trackSlot);
+      }
       if (!sessionId) {
         const request = {
           workspaceId: this.resolveWorkspaceId(),
@@ -607,7 +611,8 @@ export class GitlabTodoRuntime {
           item: todo,
         };
         await this.persistQuietly('pending Session');
-        await this.host.renameSession(sessionId, buildSessionTitle(todo));
+        sessionTitle = buildSessionTitle(todo);
+        await this.host.renameSession(sessionId, sessionTitle);
       }
       if (reserved) {
         this.releaseReservation();
@@ -631,6 +636,7 @@ export class GitlabTodoRuntime {
         outcome: 'session-accepted',
         executionStatus: 'running',
         automatic: trackSlot,
+        sessionTitle,
         acceptedAt: Date.now(),
         title: todo.title,
         url: todo.url,

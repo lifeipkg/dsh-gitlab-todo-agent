@@ -269,6 +269,7 @@ export function normalizeState(value) {
         sessionId,
         outcome,
         acceptedAt: timestamp(record.acceptedAt) ?? Date.now(),
+        sessionTitle: text(record.sessionTitle),
         executionStatus: ['running', 'completed', 'failed'].includes(record.executionStatus) ? record.executionStatus : null,
         automatic: record.automatic !== false,
         completedAt: timestamp(record.completedAt),
@@ -316,6 +317,40 @@ export function normalizeState(value) {
   };
 }
 
+export function sessionProjection(state) {
+  const accepted = Object.values(state.handled)
+    .filter((record) => Boolean(record.sessionId))
+    .map((record) => ({
+      sessionId: record.sessionId,
+      todoId: record.id,
+      title: record.title,
+      sessionTitle: record.sessionTitle,
+      url: record.url,
+      project: record.project,
+      automatic: record.automatic !== false,
+      executionStatus: record.executionStatus ?? 'accepted',
+      acceptedAt: record.acceptedAt,
+      completedAt: record.completedAt ?? null,
+      executionError: record.executionError ?? '',
+    }));
+  const pending = Object.values(state.pending)
+    .filter((record) => Boolean(record.sessionId))
+    .map((record) => ({
+      sessionId: record.sessionId,
+      todoId: record.item.id,
+      title: record.item.title,
+      sessionTitle: '',
+      url: record.item.url,
+      project: record.item.project,
+      automatic: record.automatic !== false,
+      executionStatus: 'starting',
+      acceptedAt: record.createdAt,
+      completedAt: null,
+      executionError: '',
+    }));
+  return [...accepted, ...pending].sort((a, b) => b.acceptedAt - a.acceptedAt).slice(0, 50);
+}
+
 export function publicState(state, running = false, currentUserId = null) {
   return {
     settings: {
@@ -331,6 +366,7 @@ export function publicState(state, running = false, currentUserId = null) {
       executionError: state.handled[todo.id]?.executionError ?? '',
       sessionId: state.handled[todo.id]?.sessionId ?? state.pending[todo.id]?.sessionId ?? null,
     })),
+    sessions: sessionProjection(state),
     recent: state.recent.map((record) => ({ ...record })),
     handledCount: Object.keys(state.handled).length,
     pendingCount: state.todos.filter((todo) => !state.handled[todo.id]).length,
