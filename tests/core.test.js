@@ -3,8 +3,10 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
+  buildJudgePrompt,
   buildSessionTitle,
   buildTodoPrompt,
+  parseJudgeReply,
   classifyTodo,
   defaultSettings,
   initialState,
@@ -164,6 +166,92 @@ test('session projection lists dispatched sessions with status', () => {
   ]);
   assert.equal(view.sessions[2].sessionTitle, '[协助]-issue-1-note-2');
   assert.equal(view.sessions.some((record) => record.sessionId === null), false);
+});
+
+test('judge prompt and reply parsing are conservative', () => {
+  const prompt = buildJudgePrompt(normalizeTodos([directNoteTodo])[0]);
+  assert.match(prompt, /预检器/);
+  assert.match(prompt, /needsProcessing/);
+  assert.match(prompt, /不可信|待判定数据/);
+  assert.deepEqual(parseJudgeReply('{"needsProcessing":false,"reason":"纯感谢"}'), { needsProcessing: false, reason: '纯感谢' });
+  assert.deepEqual(parseJudgeReply('说明 {"needsProcessing":true} 尾巴'), { needsProcessing: true, reason: '' });
+  assert.equal(parseJudgeReply('不是 JSON'), null);
+  assert.equal(parseJudgeReply('{"foo":1}'), null);
+});
+
+function runtimeWithLlmJudge(reply) {
+  const harness = runtimeWithPrompt(async () => ({ accepted: true }));
+  harness.runtime.ctx.llm = {
+    async prepareCall(route) {
+      return {
+        config: route,
+        stream: async function* stream() {
+          yield { text: reply };
+        },
+      };
+    },
+    stream() {
+      throw new Error('should go through prepareCall');
+    },
+  };
+  return harness;
+}
+
+test('precheck marks a todo done without a session when the judge declines', async () => {
+  const { runtime, calls } = runtimeWithLlmJudge('{"needsProcessing":false,"reason":"纯感谢，无需处理"}');
+  let marked = 0;
+  runtime.markTodoDone = async () => { marked += 1; };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 0);
+  assert.equal(calls.prompt, 0);
+  assert.equal(marked, 1);
+  assert.equal(runtime.state.handled.direct.outcome, 'precheck-skipped');
+  assert.equal(runtime.state.handled.direct.skipReason, '纯感谢，无需处理');
+  assert.equal(runtime.occupiedSlots(), 0);
+});
+
+test('precheck opens the session when the judge requires handling or is unavailable', async () => {
+  const required = runtimeWithLlmJudge('{"needsProcessing":true,"reason":"有具体问题"}');
+  required.runtime.state.settings.enabled = true;
+  required.runtime.state.settings.autoProcess = true;
+  required.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await required.runtime.executePoll('test');
+  await required.runtime.pump();
+  assert.equal(required.calls.create, 1);
+  assert.equal(required.runtime.state.handled.direct.outcome, 'session-accepted');
+
+  const broken = runtimeWithLlmJudge('模型输出的不是 JSON');
+  broken.runtime.state.settings.enabled = true;
+  broken.runtime.state.settings.autoProcess = true;
+  broken.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await broken.runtime.executePoll('test');
+  await broken.runtime.pump();
+  assert.equal(broken.calls.create, 1);
+
+  const noLlm = runtimeWithPrompt(async () => ({ accepted: true }));
+  noLlm.runtime.state.settings.enabled = true;
+  noLlm.runtime.state.settings.autoProcess = true;
+  noLlm.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await noLlm.runtime.executePoll('test');
+  await noLlm.runtime.pump();
+  assert.equal(noLlm.calls.create, 1);
+  await Promise.all([required.runtime.stop(), broken.runtime.stop(), noLlm.runtime.stop()]);
+});
+
+test('manual dispatch never runs the precheck', async () => {
+  const { runtime, calls } = runtimeWithLlmJudge('{"needsProcessing":false,"reason":"纯感谢"}');
+  let judged = 0;
+  runtime.judgeNeedsProcessing = async () => { judged += 1; return { needsProcessing: false, reason: '' }; };
+  const [todo] = normalizeTodos([directNoteTodo]);
+  const result = await runtime.dispatch(todo);
+  assert.equal(result.ok, true);
+  assert.equal(judged, 0);
+  assert.equal(calls.create, 1);
+  await runtime.stop();
 });
 
 test('state normalization and public projection retain accepted session links', () => {

@@ -6,12 +6,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DshHostClient } from './dsh-host.js';
 import {
+  buildJudgePrompt,
   buildSessionTitle,
   buildTodoPrompt,
   classifyTodo,
   initialState,
   normalizeState,
   normalizeTodos,
+  parseJudgeReply,
   publicState,
   selectPendingTodos,
   STATE_VERSION,
@@ -193,6 +195,75 @@ export class GitlabTodoRuntime {
     this.resetTimer();
     this.wakeWaiters();
     return this.snapshot();
+  }
+
+  llmRuntime() {
+    let llm = null;
+    if (typeof this.ctx.get === 'function') {
+      try {
+        llm = this.ctx.get('llm') ?? null;
+      } catch {
+        llm = null;
+      }
+    }
+    if (!llm) {
+      try {
+        llm = this.ctx.llm ?? null;
+      } catch {
+        llm = null;
+      }
+    }
+    return llm && typeof llm.stream === 'function' ? llm : null;
+  }
+
+  async judgeModel() {
+    if (this.state.settings.sessionModel) return this.state.settings.sessionModel;
+    if (!this.catalogCache) {
+      try {
+        this.catalogCache = await this.host.modelCatalog();
+      } catch {
+        this.catalogCache = null;
+      }
+    }
+    const fallback = this.catalogCache?.default;
+    return fallback?.provider && fallback?.model ? { provider: fallback.provider, model: fallback.model } : null;
+  }
+
+  /**
+   * 开会话前的轻量预判：不需要处理的提及直接标记 Todo 完成。
+   * 任何失败（无 llm 服务、路由不可用、超时、解析失败）一律保守判定为需要处理。
+   */
+  async judgeNeedsProcessing(todo) {
+    const llm = this.llmRuntime();
+    if (!llm) return { needsProcessing: true, reason: '' };
+    const route = await this.judgeModel();
+    if (!route) return { needsProcessing: true, reason: '' };
+    const timeoutMs = Number.isFinite(this.config.judgeTimeoutMs) ? Math.max(1000, this.config.judgeTimeoutMs) : 30000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    timer.unref?.();
+    try {
+      const messages = [{ role: 'user', content: buildJudgePrompt(todo) }];
+      let stream;
+      if (typeof llm.prepareCall === 'function') {
+        const prepared = await llm.prepareCall(route, controller.signal);
+        stream = prepared.stream({ ...prepared.config, messages, signal: controller.signal });
+      } else {
+        stream = llm.stream({ ...route, messages, signal: controller.signal });
+      }
+      let text = '';
+      for await (const chunk of stream) {
+        const piece = chunk?.text ?? chunk?.delta?.text ?? chunk?.content ?? '';
+        if (typeof piece === 'string') text += piece;
+        if (text.length > 20000) break;
+      }
+      const verdict = parseJudgeReply(text);
+      return verdict ?? { needsProcessing: true, reason: '' };
+    } catch {
+      return { needsProcessing: true, reason: '' };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   concurrencyLimit() {
@@ -586,6 +657,27 @@ export class GitlabTodoRuntime {
         this.state.lastDispatchError = null;
         await this.persistQuietly('MR 直接完成');
         return { ok: true, sessionId: null, duplicate: false, skipped: true };
+      }
+      if (trackSlot && this.state.settings.precheckEnabled) {
+        const verdict = await this.judgeNeedsProcessing(todo);
+        if (!verdict.needsProcessing) {
+          await this.markTodoDone(todo);
+          this.state.handled[todo.id] = {
+            id: todo.id,
+            sessionId: null,
+            outcome: 'precheck-skipped',
+            automatic: trackSlot,
+            acceptedAt: Date.now(),
+            skipReason: verdict.reason,
+            title: todo.title,
+            url: todo.url,
+            project: todo.project,
+          };
+          delete this.state.pending[todo.id];
+          this.state.lastDispatchError = null;
+          await this.persistQuietly('预检跳过');
+          return { ok: true, sessionId: null, duplicate: false, skipped: true, reason: verdict.reason };
+        }
       }
       if (trackSlot) {
         this.reserveSlot();

@@ -22,6 +22,7 @@ window.__ModuleLoader__.load({
       sessionStarting: 'Starting', sessionAccepted: 'Queued',
       process: 'Open session', reprocess: 'Process again', dispatched: 'Accepted', waiting: 'Waiting',
       executionRunning: 'Running', executionCompleted: 'Completed', executionFailed: 'Failed',
+      precheckSkipped: 'Skipped (no handling needed)',
       openSession: 'Open session',
       interval: 'Poll interval (seconds)', limit: 'Maximum new sessions per poll', concurrency: 'Automatic dispatch concurrency',
       cwd: 'GitLab working directory', cwdHint: 'Leave empty to use the Host process directory.',
@@ -31,6 +32,7 @@ window.__ModuleLoader__.load({
       sessionModelUnavailable: 'Currently configured model (not in the available catalog)',
       modelCatalogError: 'Could not load the available model catalog',
       autoProcess: 'Automatically open sessions only for direct comment mentions from other users',
+      precheckEnabled: 'Precheck with one lightweight model call: todos that need no handling are marked done directly',
       loading: 'Loading GitLab Todo panel…', renderError: 'The panel failed to render', retry: 'Retry rendering',
       localError: 'Action failed',
       defaultPaused: 'Polling starts paused so installation never dispatches your real todos automatically.',
@@ -51,6 +53,7 @@ window.__ModuleLoader__.load({
       sessionStarting: '启动中', sessionAccepted: '已入队',
       process: '开 Session 处理', reprocess: '重新处理', dispatched: '已接受', waiting: '待处理',
       executionRunning: '执行中', executionCompleted: '执行完成', executionFailed: '执行失败',
+      precheckSkipped: '已跳过（无需处理）',
       openSession: '打开 Session',
       interval: '轮询间隔（秒）', limit: '每轮最多创建 Session 数', concurrency: '自动处理并发数',
       cwd: 'GitLab 工作目录', cwdHint: '留空使用 Host 进程目录。',
@@ -60,6 +63,7 @@ window.__ModuleLoader__.load({
       sessionModelUnavailable: '当前配置模型（不在可用目录中）',
       modelCatalogError: '无法加载可用模型目录',
       autoProcess: '仅为其他用户在评论中直接 @ 我的 Todo 自动创建 Session',
+      precheckEnabled: '开会话前轻量预判：不需要处理的提及直接标记完成',
       loading: '正在加载 GitLab Todo 面板…', renderError: '面板渲染失败', retry: '重新渲染',
       localError: '操作失败',
       defaultPaused: '插件默认停用，避免安装后立即处理真实 Todo。',
@@ -94,6 +98,7 @@ window.__ModuleLoader__.load({
 
     function todoStatusLabel(todo, t) {
       if (todo.outcome === 'merge-request-done') return t('mrDone');
+      if (todo.outcome === 'precheck-skipped') return t('precheckSkipped');
       if (todo.executionStatus === 'running') return t('executionRunning');
       if (todo.executionStatus === 'completed') return t('executionCompleted');
       if (todo.executionStatus === 'failed') return t('executionFailed');
@@ -314,6 +319,10 @@ window.__ModuleLoader__.load({
             type: 'checkbox', checked: draft.autoProcess,
             onChange: (event) => setDraft({ ...draft, autoProcess: event.target.checked }),
           }), t('autoProcess')),
+          h('label', { className: 'gta-check' }, h('input', {
+            type: 'checkbox', checked: draft.precheckEnabled,
+            onChange: (event) => setDraft({ ...draft, precheckEnabled: event.target.checked }),
+          }), t('precheckEnabled')),
           h('div', { className: 'gta-form-actions' },
             h(Button, { primary: true, disabled: Boolean(busy), onClick: () => saveGeneralSettings().then((saved) => { if (saved) setDraft(null); }) }, t('save')),
             h(Button, { disabled: Boolean(busy), onClick: () => setDraft(null) }, t('cancel')),
@@ -354,9 +363,9 @@ window.__ModuleLoader__.load({
                         ? h('a', { href: todo.url, target: '_blank', rel: 'noreferrer' }, todo.title)
                         : h('span', null, todo.title),
                       todo.directMention && h('span', { className: 'gta-tag gta-tag-mention' }, t('directMention')),
-                      h('span', { className: `gta-tag ${todo.executionStatus === 'completed' || todo.outcome === 'merge-request-done' ? 'gta-tag-success' : ''}` }, todoStatusLabel(todo, t)),
+                      h('span', { className: `gta-tag ${todo.executionStatus === 'completed' || todo.outcome === 'merge-request-done' || todo.outcome === 'precheck-skipped' ? 'gta-tag-success' : ''}` }, todoStatusLabel(todo, t)),
                     ),
-                    h('div', { className: 'gta-muted gta-meta' }, [`#${todo.id}`, todo.project, todo.targetType, todo.action, todo.author && `@${todo.author}`].filter(Boolean).join(' · ')),
+                    h('div', { className: 'gta-muted gta-meta' }, [`#${todo.id}`, todo.project, todo.targetType, todo.action, todo.author && `@${todo.author}`, todo.skipReason].filter(Boolean).join(' · ')),
                   ),
                   h('div', { className: 'gta-todo-actions' },
                     todo.sessionId && h(Button, { onClick: () => openSession(todo.sessionId) }, t('openSession')),
