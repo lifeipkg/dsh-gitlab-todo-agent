@@ -27,7 +27,12 @@ window.__ModuleLoader__.load({
       openSession: 'Open session',
       interval: 'Poll interval (seconds)', limit: 'Maximum new sessions per poll', concurrency: 'Automatic dispatch concurrency',
       cwd: 'GitLab working directory', cwdHint: 'Leave empty to use the Host process directory.',
-      sessionCwd: 'New session workspace folder', sessionCwdHint: 'A folder registered as a DSH workspace, e.g. D:\\agent-workspace. Leave empty to use the most recently used workspace.',
+      sessionCwd: 'New session workspace', sessionCwdHint: 'Pick the DSH workspace for new sessions. "Auto" follows the most recently used workspace.',
+      sessionCwdAuto: 'Auto (most recently used workspace)', sessionCwdUnregistered: 'Current setting (not registered)',
+      workspacesTitle: 'Workspaces', noWorkspaces: 'No DSH workspace is registered yet.',
+      workspacesError: 'Could not load the DSH workspace list',
+      configuredWorkspace: 'plugin target', pluginSessionTag: 'plugin',
+      sessionUnknown: 'Untitled session', lastActive: 'Last activity',
       sessionModel: 'New session model', sessionModelDefault: 'Use the DSH default model',
       sessionModelPinDefault: 'Pin the current default model', sessionModelFixedHint: 'Selecting a concrete model pins every new session to that provider/model; it will not follow future default changes.',
       sessionModelUnavailable: 'Currently configured model (not in the available catalog)',
@@ -60,7 +65,12 @@ window.__ModuleLoader__.load({
       openSession: '打开 Session',
       interval: '轮询间隔（秒）', limit: '每轮最多创建 Session 数', concurrency: '自动处理并发数',
       cwd: 'GitLab 工作目录', cwdHint: '留空使用 Host 进程目录。',
-      sessionCwd: '新开会话的工作区文件夹', sessionCwdHint: '须为 DSH 已注册的工作区路径，例如 D:\\agent-workspace；留空使用最近使用的工作区。',
+      sessionCwd: '新开会话的工作区', sessionCwdHint: '选择新会话归属的 DSH 工作区；“自动”跟随最近使用的工作区。',
+      sessionCwdAuto: '自动（最近使用的工作区）', sessionCwdUnregistered: '当前配置（未注册）',
+      workspacesTitle: '工作区', noWorkspaces: 'DSH 尚未注册工作区。',
+      workspacesError: '无法加载 DSH 工作区列表',
+      configuredWorkspace: '插件目标', pluginSessionTag: '插件',
+      sessionUnknown: '未命名会话', lastActive: '最近活动',
       sessionModel: '新开会话使用的模型', sessionModelDefault: '跟随 DSH 默认模型',
       sessionModelPinDefault: '固定当前默认模型', sessionModelFixedHint: '选择具体模型后，新会话会固定使用该 provider/model，不再随 DSH 默认模型变化。',
       sessionModelUnavailable: '当前配置模型（不在可用目录中）',
@@ -74,7 +84,7 @@ window.__ModuleLoader__.load({
     };
 
     async function bridge(action, options = {}) {
-      const method = options.method ?? (action === 'state' || action === 'models' ? 'GET' : 'POST');
+      const method = options.method ?? (action === 'state' || action === 'models' || action === 'workspaces' ? 'GET' : 'POST');
       const headers = { Accept: 'application/json' };
       if (method === 'POST') headers['Content-Type'] = 'application/json';
       const query = method === 'GET' ? `?action=${encodeURIComponent(action)}` : '';
@@ -176,6 +186,8 @@ window.__ModuleLoader__.load({
       const [activeTab, setActiveTab] = React.useState('todos');
       const [modelCatalog, setModelCatalog] = React.useState(null);
       const [modelCatalogError, setModelCatalogError] = React.useState(null);
+      const [workspaceData, setWorkspaceData] = React.useState(null);
+      const [workspaceError, setWorkspaceError] = React.useState(null);
 
       React.useEffect(() => {
         let disposed = false;
@@ -186,6 +198,35 @@ window.__ModuleLoader__.load({
         });
         return () => { disposed = true; };
       }, []);
+
+      // 工作区列表：挂载时先拉一次供 Tab 计数与设置下拉使用；
+      // 打开“工作区”Tab 或设置面板时再按 10s 间隔刷新。
+      React.useEffect(() => {
+        let disposed = false;
+        bridge('workspaces').then((data) => {
+          if (!disposed) setWorkspaceData(Array.isArray(data.workspaces) ? data.workspaces : []);
+        }).catch(() => {});
+        return () => { disposed = true; };
+      }, []);
+      const needWorkspacePolling = activeTab === 'workspaces' || Boolean(draft);
+      React.useEffect(() => {
+        if (!needWorkspacePolling) return undefined;
+        let disposed = false;
+        const load = async () => {
+          try {
+            const data = await bridge('workspaces');
+            if (!disposed) {
+              setWorkspaceData(Array.isArray(data.workspaces) ? data.workspaces : []);
+              setWorkspaceError(null);
+            }
+          } catch (cause) {
+            if (!disposed) setWorkspaceError(cause.message);
+          }
+        };
+        void load();
+        const timer = setInterval(load, 10000);
+        return () => { disposed = true; clearInterval(timer); };
+      }, [needWorkspacePolling]);
 
       React.useEffect(() => {
         let disposed = false;
@@ -245,6 +286,14 @@ window.__ModuleLoader__.load({
         ];
       };
       const quickModelKey = sessionModelKey(settings?.sessionModel);
+      // 工作区下拉：值仍是工作区路径（sessionCwd 语义不变）；比较忽略大小写/斜杠差异。
+      const workspaceOptions = Array.isArray(workspaceData) ? workspaceData : [];
+      const normalizePathKey = (value) => String(value ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+      const registeredWorkspacePaths = new Set(workspaceOptions.map((workspace) => normalizePathKey(workspace.path)));
+      const draftSessionCwdUnregistered = Boolean(draft?.sessionCwd) && !registeredWorkspacePaths.has(normalizePathKey(draft.sessionCwd));
+      const sessionDisplayName = (session, label) => session.sessionTitle
+        || (session.cwd ? String(session.cwd).split(/[\\/]+/).filter(Boolean).pop() : '')
+        || label;
 
       return h('div', { className: 'gta-root' },
         h('style', { children: CSS }),
@@ -310,10 +359,15 @@ window.__ModuleLoader__.load({
               }),
             }, modelOptions(draft.sessionModel))),
             h('p', { className: 'gta-muted gta-wide' }, t('sessionModelFixedHint')),
-            h('label', { className: 'gta-wide' }, t('sessionCwd'), h('input', {
-              type: 'text', value: draft.sessionCwd, placeholder: t('sessionCwdHint'),
+            h('label', { className: 'gta-wide' }, t('sessionCwd'), h('select', {
+              value: draft.sessionCwd,
               onChange: (event) => setDraft({ ...draft, sessionCwd: event.target.value }),
-            })),
+            },
+              h('option', { value: '' }, t('sessionCwdAuto')),
+              draftSessionCwdUnregistered && h('option', { value: draft.sessionCwd }, `${t('sessionCwdUnregistered')}：${draft.sessionCwd}`),
+              workspaceOptions.map((workspace) => h('option', { key: workspace.workspaceId, value: workspace.path },
+                `${workspace.title || workspace.path} · ${workspace.path}`)),
+            ), h('span', { className: 'gta-muted' }, t('sessionCwdHint'))),
             h('label', { className: 'gta-wide' }, t('cwd'), h('input', {
               type: 'text', value: draft.cwd, placeholder: t('cwdHint'),
               onChange: (event) => setDraft({ ...draft, cwd: event.target.value }),
@@ -358,6 +412,12 @@ window.__ModuleLoader__.load({
             className: `gta-tab${activeTab === 'sessions' ? ' gta-tab-active' : ''}`,
             onClick: () => setActiveTab('sessions'),
           }, `${t('sessionsTitle')} (${(snapshot.sessions ?? []).length})`),
+          h('button', {
+            type: 'button', role: 'tab', id: `${PANEL_ID}-tab-workspaces`, 'aria-selected': activeTab === 'workspaces',
+            'aria-controls': `${PANEL_ID}-panel-workspaces`,
+            className: `gta-tab${activeTab === 'workspaces' ? ' gta-tab-active' : ''}`,
+            onClick: () => setActiveTab('workspaces'),
+          }, `${t('workspacesTitle')} (${workspaceOptions.length})`),
         ),
         activeTab === 'todos' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-todos`, 'aria-labelledby': `${PANEL_ID}-tab-todos` },
           h('div', { className: 'gta-section-title' }, h('h2', null, t('todoList')), h('span', { className: 'gta-muted' }, `${t('newFound')}：${snapshot.lastNewCount}`)),
@@ -415,6 +475,44 @@ window.__ModuleLoader__.load({
                 ),
               )),
         ),
+        activeTab === 'workspaces' && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-workspaces`, 'aria-labelledby': `${PANEL_ID}-tab-workspaces` },
+          h('div', { className: 'gta-section-title' }, h('h2', null, t('workspacesTitle')), h('span', { className: 'gta-muted' }, `${workspaceOptions.length}`)),
+          workspaceError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('workspacesError')}：${workspaceError}`),
+          workspaceOptions.length === 0 && !workspaceError && h('div', { className: 'gta-empty' }, t('noWorkspaces')),
+          h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('workspacesTitle') },
+            workspaceOptions.map((workspace) =>
+              h('article', { className: 'gta-todo gta-workspace', key: workspace.workspaceId },
+                h('div', { className: 'gta-todo-main' },
+                  h('div', { className: 'gta-todo-title' },
+                    h('span', { className: 'gta-workspace-name', title: workspace.path }, workspace.title || workspace.path || workspace.workspaceId),
+                    workspace.configured && h('span', { className: 'gta-tag gta-tag-mention' }, t('configuredWorkspace')),
+                    h('span', { className: 'gta-muted' }, `${t('sessionsTitle')}：${workspace.sessionCount}`),
+                  ),
+                  h('div', { className: 'gta-muted gta-meta' },
+                    [workspace.path, workspace.updatedAt ? `${t('lastActive')}：${formatTime(workspace.updatedAt, '')}` : ''].filter(Boolean).join(' · ')),
+                  h('div', { className: 'gta-workspace-sessions' },
+                    workspace.sessions.length === 0
+                      ? h('div', { className: 'gta-muted' }, t('noSessions'))
+                      : workspace.sessions.map((session) =>
+                          h('div', { className: 'gta-workspace-session', key: session.sessionId },
+                            session.archived
+                              ? h('span', { className: 'gta-session-name', title: session.sessionId }, sessionDisplayName(session, t('sessionUnknown')))
+                              : h('button', {
+                                  type: 'button', className: 'gta-session-link', title: session.sessionId,
+                                  onClick: () => openSession(session.sessionId),
+                                }, sessionDisplayName(session, t('sessionUnknown'))),
+                            h('span', { className: `gta-tag ${session.running ? '' : 'gta-tag-success'}` },
+                              session.running ? t('executionRunning') : t('idle')),
+                            session.plugin && h('span', { className: 'gta-tag gta-tag-mention' }, t('pluginSessionTag')),
+                            session.archived && h('span', { className: 'gta-tag gta-tag-success' }, t('sessionArchived')),
+                            h('span', { className: 'gta-muted gta-session-meta' },
+                              [session.known ? '' : '·', session.updatedAt ? formatTime(session.updatedAt, '') : ''].filter(Boolean).join(' ')),
+                          )),
+                  ),
+                ),
+              )),
+          ),
+        ),
       );
     }
 
@@ -429,6 +527,7 @@ window.__ModuleLoader__.load({
       .gta-root input[type=text],.gta-root input[type=number],.gta-root select{width:100%;border:1px solid var(--dsw-alias-border-l2);border-radius:7px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;padding:8px 10px}.gta-check{display:flex;align-items:center;gap:8px;margin:16px 0 0}.gta-form-actions{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap}
       .gta-stats{display:grid;grid-template-columns:repeat(4,minmax(100px,1fr));gap:10px}.gta-stat{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);padding:12px 14px;display:flex;flex-direction:column;gap:4px}.gta-stat>span{color:var(--dsw-alias-label-secondary);font-size:12px}.gta-stat>strong{font-size:18px}.gta-stat-time{grid-column:span 2}.gta-stat-time>strong{font-size:13px}
       .gta-section-title{display:flex;align-items:baseline;justify-content:space-between;gap:16px}.gta-tabs{max-width:1180px;margin:16px auto 0;display:flex;gap:4px;border-bottom:1px solid var(--dsw-alias-border-l1)}.gta-tab{appearance:none;margin-bottom:-1px;padding:9px 18px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;white-space:nowrap}.gta-tab:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}.gta-tab:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}.gta-tab-active{border-bottom-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);font-weight:600}.gta-list{display:flex;flex-direction:column;gap:8px}.gta-scroll-list{max-height:min(52vh,480px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-gutter:stable;padding:2px 6px 2px 2px}.gta-scroll-list::-webkit-scrollbar{width:8px}.gta-scroll-list::-webkit-scrollbar-track{background:transparent}.gta-scroll-list::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l2);border-radius:4px}.gta-scroll-list::-webkit-scrollbar-thumb:hover{background:var(--dsw-alias-label-tertiary,var(--dsw-alias-border-l2))}.gta-todo{display:flex;align-items:center;gap:16px;padding:14px 16px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}.gta-todo-main{min-width:0;flex:1}.gta-todo-title{display:flex;align-items:center;gap:10px;font-weight:550}.gta-todo-title>a{color:var(--dsw-alias-label-primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-todo-title>a:hover{color:var(--dsw-alias-brand-primary);text-decoration:underline}.gta-tag{flex:none;font-size:11px;padding:1px 7px;border-radius:10px;color:var(--dsw-alias-state-warn-primary);border:1px solid var(--dsw-alias-state-warn-primary)}.gta-tag-success{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}.gta-tag-mention{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}.gta-meta{margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-todo-actions{display:flex;gap:8px;flex:none}.gta-session-list{max-height:min(40vh,360px)}
+      .gta-workspace{flex-direction:column;align-items:stretch;gap:10px}.gta-workspace-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-workspace-sessions{display:flex;flex-direction:column;gap:6px;margin-top:4px}.gta-workspace-session{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-base);min-width:0}.gta-session-link{appearance:none;border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-weight:550;padding:0;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;min-width:0}.gta-session-link:hover{color:var(--dsw-alias-brand-primary);text-decoration:underline}.gta-session-name{font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;min-width:0}.gta-session-meta{margin-left:auto;flex:none}
       .gta-empty{padding:24px;border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;text-align:center;color:var(--dsw-alias-label-secondary)}.gta-fatal{max-width:720px;margin:48px auto;padding:24px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}.gta-fatal p{white-space:pre-wrap;word-break:break-word;margin:12px 0 20px;color:var(--dsw-alias-state-error-primary)}
       @media(max-width:900px){.gta-root{padding:20px 18px 36px}.gta-header{flex-direction:column}.gta-actions{justify-content:flex-start}.gta-form-grid{grid-template-columns:1fr}.gta-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.gta-scroll-list{max-height:min(60vh,420px)}.gta-todo{align-items:flex-start;flex-direction:column}.gta-todo-actions{width:100%;justify-content:flex-end}}
     `;

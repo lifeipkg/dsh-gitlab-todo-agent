@@ -361,6 +361,61 @@ export function normalizeState(value) {
   };
 }
 
+/** 工作区路径归一化：比较时忽略大小写、正反斜杠与结尾分隔符。 */
+export function normalizeWorkspacePath(value) {
+  return String(value ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+}
+
+/**
+ * 组装 DSH 工作区总览：workspaceRegistry 的工作区条目（sessionIds 为权威归属）
+ * 与 session/list 名册（运行状态、updatedAt）join，再叠加插件自己的会话记录。
+ * 名册缺项的会话仍列出（known=false），名册整体不可用时调用方传空数组即可降级。
+ */
+export function buildWorkspaceOverview(workspaces, roster, pluginSessions = [], configuredPath = '') {
+  const items = Array.isArray(workspaces) ? workspaces : [];
+  const rosterItems = Array.isArray(roster) ? roster : [];
+  const rosterById = new Map(rosterItems.map((item) => [String(item?.sessionId ?? ''), item]));
+  const pluginById = new Map(
+    (Array.isArray(pluginSessions) ? pluginSessions : [])
+      .filter((item) => item?.sessionId)
+      .map((item) => [String(item.sessionId), item]),
+  );
+  const configured = normalizeWorkspacePath(configuredPath);
+  return items.map((item, index) => {
+    const sessionIds = Array.isArray(item?.sessionIds) ? item.sessionIds.map((id) => String(id ?? '')) : [];
+    const sessions = sessionIds
+      .filter(Boolean)
+      .map((sessionId) => {
+        const summary = rosterById.get(sessionId);
+        const plugin = pluginById.get(sessionId);
+        return {
+          sessionId,
+          known: Boolean(summary),
+          running: summary?.running === true,
+          updatedAt: typeof summary?.updatedAt === 'number' && Number.isFinite(summary.updatedAt) ? summary.updatedAt : null,
+          cwd: typeof summary?.cwd === 'string' ? summary.cwd : '',
+          plugin: Boolean(plugin),
+          sessionTitle: typeof plugin?.sessionTitle === 'string' ? plugin.sessionTitle : '',
+          automatic: plugin ? plugin.automatic !== false : null,
+          archived: plugin ? plugin.archived === true : false,
+          url: typeof plugin?.url === 'string' ? plugin.url : '',
+        };
+      })
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+    const path = String(item?.path ?? item?.cwd ?? '');
+    return {
+      workspaceId: String(item?.id ?? item?.workspaceId ?? `workspace-${index}`),
+      path,
+      title: String(item?.title ?? ''),
+      configured: Boolean(configured) && normalizeWorkspacePath(path) === configured,
+      createdAt: item?.createdAt ?? null,
+      updatedAt: item?.updatedAt ?? null,
+      sessionCount: sessions.length,
+      sessions,
+    };
+  });
+}
+
 export function sessionProjection(state) {
   const accepted = Object.values(state.handled)
     .filter((record) => Boolean(record.sessionId))

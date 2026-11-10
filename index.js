@@ -9,10 +9,12 @@ import {
   buildJudgePrompt,
   buildSessionTitle,
   buildTodoPrompt,
+  buildWorkspaceOverview,
   classifyTodo,
   initialState,
   normalizeState,
   normalizeTodos,
+  normalizeWorkspacePath,
   parseJudgeReply,
   publicState,
   selectPendingTodos,
@@ -601,8 +603,7 @@ export class GitlabTodoRuntime {
     const items = this.ctx.workspaceRegistry?.list?.() ?? [];
     const configured = this.state.settings.sessionCwd;
     if (configured) {
-      const normalize = (value) => String(value ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
-      const match = items.find((item) => normalize(item.path ?? item.cwd) === normalize(configured));
+      const match = items.find((item) => normalizeWorkspacePath(item.path ?? item.cwd) === normalizeWorkspacePath(configured));
       if (match?.id) return match.id;
       throw new Error(`配置的工作区文件夹未在 DSH 工作区中注册：${configured}`);
     }
@@ -618,6 +619,49 @@ export class GitlabTodoRuntime {
     const workspaceId = best?.id ?? items[0]?.id;
     if (!workspaceId) throw new Error('DSH 尚未注册工作区，请先创建或选择一个工作区。');
     return workspaceId;
+  }
+
+  /** 插件自己派发过的会话（handled + pending），供工作区总览打标。 */
+  pluginSessionRecords() {
+    const records = [];
+    for (const record of Object.values(this.state.handled)) {
+      if (!record?.sessionId) continue;
+      records.push({
+        sessionId: record.sessionId,
+        sessionTitle: record.sessionTitle,
+        automatic: record.automatic !== false,
+        archived: record.archived === true,
+        url: record.url,
+      });
+    }
+    for (const record of Object.values(this.state.pending)) {
+      if (!record?.sessionId) continue;
+      records.push({
+        sessionId: record.sessionId,
+        sessionTitle: '',
+        automatic: record.automatic !== false,
+        archived: false,
+        url: record.item?.url ?? '',
+      });
+    }
+    return records;
+  }
+
+  /**
+   * 当前 dsh-desktop 的工作区总览：工作区（含权威 sessionIds 归属）
+   * join session/list 名册（运行状态），并给插件会话打标。
+   * 名册不可用时降级为只展示结构（known=false），不抛错。
+   */
+  async workspaceOverview() {
+    const workspaces = this.ctx.workspaceRegistry?.list?.() ?? [];
+    let roster = [];
+    try {
+      const value = await this.host.listSessions();
+      if (Array.isArray(value?.items)) roster = value.items;
+    } catch {
+      roster = [];
+    }
+    return buildWorkspaceOverview(workspaces, roster, this.pluginSessionRecords(), this.state.settings.sessionCwd);
   }
 
   async dispatchById(id) {
@@ -775,6 +819,9 @@ export class GitlabTodoRuntime {
       if (request.method === 'GET' && url.searchParams.get('action') === 'models') {
         return jsonResponse(200, { ok: true, catalog: await this.host.modelCatalog() });
       }
+      if (request.method === 'GET' && url.searchParams.get('action') === 'workspaces') {
+        return jsonResponse(200, { ok: true, workspaces: await this.workspaceOverview() });
+      }
       if (request.method !== 'POST') {
         return jsonResponse(405, { ok: false, error: '不支持的请求方法。' });
       }
@@ -788,6 +835,9 @@ export class GitlabTodoRuntime {
       const body = JSON.parse(raw || '{}');
       if (body.action === 'models') {
         return jsonResponse(200, { ok: true, catalog: await this.host.modelCatalog() });
+      }
+      if (body.action === 'workspaces') {
+        return jsonResponse(200, { ok: true, workspaces: await this.workspaceOverview() });
       }
       if (body.action === 'poll') {
         const state = await this.poll('manual');

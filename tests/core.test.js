@@ -6,6 +6,7 @@ import {
   buildJudgePrompt,
   buildSessionTitle,
   buildTodoPrompt,
+  buildWorkspaceOverview,
   parseJudgeReply,
   classifyTodo,
   defaultSettings,
@@ -274,6 +275,42 @@ test('state normalization migrates the legacy shared cwd to new sessions', () =>
   assert.equal(state.settings.cwd, 'D:\\legacy\\workspace');
   assert.equal(state.settings.sessionCwd, 'D:\\legacy\\workspace');
   assert.equal(state.settings.sessionModel, null);
+});
+
+test('buildWorkspaceOverview joins workspaces, roster, and plugin sessions', () => {
+  const overview = buildWorkspaceOverview(
+    [
+      { id: 'w1', path: 'D:\\agent-workspace', title: 'Agent', sessionIds: ['s1', 's2', 's3'], updatedAt: '2026-01-02T00:00:00Z' },
+      { id: 'w2', path: 'D:\\work\\repo', sessionIds: [] },
+    ],
+    [
+      { sessionId: 's1', running: true, updatedAt: 300, cwd: 'D:\\agent-workspace' },
+      { sessionId: 's2', running: false, updatedAt: 500 },
+    ],
+    [{ sessionId: 's2', sessionTitle: '[协助]-issue-1', automatic: true, archived: true, url: 'https://gitlab.local/i/1' }],
+    'd:/agent-workspace/',
+  );
+  assert.equal(overview.length, 2);
+  const [w1, w2] = overview;
+  assert.equal(w1.workspaceId, 'w1');
+  assert.equal(w1.title, 'Agent');
+  assert.equal(w1.sessionCount, 3);
+  // 配置路径比较忽略大小写、正反斜杠与结尾分隔符。
+  assert.equal(w1.configured, true);
+  assert.equal(w2.configured, false);
+  // 会话按 updatedAt 倒序，名册缺项（known=false）排最后。
+  assert.equal(w1.sessions[0].sessionId, 's2');
+  assert.equal(w1.sessions[0].plugin, true);
+  assert.equal(w1.sessions[0].sessionTitle, '[协助]-issue-1');
+  assert.equal(w1.sessions[0].archived, true);
+  assert.equal(w1.sessions[0].automatic, true);
+  assert.equal(w1.sessions[1].sessionId, 's1');
+  assert.equal(w1.sessions[1].running, true);
+  assert.equal(w1.sessions[1].cwd, 'D:\\agent-workspace');
+  assert.equal(w1.sessions[2].sessionId, 's3');
+  assert.equal(w1.sessions[2].known, false);
+  assert.equal(w1.sessions[2].updatedAt, null);
+  assert.equal(w2.sessionCount, 0);
 });
 
 test('state normalization migrates v1 and v2 script states to v3', () => {
@@ -735,6 +772,23 @@ test('fetch handler returns state and validates settings updates', async () => {
   assert.equal(modelsPostResponse.status, 200);
   assert.equal((await modelsPostResponse.json()).catalog.groups[0].models[0].id, 'deepseek-chat');
 
+  const workspacesResponse = await runtime.handleFetch(new Request('http://127.0.0.1/api/gitlab-todo-agent?action=workspaces'));
+  assert.equal(workspacesResponse.status, 200);
+  const workspacesBody = await workspacesResponse.json();
+  assert.equal(workspacesBody.ok, true);
+  assert.equal(workspacesBody.workspaces.length, 2);
+  assert.equal(workspacesBody.workspaces[0].workspaceId, 'workspace-default');
+  assert.equal(workspacesBody.workspaces[0].sessionCount, 0);
+  assert.equal(workspacesBody.workspaces[1].workspaceId, 'workspace-work');
+
+  const workspacesPostResponse = await runtime.handleFetch(new Request('http://127.0.0.1/api/gitlab-todo-agent', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'workspaces' }),
+  }));
+  assert.equal(workspacesPostResponse.status, 200);
+  assert.equal((await workspacesPostResponse.json()).workspaces.length, 2);
+
   const updateResponse = await runtime.handleFetch(new Request('http://127.0.0.1/api/gitlab-todo-agent', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -749,6 +803,33 @@ test('fetch handler returns state and validates settings updates', async () => {
     body: JSON.stringify({ action: 'updateSettings', settings: { intervalSeconds: 1 } }),
   }));
   assert.equal(badResponse.status, 400);
+});
+
+test('workspace overview survives roster failures and tags plugin sessions', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const [todo] = normalizeTodos([sessionTodo]);
+  const result = await runtime.dispatch(todo);
+  assert.equal(result.ok, true);
+  runtime.ctx.workspaceRegistry.list = () => [
+    { id: 'w1', path: 'D:\\agent-workspace', title: 'Agent', sessionIds: ['session-1', 'other-1'] },
+  ];
+  const overview = await runtime.workspaceOverview();
+  assert.equal(overview.length, 1);
+  assert.equal(overview[0].configured, false);
+  assert.equal(overview[0].sessionCount, 2);
+  const [pluginSession, otherSession] = overview[0].sessions;
+  assert.equal(pluginSession.sessionId, 'session-1');
+  assert.equal(pluginSession.plugin, true);
+  assert.equal(pluginSession.sessionTitle, '[协助]-issue-7');
+  assert.equal(pluginSession.known, true);
+  assert.equal(otherSession.plugin, false);
+  assert.equal(otherSession.known, false);
+
+  calls.failList = true;
+  const degraded = await runtime.workspaceOverview();
+  assert.equal(degraded.length, 1);
+  assert.equal(degraded[0].sessions[0].plugin, true);
+  assert.equal(degraded[0].sessions[0].known, false);
 });
 
 test('startup upgrades script-era state without creating script files', async () => {
