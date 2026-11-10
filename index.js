@@ -674,6 +674,9 @@ export class GitlabTodoRuntime {
         return jsonResponse(413, { ok: false, error: `请求体超过 ${MAX_REQUEST_BYTES} 字节上限。` });
       }
       const body = JSON.parse(raw || '{}');
+      if (body.action === 'models') {
+        return jsonResponse(200, { ok: true, catalog: await this.host.modelCatalog() });
+      }
       if (body.action === 'poll') {
         const state = await this.poll('manual');
         return jsonResponse(200, { ok: true, state });

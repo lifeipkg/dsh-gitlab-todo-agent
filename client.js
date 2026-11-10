@@ -62,7 +62,7 @@ window.__ModuleLoader__.load({
     };
 
     async function bridge(action, options = {}) {
-      const method = options.method ?? (action === 'state' ? 'GET' : 'POST');
+      const method = options.method ?? (action === 'state' || action === 'models' ? 'GET' : 'POST');
       const headers = { Accept: 'application/json' };
       if (method === 'POST') headers['Content-Type'] = 'application/json';
       const query = method === 'GET' ? `?action=${encodeURIComponent(action)}` : '';

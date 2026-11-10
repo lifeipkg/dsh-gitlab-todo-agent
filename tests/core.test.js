@@ -563,6 +563,14 @@ test('fetch handler returns state and validates settings updates', async () => {
   assert.equal(modelsResponse.status, 200);
   assert.equal(modelsBody.catalog.groups[0].models[0].id, 'deepseek-chat');
 
+  const modelsPostResponse = await runtime.handleFetch(new Request('http://127.0.0.1/api/gitlab-todo-agent', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'models' }),
+  }));
+  assert.equal(modelsPostResponse.status, 200);
+  assert.equal((await modelsPostResponse.json()).catalog.groups[0].models[0].id, 'deepseek-chat');
+
   const updateResponse = await runtime.handleFetch(new Request('http://127.0.0.1/api/gitlab-todo-agent', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
