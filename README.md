@@ -71,7 +71,7 @@ Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再�
 ## 新会话配置
 
 - **新开会话的工作区文件夹**：通过 `sessionController.create({ cwd })` 应用于新 Session；留空使用 DSH 默认工作区。它与 **GitLab 工作目录** 相互独立。
-- **新开会话使用的模型**：下拉选项来自 Host 的 `sessionController.modelCatalog()`；创建 Session 后、提交提示词前调用 `selectModel()`。选择“跟随 DSH 默认模型”则不覆盖默认选择。
+- **新开会话使用的模型**：直接遍历 Host `sessionController.modelCatalog()` 返回的全部模型分组；创建 Session 后、提交提示词前调用 `selectModel({ provider, model })`。选择具体模型（包括“固定当前默认模型”）会固定该路由，不随 DSH 默认模型变化；选择“跟随 DSH 默认模型”才不覆盖默认选择。
 - 设置保存在 `state.json`，不修改已接受的历史 Session。工作区只在创建时确定；pending Session 重试会复用原工作区，但会重新应用当前模型配置。
 
 ## 存储与升级

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-gitlab-todo-agent",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": false,
   "description": "GitLab Todo watcher for DeepSeek Harness: reads your GitLab todos via glab, opens isolated DSH sessions for direct comment mentions from other users, with running-session concurrency control.",
   "type": "module",

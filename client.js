@@ -24,6 +24,7 @@ window.__ModuleLoader__.load({
       cwd: 'GitLab working directory', cwdHint: 'Leave empty to use the Host process directory.',
       sessionCwd: 'New session workspace folder', sessionCwdHint: 'Example: D:\\agent-workspace. Leave empty for the DSH default workspace.',
       sessionModel: 'New session model', sessionModelDefault: 'Use the DSH default model',
+      sessionModelPinDefault: 'Pin the current default model', sessionModelFixedHint: 'Selecting a concrete model pins every new session to that provider/model; it will not follow future default changes.',
       sessionModelUnavailable: 'Currently configured model (not in the available catalog)',
       modelCatalogError: 'Could not load the available model catalog',
       autoProcess: 'Automatically open sessions only for direct comment mentions from other users',
@@ -49,6 +50,7 @@ window.__ModuleLoader__.load({
       cwd: 'GitLab 工作目录', cwdHint: '留空使用 Host 进程目录。',
       sessionCwd: '新开会话的工作区文件夹', sessionCwdHint: '例如 D:\\agent-workspace；留空使用 DSH 默认工作区。',
       sessionModel: '新开会话使用的模型', sessionModelDefault: '跟随 DSH 默认模型',
+      sessionModelPinDefault: '固定当前默认模型', sessionModelFixedHint: '选择具体模型后，新会话会固定使用该 provider/model，不再随 DSH 默认模型变化。',
       sessionModelUnavailable: '当前配置模型（不在可用目录中）',
       modelCatalogError: '无法加载可用模型目录',
       autoProcess: '仅为其他用户在评论中直接 @ 我的 Todo 自动创建 Session',
@@ -191,15 +193,19 @@ window.__ModuleLoader__.load({
       const saveGeneralSettings = () => updateSettings(draft);
       const openSession = (sessionId) => ctx.uiWorkspace.openSession(sessionId);
       const settings = snapshot?.settings;
-      const modelGroups = (modelCatalog?.groups ?? []).filter((group) => modelCatalog.routableProviders.includes(group.id));
-      const availableModelKeys = new Set(modelGroups.flatMap((group) => group.models.map((model) => sessionModelKey({ provider: group.id, model: model.id }))));
+      // 与 task-board 的 model-options 实现一致：直接遍历目录 groups，不按 routableProviders 二次过滤。
+      const modelGroups = (Array.isArray(modelCatalog?.groups) ? modelCatalog.groups : [])
+        .filter((group) => Array.isArray(group?.models) && group.models.length > 0);
+      const availableModelKeys = new Set(modelGroups.flatMap((group) => group.models.map((model) => sessionModelKey({ provider: group.id ?? group.provider, model: model.id }))));
+      const pinnedDefaultKey = sessionModelKey(modelCatalog?.default);
       const modelOptions = (selection) => {
         const selectedKey = sessionModelKey(selection);
         return [
           h('option', { value: '' }, `${t('sessionModelDefault')}${modelCatalog?.default ? ` (${modelCatalog.default.model})` : ''}`),
-          selectedKey && !availableModelKeys.has(selectedKey) && h('option', { value: selectedKey }, `${t('sessionModelUnavailable')}: ${selection.provider}/${selection.model}`),
-          modelGroups.map((group) => h('optgroup', { key: group.id, label: group.name }, group.models.map((model) =>
-            h('option', { key: model.id, value: sessionModelKey({ provider: group.id, model: model.id }) }, `${model.name} · ${model.id}`),
+          pinnedDefaultKey && !availableModelKeys.has(pinnedDefaultKey) && h('option', { value: pinnedDefaultKey }, `${t('sessionModelPinDefault')} (${modelCatalog.default.model} · ${modelCatalog.default.provider})`),
+          selectedKey && selectedKey !== pinnedDefaultKey && !availableModelKeys.has(selectedKey) && h('option', { value: selectedKey }, `${t('sessionModelUnavailable')}: ${selection.provider}/${selection.model}`),
+          modelGroups.map((group) => h('optgroup', { key: group.id ?? group.provider, label: group.name ?? group.id ?? group.provider }, group.models.map((model) =>
+            h('option', { key: model.id, value: sessionModelKey({ provider: group.id ?? group.provider, model: model.id }) }, `${model.name ?? model.id} · ${model.id}`),
           ))),
         ];
       };
@@ -216,11 +222,11 @@ window.__ModuleLoader__.load({
             h('p', null, t('subtitle')),
           ),
           h('div', { className: 'gta-actions' },
-            h('label', { className: 'gta-model-quick', title: t('sessionModel') },
+            h('label', { className: 'gta-model-quick', title: t('sessionModelFixedHint') },
               h('span', null, t('sessionModel')),
               h('select', {
                 value: quickModelKey,
-                disabled: !snapshot || Boolean(busy) || !modelCatalog,
+                disabled: !snapshot || Boolean(busy),
                 'aria-label': t('sessionModel'),
                 onChange: (event) => updateSettings({ sessionModel: event.target.value ? JSON.parse(event.target.value) : null }),
               }, modelOptions(settings?.sessionModel)),
@@ -245,6 +251,7 @@ window.__ModuleLoader__.load({
         error && h('div', { className: 'gta-banner gta-error', role: 'alert' }, `${t('localError')}：${error}`),
         snapshot?.lastPollError && h('div', { className: 'gta-banner gta-error', role: 'alert' }, snapshot.lastPollError),
         snapshot?.lastDispatchError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, snapshot.lastDispatchError),
+        modelCatalogError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('modelCatalogError')}：${modelCatalogError}`),
         draft && h('section', { className: 'gta-card gta-settings' },
           h('h2', null, t('settings')),
           h('div', { className: 'gta-form-grid' },
@@ -267,6 +274,7 @@ window.__ModuleLoader__.load({
                 sessionModel: event.target.value ? JSON.parse(event.target.value) : null,
               }),
             }, modelOptions(draft.sessionModel))),
+            h('p', { className: 'gta-muted gta-wide' }, t('sessionModelFixedHint')),
             h('label', { className: 'gta-wide' }, t('sessionCwd'), h('input', {
               type: 'text', value: draft.sessionCwd, placeholder: t('sessionCwdHint'),
               onChange: (event) => setDraft({ ...draft, sessionCwd: event.target.value }),
@@ -276,7 +284,6 @@ window.__ModuleLoader__.load({
               onChange: (event) => setDraft({ ...draft, cwd: event.target.value }),
             })),
           ),
-          modelCatalogError && h('p', { className: 'gta-muted', role: 'status' }, `${t('modelCatalogError')}：${modelCatalogError}`),
           h('label', { className: 'gta-check' }, h('input', {
             type: 'checkbox', checked: draft.autoProcess,
             onChange: (event) => setDraft({ ...draft, autoProcess: event.target.checked }),
