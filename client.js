@@ -23,6 +23,7 @@ window.__ModuleLoader__.load({
       process: 'Open session', reprocess: 'Process again', dispatched: 'Accepted', waiting: 'Waiting',
       executionRunning: 'Running', executionCompleted: 'Completed', executionFailed: 'Failed',
       precheckSkipped: 'Skipped (no handling needed)',
+      ruleSkipped: 'Skipped (pipeline notify)',
       sessionArchived: 'Archived',
       openSession: 'Open session',
       interval: 'Poll interval (seconds)', limit: 'Maximum new sessions per poll', concurrency: 'Automatic dispatch concurrency',
@@ -34,11 +35,14 @@ window.__ModuleLoader__.load({
       configuredWorkspace: 'plugin target', pluginSessionTag: 'plugin',
       sessionUnknown: 'Untitled session', lastActive: 'Last activity',
       sessionModel: 'New session model', sessionModelDefault: 'Use the DSH default model',
+      judgeModel: 'Precheck model', judgeModelDefault: 'Follow the session model',
+      judgeModelHint: 'Pin a fast, lightweight model here so the need-to-handle judgment returns quickly; new sessions keep using the session model above.',
       sessionModelPinDefault: 'Pin the current default model', sessionModelFixedHint: 'Selecting a concrete model pins every new session to that provider/model; it will not follow future default changes.',
       sessionModelUnavailable: 'Currently configured model (not in the available catalog)',
       modelCatalogError: 'Could not load the available model catalog',
       autoProcess: 'Automatically open sessions only for direct comment mentions from other users',
-      precheckEnabled: 'Precheck with one lightweight model call: todos that need no handling are marked done directly',
+      precheckEnabled: 'Fast pre-judgment during each poll: mentions that need no handling are marked done directly, in parallel, without opening sessions',
+      ruleSkipEnabled: 'Mark pipeline notifications done directly by rule (no model call)',
       autoArchive: 'Archive the session automatically after its execution completes (plugin-created sessions only)',
       loading: 'Loading GitLab Todo panel…', renderError: 'The panel failed to render', retry: 'Retry rendering',
       localError: 'Action failed',
@@ -61,6 +65,7 @@ window.__ModuleLoader__.load({
       process: '开 Session 处理', reprocess: '重新处理', dispatched: '已接受', waiting: '待处理',
       executionRunning: '执行中', executionCompleted: '执行完成', executionFailed: '执行失败',
       precheckSkipped: '已跳过（无需处理）',
+      ruleSkipped: '已跳过（流水线通知）',
       sessionArchived: '已归档',
       openSession: '打开 Session',
       interval: '轮询间隔（秒）', limit: '每轮最多创建 Session 数', concurrency: '自动处理并发数',
@@ -72,11 +77,14 @@ window.__ModuleLoader__.load({
       configuredWorkspace: '插件目标', pluginSessionTag: '插件',
       sessionUnknown: '未命名会话', lastActive: '最近活动',
       sessionModel: '新开会话使用的模型', sessionModelDefault: '跟随 DSH 默认模型',
+      judgeModel: '预检模型', judgeModelDefault: '跟随会话模型',
+      judgeModelHint: '固定一个更快的轻量模型可显著缩短“是否需要处理”的判断耗时；新会话仍使用上面的会话模型。',
       sessionModelPinDefault: '固定当前默认模型', sessionModelFixedHint: '选择具体模型后，新会话会固定使用该 provider/model，不再随 DSH 默认模型变化。',
       sessionModelUnavailable: '当前配置模型（不在可用目录中）',
       modelCatalogError: '无法加载可用模型目录',
       autoProcess: '仅为其他用户在评论中直接 @ 我的 Todo 自动创建 Session',
-      precheckEnabled: '开会话前轻量预判：不需要处理的提及直接标记完成',
+      precheckEnabled: '每轮轮询先并行快速预判：不需要处理的提及直接标记完成，不开会话',
+      ruleSkipEnabled: '流水线通知等规则噪声直接标记完成，不经过模型',
       autoArchive: '执行完成后自动归档会话（仅插件创建的会话）',
       loading: '正在加载 GitLab Todo 面板…', renderError: '面板渲染失败', retry: '重新渲染',
       localError: '操作失败',
@@ -113,6 +121,7 @@ window.__ModuleLoader__.load({
     function todoStatusLabel(todo, t) {
       if (todo.outcome === 'merge-request-done') return t('mrDone');
       if (todo.outcome === 'precheck-skipped') return t('precheckSkipped');
+      if (todo.outcome === 'rule-skipped') return t('ruleSkipped');
       if (todo.executionStatus === 'running') return t('executionRunning');
       if (todo.executionStatus === 'completed') return t('executionCompleted');
       if (todo.executionStatus === 'failed') return t('executionFailed');
@@ -272,12 +281,13 @@ window.__ModuleLoader__.load({
         .filter((group) => Array.isArray(group?.models) && group.models.length > 0);
       const availableModelKeys = new Set(modelGroups.flatMap((group) => group.models.map((model) => sessionModelKey({ provider: group.id ?? group.provider, model: model.id }))));
       const pinnedDefaultKey = sessionModelKey(modelCatalog?.default);
-      const modelOptions = (selection) => {
+      const modelOptions = (selection, followLabel) => {
+        const follow = followLabel ?? t('sessionModelDefault');
         const hasFields = typeof selection?.provider === 'string' && selection.provider
           && typeof selection?.model === 'string' && selection.model;
         const selectedKey = hasFields ? sessionModelKey(selection) : '';
         return [
-          h('option', { value: '' }, `${t('sessionModelDefault')}${modelCatalog?.default ? ` (${modelCatalog.default.model})` : ''}`),
+          h('option', { value: '' }, `${follow}${modelCatalog?.default ? ` (${modelCatalog.default.model})` : ''}`),
           pinnedDefaultKey && !availableModelKeys.has(pinnedDefaultKey) && h('option', { value: pinnedDefaultKey }, `${t('sessionModelPinDefault')} (${modelCatalog.default.model} · ${modelCatalog.default.provider})`),
           selectedKey && selectedKey !== pinnedDefaultKey && !availableModelKeys.has(selectedKey) && h('option', { value: selectedKey }, `${t('sessionModelUnavailable')}: ${selection.provider}/${selection.model}`),
           modelGroups.map((group) => h('optgroup', { key: group.id ?? group.provider, label: group.name ?? group.id ?? group.provider }, group.models.map((model) =>
@@ -358,7 +368,15 @@ window.__ModuleLoader__.load({
                 sessionModel: event.target.value ? JSON.parse(event.target.value) : null,
               }),
             }, modelOptions(draft.sessionModel))),
+            h('label', null, t('judgeModel'), h('select', {
+              value: sessionModelKey(draft.judgeModel),
+              onChange: (event) => setDraft({
+                ...draft,
+                judgeModel: event.target.value ? JSON.parse(event.target.value) : null,
+              }),
+            }, modelOptions(draft.judgeModel, t('judgeModelDefault')))),
             h('p', { className: 'gta-muted gta-wide' }, t('sessionModelFixedHint')),
+            h('p', { className: 'gta-muted gta-wide' }, t('judgeModelHint')),
             h('label', { className: 'gta-wide' }, t('sessionCwd'), h('select', {
               value: draft.sessionCwd,
               onChange: (event) => setDraft({ ...draft, sessionCwd: event.target.value }),
@@ -381,6 +399,10 @@ window.__ModuleLoader__.load({
             type: 'checkbox', checked: draft.precheckEnabled,
             onChange: (event) => setDraft({ ...draft, precheckEnabled: event.target.checked }),
           }), t('precheckEnabled')),
+          h('label', { className: 'gta-check' }, h('input', {
+            type: 'checkbox', checked: draft.ruleSkipEnabled,
+            onChange: (event) => setDraft({ ...draft, ruleSkipEnabled: event.target.checked }),
+          }), t('ruleSkipEnabled')),
           h('label', { className: 'gta-check' }, h('input', {
             type: 'checkbox', checked: draft.autoArchive,
             onChange: (event) => setDraft({ ...draft, autoArchive: event.target.checked }),

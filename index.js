@@ -27,8 +27,28 @@ const DEFAULT_STORAGE_DIRECTORY = join(homedir(), '.dsh-plugins', 'gitlabtodo');
 const LEGACY_STATE_FILE = join(PACKAGE_DIR, '.runtime', 'state.json');
 const TODO_PAGE_SIZE = 100;
 const MAX_TODO_PAGES = 20;
+const MAX_RULE_SKIPS_PER_POLL = 20;
+const PRECHECK_CONCURRENCY = 3;
 const BRIDGE_PATH = '/api/gitlab-todo-agent';
 const MAX_REQUEST_BYTES = 128 * 1024;
+
+/** 有界并发顺序保持的 map：用于轮询阶段并行跑 LLM 预检。 */
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let index = 0;
+  const runners = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    () => (async () => {
+      while (index < items.length) {
+        const current = index;
+        index += 1;
+        results[current] = await worker(items[current], current);
+      }
+    })(),
+  );
+  await Promise.all(runners);
+  return results;
+}
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
@@ -219,6 +239,8 @@ export class GitlabTodoRuntime {
   }
 
   async judgeModel() {
+    // 预检可用更快的专用小模型；未配置时退回会话模型，再退回 Host 默认模型。
+    if (this.state.settings.judgeModel) return this.state.settings.judgeModel;
     if (this.state.settings.sessionModel) return this.state.settings.sessionModel;
     if (!this.catalogCache) {
       try {
@@ -283,7 +305,7 @@ export class GitlabTodoRuntime {
   }
 
   sessionPollMs() {
-    return Number.isFinite(this.config.sessionPollMs) ? Math.max(20, this.config.sessionPollMs) : 5000;
+    return Number.isFinite(this.config.sessionPollMs) ? Math.max(20, this.config.sessionPollMs) : 3000;
   }
 
   ensureSessionTimer() {
@@ -466,10 +488,63 @@ export class GitlabTodoRuntime {
         .filter((todo) => !this.dispatches.has(todo.id));
       this.state.lastNewCount = candidates.length;
       if (this.state.settings.enabled && this.state.settings.autoProcess) {
-        const directMentions = candidates
-          .filter((todo) => classifyTodo(todo, this.gitlabUserId) === 'direct-mention')
+        // 1) 规则跳过：流水线通知等噪声零模型调用，程序内直接标记完成。
+        if (this.state.settings.ruleSkipEnabled !== false) {
+          const noise = candidates
+            .filter((todo) => classifyTodo(todo, this.gitlabUserId) === 'pipeline-notify')
+            .slice(0, MAX_RULE_SKIPS_PER_POLL);
+          for (const todo of noise) {
+            try {
+              await this.markTodoDone(todo);
+              this.state.handled[todo.id] = {
+                id: todo.id,
+                sessionId: null,
+                outcome: 'rule-skipped',
+                automatic: true,
+                acceptedAt: Date.now(),
+                skipReason: '流水线通知，规则判定无需处理',
+                title: todo.title,
+                url: todo.url,
+                project: todo.project,
+              };
+            } catch (error) {
+              this.ctx.logger?.warn?.(`[gitlab-todo-agent] 规则跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
+            }
+          }
+        }
+        // 2) LLM 快速预检：在轮询阶段并行完成（不占用会话并发槽，也不阻塞队列），
+        //    只有判定需要处理的 Todo 才进入派发队列，槽位空闲时会话可立即创建。
+        let mentions = candidates
+          .filter((todo) => !this.state.handled[todo.id] && classifyTodo(todo, this.gitlabUserId) === 'direct-mention')
           .slice(0, this.state.settings.maxSessionsPerPoll);
-        this.enqueueDispatch(directMentions);
+        if (this.state.settings.precheckEnabled && mentions.length > 0) {
+          const ready = [];
+          await mapLimit(mentions, PRECHECK_CONCURRENCY, async (todo) => {
+            const verdict = await this.judgeNeedsProcessing(todo);
+            if (!verdict.needsProcessing) {
+              try {
+                await this.markTodoDone(todo);
+                this.state.handled[todo.id] = {
+                  id: todo.id,
+                  sessionId: null,
+                  outcome: 'precheck-skipped',
+                  automatic: true,
+                  acceptedAt: Date.now(),
+                  skipReason: verdict.reason,
+                  title: todo.title,
+                  url: todo.url,
+                  project: todo.project,
+                };
+              } catch (error) {
+                this.ctx.logger?.warn?.(`[gitlab-todo-agent] 预检跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
+              }
+              return;
+            }
+            ready.push(todo);
+          });
+          mentions = ready;
+        }
+        this.enqueueDispatch(mentions);
         void this.pump();
       }
     } catch (error) {
@@ -712,27 +787,6 @@ export class GitlabTodoRuntime {
         this.state.lastDispatchError = null;
         await this.persistQuietly('MR 直接完成');
         return { ok: true, sessionId: null, duplicate: false, skipped: true };
-      }
-      if (trackSlot && this.state.settings.precheckEnabled) {
-        const verdict = await this.judgeNeedsProcessing(todo);
-        if (!verdict.needsProcessing) {
-          await this.markTodoDone(todo);
-          this.state.handled[todo.id] = {
-            id: todo.id,
-            sessionId: null,
-            outcome: 'precheck-skipped',
-            automatic: trackSlot,
-            acceptedAt: Date.now(),
-            skipReason: verdict.reason,
-            title: todo.title,
-            url: todo.url,
-            project: todo.project,
-          };
-          delete this.state.pending[todo.id];
-          this.state.lastDispatchError = null;
-          await this.persistQuietly('预检跳过');
-          return { ok: true, sessionId: null, duplicate: false, skipped: true, reason: verdict.reason };
-        }
       }
       if (trackSlot) {
         this.reserveSlot();

@@ -114,6 +114,15 @@ test('settings validation preserves supported fields and drops legacy script fie
   assert.equal(configured.sessionCwd, 'D:\\work\\repo');
   assert.deepEqual(configured.sessionModel, { provider: 'deepseek', model: 'deepseek-chat' });
   assert.equal(validateSettings({ sessionModel: null }, configured).sessionModel, null);
+  const judged = validateSettings({
+    ruleSkipEnabled: false,
+    judgeModel: { provider: ' deepseek ', model: ' fast-chat ' },
+  }, defaultSettings());
+  assert.equal(judged.ruleSkipEnabled, false);
+  assert.deepEqual(judged.judgeModel, { provider: 'deepseek', model: 'fast-chat' });
+  assert.equal(judged.precheckEnabled, true);
+  assert.throws(() => validateSettings({ judgeModel: { provider: 'deepseek' } }, defaultSettings()), /预检模型/);
+  assert.throws(() => validateSettings({ ruleSkipEnabled: 'yes' }, defaultSettings()), /ruleSkipEnabled/);
   assert.throws(() => validateSettings({ sessionModel: { provider: 'deepseek' } }, defaultSettings()), /Session 模型/);
   assert.throws(() => validateSettings({ sessionCwd: 42 }, defaultSettings()), /Session 工作区文件夹/);
   assert.throws(() => validateSettings({ cwd: 42 }, defaultSettings()), /GitLab 工作目录/);
@@ -259,6 +268,93 @@ test('manual dispatch never runs the precheck', async () => {
   assert.equal(result.ok, true);
   assert.equal(judged, 0);
   assert.equal(calls.create, 1);
+  await runtime.stop();
+});
+
+const pipelineTodo = {
+  ...sessionTodo,
+  id: 9001,
+  action_name: 'build_failed',
+  author: { id: 9, username: 'ci-bot' },
+};
+
+test('pipeline notifications are marked done by rule without any model call', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  let marked = 0;
+  let judged = 0;
+  runtime.markTodoDone = async () => { marked += 1; };
+  runtime.judgeNeedsProcessing = async () => { judged += 1; return { needsProcessing: true, reason: '' }; };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.fetchTodos = async () => normalizeTodos([pipelineTodo, directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(classifyTodo(normalizeTodos([pipelineTodo])[0], '106'), 'pipeline-notify');
+  // 规则噪声：零模型调用直接标记完成；直接提及照常走预检并开会话。
+  assert.equal(marked, 1);
+  assert.equal(judged, 1);
+  assert.equal(calls.create, 1);
+  assert.equal(runtime.state.handled['9001'].outcome, 'rule-skipped');
+  assert.equal(runtime.state.handled['9001'].sessionId, null);
+  assert.match(runtime.state.handled['9001'].skipReason, /流水线通知/);
+  assert.equal(runtime.state.handled.direct.outcome, 'session-accepted');
+  const restored = normalizeState(JSON.parse(JSON.stringify(runtime.state)));
+  assert.equal(restored.handled['9001'].outcome, 'rule-skipped');
+  await runtime.stop();
+});
+
+test('disabling rule skip keeps pipeline notifications untouched', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  let marked = 0;
+  runtime.markTodoDone = async () => { marked += 1; };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.state.settings.ruleSkipEnabled = false;
+  runtime.fetchTodos = async () => normalizeTodos([pipelineTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(marked, 0);
+  assert.equal(calls.create, 0);
+  assert.equal(runtime.state.handled['9001'], undefined);
+  await runtime.stop();
+});
+
+test('poll-stage precheck judges mentions in place and only enqueues the needed ones', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  let marked = 0;
+  let judged = 0;
+  runtime.markTodoDone = async () => { marked += 1; };
+  const declined = new Set(['direct']);
+  runtime.judgeNeedsProcessing = async (todo) => {
+    judged += 1;
+    return declined.has(todo.id)
+      ? { needsProcessing: false, reason: '纯感谢，无需处理' }
+      : { needsProcessing: true, reason: '有具体问题' };
+  };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  const secondMention = { ...directNoteTodo, id: 'direct2', target_url: 'https://gitlab.local/group/project/-/issues/7#note_11' };
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo, secondMention]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  // 每条提及只预检一次（派发路径不再重复调用模型）。
+  assert.equal(judged, 2);
+  assert.equal(runtime.state.handled.direct.outcome, 'precheck-skipped');
+  assert.equal(runtime.state.handled.direct.skipReason, '纯感谢，无需处理');
+  assert.equal(runtime.state.handled.direct2.outcome, 'session-accepted');
+  assert.equal(calls.create, 1);
+  assert.equal(calls.prompt, 1);
+  assert.equal(marked, 1);
+  await runtime.stop();
+});
+
+test('judge model prefers the dedicated precheck model over the session model', async () => {
+  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.state.settings.sessionModel = { provider: 'deepseek', model: 'big-model' };
+  runtime.state.settings.judgeModel = { provider: 'deepseek', model: 'fast-model' };
+  assert.deepEqual(await runtime.judgeModel(), { provider: 'deepseek', model: 'fast-model' });
+  runtime.state.settings.judgeModel = null;
+  assert.deepEqual(await runtime.judgeModel(), { provider: 'deepseek', model: 'big-model' });
   await runtime.stop();
 });
 

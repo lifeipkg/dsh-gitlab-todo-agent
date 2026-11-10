@@ -4,6 +4,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   enabled: false,
   autoProcess: true,
   precheckEnabled: true,
+  ruleSkipEnabled: true,
   autoArchive: true,
   intervalSeconds: 300,
   maxSessionsPerPoll: 2,
@@ -11,6 +12,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   cwd: '',
   sessionCwd: '',
   sessionModel: null,
+  judgeModel: null,
 });
 
 function isRecord(value) {
@@ -38,7 +40,7 @@ export function defaultSettings() {
 export function validateSettings(input, current = defaultSettings()) {
   if (!isRecord(input)) throw new Error('设置必须是 JSON 对象。');
   const next = { ...current };
-  for (const key of ['enabled', 'autoProcess', 'precheckEnabled', 'autoArchive']) {
+  for (const key of ['enabled', 'autoProcess', 'precheckEnabled', 'ruleSkipEnabled', 'autoArchive']) {
     if (key in input) {
       if (typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值。`);
       next[key] = input[key];
@@ -73,17 +75,19 @@ export function validateSettings(input, current = defaultSettings()) {
       next[key] = input[key].trim();
     }
   }
-  if ('sessionModel' in input) {
-    const value = input.sessionModel;
-    if (value !== null && (!isRecord(value)
-      || typeof value.provider !== 'string' || !value.provider.trim() || value.provider.length > 200
-      || typeof value.model !== 'string' || !value.model.trim() || value.model.length > 200)) {
-      throw new Error('Session 模型必须是 null，或包含非空 provider 和 model 的对象。');
+  for (const key of ['sessionModel', 'judgeModel']) {
+    if (key in input) {
+      const value = input[key];
+      if (value !== null && (!isRecord(value)
+        || typeof value.provider !== 'string' || !value.provider.trim() || value.provider.length > 200
+        || typeof value.model !== 'string' || !value.model.trim() || value.model.length > 200)) {
+        throw new Error(`${key === 'sessionModel' ? 'Session 模型' : '预检模型'}必须是 null，或包含非空 provider 和 model 的对象。`);
+      }
+      next[key] = value === null ? null : {
+        provider: value.provider.trim(),
+        model: value.model.trim(),
+      };
     }
-    next.sessionModel = value === null ? null : {
-      provider: value.provider.trim(),
-      model: value.model.trim(),
-    };
   }
   return next;
 }
@@ -150,8 +154,17 @@ export function isDirectNoteMention(todo, currentUserId) {
     && authorId !== userId;
 }
 
+/** 规则即可判定无需处理的 GitLab action_name 噪声集合（零模型调用直接标记完成）。 */
+export const NOISE_ACTIONS = ['build_failed'];
+
+/** 流水线通知等规则噪声：不需要 LLM，程序内直接标记完成。 */
+export function isNoiseTodo(todo) {
+  return NOISE_ACTIONS.includes(String(todo?.action ?? '').toLowerCase());
+}
+
 export function classifyTodo(todo, currentUserId) {
   if (isDirectNoteMention(todo, currentUserId)) return 'direct-mention';
+  if (isNoiseTodo(todo)) return 'pipeline-notify';
   const targetType = String(todo.targetType ?? '').toLowerCase().replace(/[^a-z]/g, '');
   if (targetType === 'mergerequest' || /\/-\/merge_requests(?:\/|$)/i.test(todo.url ?? '')) {
     return 'merge-request';
@@ -307,7 +320,7 @@ export function normalizeState(value) {
     for (const [id, record] of Object.entries(value.handled)) {
       if (!isRecord(record)) continue;
       const sessionId = typeof record.sessionId === 'string' && record.sessionId ? record.sessionId : null;
-      const outcome = record.outcome === 'merge-request-done' || record.outcome === 'precheck-skipped'
+      const outcome = record.outcome === 'merge-request-done' || record.outcome === 'precheck-skipped' || record.outcome === 'rule-skipped'
         ? record.outcome : 'session-accepted';
       if (!sessionId && outcome === 'session-accepted') continue;
       handled[id] = {
