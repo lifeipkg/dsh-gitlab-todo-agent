@@ -4,6 +4,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   enabled: false,
   autoProcess: true,
   precheckEnabled: true,
+  autoArchive: true,
   intervalSeconds: 300,
   maxSessionsPerPoll: 2,
   maxConcurrentSessions: 2,
@@ -37,7 +38,7 @@ export function defaultSettings() {
 export function validateSettings(input, current = defaultSettings()) {
   if (!isRecord(input)) throw new Error('设置必须是 JSON 对象。');
   const next = { ...current };
-  for (const key of ['enabled', 'autoProcess', 'precheckEnabled']) {
+  for (const key of ['enabled', 'autoProcess', 'precheckEnabled', 'autoArchive']) {
     if (key in input) {
       if (typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值。`);
       next[key] = input[key];
@@ -315,6 +316,8 @@ export function normalizeState(value) {
         completedAt: timestamp(record.completedAt),
         executionError: text(record.executionError),
         skipReason: text(record.skipReason).slice(0, 300),
+        archived: record.archived === true,
+        archiveError: text(record.archiveError).slice(0, 300),
         title: text(record.title, `GitLab Todo ${id}`),
         url: safeUrl(record.url),
         project: text(record.project),
@@ -373,6 +376,7 @@ export function sessionProjection(state) {
       acceptedAt: record.acceptedAt,
       completedAt: record.completedAt ?? null,
       executionError: record.executionError ?? '',
+      archived: record.archived === true,
     }));
   const pending = Object.values(state.pending)
     .filter((record) => Boolean(record.sessionId))

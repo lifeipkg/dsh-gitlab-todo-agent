@@ -387,6 +387,17 @@ export class GitlabTodoRuntime {
           handled.executionStatus = inspection.outcome === 'succeeded' ? 'completed' : 'failed';
           handled.completedAt = Date.now();
           handled.executionError = inspection.error ?? '';
+          if (inspection.outcome === 'succeeded' && this.state.settings.autoArchive !== false) {
+            try {
+              await this.host.archiveSession(sessionId);
+              handled.archived = true;
+              handled.archiveError = '';
+            } catch (archiveError) {
+              // 归档失败不影响执行结算；仍有工作在跑等拒绝只记录原因，不强行停止任何工作。
+              handled.archiveError = errorMessage(archiveError);
+              this.ctx.logger?.warn?.(`[gitlab-todo-agent] 归档会话 ${sessionId} 失败：${handled.archiveError}`);
+            }
+          }
           changed = true;
         }
         this.untrackSession(sessionId);
@@ -729,6 +740,8 @@ export class GitlabTodoRuntime {
         executionStatus: 'running',
         automatic: trackSlot,
         sessionTitle,
+        archived: false,
+        archiveError: '',
         acceptedAt: Date.now(),
         title: todo.title,
         url: todo.url,

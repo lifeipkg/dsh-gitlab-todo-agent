@@ -316,6 +316,8 @@ function runtimeWithPrompt(prompt, options = {}) {
     modelSelections: [],
     renames: [],
     invocations: [],
+    archives: [],
+    failArchive: false,
     sessions,
     failList: false,
   };
@@ -341,8 +343,15 @@ function runtimeWithPrompt(prompt, options = {}) {
   const gateway = {
     async invoke(call) {
       calls.invocations.push(call);
-      assert.equal(call.namespace, 'session');
       assert.equal(call.peer.principal.kind, 'owner');
+      if (call.namespace === 'workspace') {
+        assert.equal(call.method, 'archiveSession');
+        assert.deepEqual(call.args, { request: { sessionId: call.args.request.sessionId } });
+        if (calls.failArchive) throw new Error('workspace/session-active');
+        calls.archives.push(call.args.request.sessionId);
+        return { archivedSessionIds: [call.args.request.sessionId] };
+      }
+      assert.equal(call.namespace, 'session');
       const { method, args } = call;
       if (method === 'modelCatalog') {
         assert.deepEqual(args, {});
@@ -613,20 +622,23 @@ test('reconcile settles executions by turn/end verdict and never misreads roster
   assert.equal(runtime.state.handled.direct.executionStatus, 'running');
   assert.equal(runtime.occupiedSlots(), 1);
 
-  // 回合完成：结算 completed 并释放槽位。
+  // 回合完成：结算 completed、自动归档并释放槽位。
   calls.failList = false;
   calls.complete('session-1');
   await runtime.reconcileSessions();
   assert.equal(runtime.state.handled.direct.executionStatus, 'completed');
+  assert.deepEqual(calls.archives, ['session-1']);
+  assert.equal(runtime.state.handled.direct.archived, true);
   assert.equal(runtime.occupiedSlots(), 0);
 
-  // 回合失败：结算 failed。
+  // 回合失败：结算 failed，不归档。
   const [retry] = normalizeTodos([{ ...directNoteTodo, id: 'failing', target_url: 'https://gitlab.local/group/project/-/issues/7#note_77' }]);
   await runtime.dispatch(retry, true);
   calls.complete('session-2', 'error');
   await runtime.reconcileSessions();
   assert.equal(runtime.state.handled.failing.executionStatus, 'failed');
-  assert.ok(runtime.state.handled.failing.executionError.includes('error'));
+  assert.equal(runtime.state.handled.failing.archived, false);
+  assert.deepEqual(calls.archives, ['session-1']);
 
   // 会话从名册消失：结算 failed 而不是永久占槽。
   const [vanishing] = normalizeTodos([{ ...directNoteTodo, id: 'vanishing', target_url: 'https://gitlab.local/group/project/-/issues/7#note_78' }]);
@@ -636,6 +648,37 @@ test('reconcile settles executions by turn/end verdict and never misreads roster
   assert.equal(runtime.state.handled.vanishing.executionStatus, 'failed');
   assert.equal(runtime.occupiedSlots(), 0);
   await runtime.stop();
+});
+
+test('archive refusal and the switch never affect settlement', async () => {
+  const refused = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  refused.calls.failArchive = true;
+  refused.runtime.state.settings.enabled = true;
+  refused.runtime.state.settings.autoProcess = true;
+  refused.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await refused.runtime.executePoll('test');
+  await refused.runtime.pump();
+  refused.calls.complete('session-1');
+  await refused.runtime.reconcileSessions();
+  assert.equal(refused.runtime.state.handled.direct.executionStatus, 'completed');
+  assert.equal(refused.runtime.state.handled.direct.archived, false);
+  assert.match(refused.runtime.state.handled.direct.archiveError, /session-active/);
+  assert.equal(refused.runtime.occupiedSlots(), 0);
+  await refused.runtime.stop();
+
+  const off = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  off.runtime.state.settings.enabled = true;
+  off.runtime.state.settings.autoProcess = true;
+  off.runtime.state.settings.autoArchive = false;
+  off.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await off.runtime.executePoll('test');
+  await off.runtime.pump();
+  off.calls.complete('session-1');
+  await off.runtime.reconcileSessions();
+  assert.equal(off.runtime.state.handled.direct.executionStatus, 'completed');
+  assert.deepEqual(off.calls.archives, []);
+  assert.equal(off.runtime.state.handled.direct.archived, false);
+  await off.runtime.stop();
 });
 
 test('manual refresh does not dispatch while automatic processing is disabled', async () => {

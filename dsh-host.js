@@ -88,6 +88,23 @@ export class DshHostClient {
     return this.invoke('rename', { sessionId, title });
   }
 
+  /**
+   * 归档会话：workspace 命名空间，owner-only。
+   * 不带 stopActivity——仍有工作在跑的会话会被 Host 以 workspace/session-active 拒绝，
+   * 调用方据此把失败记录下来而不是强行停止任何工作。
+   */
+  archiveSession(sessionId) {
+    if (!this.gateway || typeof this.gateway.invoke !== 'function') {
+      throw new Error('当前 Host 不提供 typertGateway.invoke，无法归档会话。');
+    }
+    return this.gateway.invoke({
+      namespace: 'workspace',
+      method: 'archiveSession',
+      args: { request: { sessionId } },
+      peer: this.peer,
+    });
+  }
+
   prompt(request) {
     return this.invoke('prompt', request);
   }
