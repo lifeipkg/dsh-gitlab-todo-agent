@@ -133,6 +133,13 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   assert.match(prompt, /discussions\/<discussion-id>\/notes/);
   assert.match(prompt, /不可信/);
   assert.match(prompt, /只有实际完成/);
+  // MR 自动合并条款：Jev 裁决 + CI 双通过才直接合并，且豁免只覆盖本 Session 新建的 MR。
+  assert.match(prompt, /按 JEV-GATE\.md 完成 Jev 裁决并留痕/);
+  assert.match(prompt, /CI 全部通过后，直接合并该 MR/);
+  assert.match(prompt, /无需人类授权/);
+  assert.match(prompt, /仅适用于本 Session 新建的 MR/);
+  assert.match(prompt, /Jev 裁决未通过或 CI 未通过时不得合并/);
+  assert.match(prompt, /第 5 条已豁免的 MR 合并授权除外/);
   assert.match(prompt, /#note_10/);
   assert.match(prompt, /other-user/);
 });

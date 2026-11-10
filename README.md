@@ -41,8 +41,9 @@ Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再�
 每个处理提示词都会携带 Todo ID、原 note ID、目标 URL 和 note 作者，并明确要求：
 
 1. 正常处理结束后，在原 note 所属的 discussion 中回复提出该 note 的人，说明处理结果、实际改动或阻塞原因，而不是只新建顶层评论。
-2. 只有实际完成该 Todo 后，才运行 `glab api -X POST todos/<todo-id>/mark_as_done`，仅标记当前这一条 Todo。
-3. 无法完成、需要人类决策或未获发布授权时，不运行完成命令；正常情况下仍应在原 note 回应进度和阻塞原因。
+2. 如果本次处理新建了 MR（由该 Session 创建）：按 JEV-GATE.md 完成 Jev 裁决并留痕，且该 MR 的 CI 全部通过后，**直接合并该 MR，无需人类授权**——这是对工作区「合并 main 须人类授权」规则在插件会话中的显式豁免，仅适用于该 Session 新建的 MR。Jev 裁决或 CI 未通过时不得合并，修复重跑后仍不过则保留 MR 并说明原因；非该 Session 创建的 MR 不适用。
+3. 只有实际完成该 Todo 后，才运行 `glab api -X POST todos/<todo-id>/mark_as_done`，仅标记当前这一条 Todo。
+4. 无法完成或需要人类决策（上述 MR 合并授权除外）时，不运行完成命令；正常情况下仍应在原 note 回应进度和阻塞原因。
 
 ## DSH 会话交互（对齐 dsh-task-board 实现）
 
