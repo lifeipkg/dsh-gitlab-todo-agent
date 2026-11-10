@@ -238,6 +238,10 @@ export function normalizeState(value) {
         sessionId,
         outcome,
         acceptedAt: timestamp(record.acceptedAt) ?? Date.now(),
+        executionStatus: ['running', 'completed', 'failed'].includes(record.executionStatus) ? record.executionStatus : null,
+        automatic: record.automatic !== false,
+        completedAt: timestamp(record.completedAt),
+        executionError: text(record.executionError),
         title: text(record.title, `GitLab Todo ${id}`),
         url: safeUrl(record.url),
         project: text(record.project),
@@ -252,6 +256,7 @@ export function normalizeState(value) {
         pending[id] = {
         sessionId: record.sessionId,
         createdAt: timestamp(record.createdAt) ?? Date.now(),
+        automatic: record.automatic !== false,
         item: normalizeTodo(record.item),
         };
       } catch {}
@@ -291,6 +296,8 @@ export function publicState(state, running = false, currentUserId = null) {
       directMention: isDirectNoteMention(todo, currentUserId),
       handled: Boolean(state.handled[todo.id]),
       outcome: state.handled[todo.id]?.outcome ?? null,
+      executionStatus: state.handled[todo.id]?.executionStatus ?? null,
+      executionError: state.handled[todo.id]?.executionError ?? '',
       sessionId: state.handled[todo.id]?.sessionId ?? state.pending[todo.id]?.sessionId ?? null,
     })),
     recent: state.recent.map((record) => ({ ...record })),

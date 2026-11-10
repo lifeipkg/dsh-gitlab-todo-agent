@@ -186,28 +186,116 @@ test('state normalization migrates v1 and v2 script states to v3', () => {
   assert.throws(() => normalizeState({ version: 99 }), /版本不受支持/);
 });
 
-function runtimeWithPrompt(prompt) {
-  const calls = { create: 0, prompt: 0, createRequests: [], modelSelections: [] };
-  const ctx = {
-    sessionController: {
-      async create(request) {
+function runtimeWithPrompt(prompt, options = {}) {
+  const sessions = new Map();
+  const calls = {
+    create: 0,
+    prompt: 0,
+    createRequests: [],
+    modelSelections: [],
+    renames: [],
+    invocations: [],
+    sessions,
+    failList: false,
+  };
+  const autoComplete = options.autoComplete !== false;
+  const complete = (sessionId, kind = 'completed') => {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+    session.running = false;
+    session.events.push({
+      type: 'turn/end',
+      seq: session.events.length + 1,
+      time: Date.now(),
+      data: { reason: { kind } },
+    });
+  };
+  calls.complete = complete;
+  const catalog = {
+    default: { provider: 'deepseek', model: 'deepseek-chat' },
+    routableProviders: ['deepseek'],
+    groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }] }],
+    failures: [],
+  };
+  const gateway = {
+    async invoke(call) {
+      calls.invocations.push(call);
+      assert.equal(call.namespace, 'session');
+      assert.equal(call.peer.principal.kind, 'owner');
+      const { method, args } = call;
+      if (method === 'modelCatalog') {
+        assert.deepEqual(args, {});
+        return catalog;
+      }
+      if (method === 'list') {
+        assert.deepEqual(args, { _request: {} });
+        if (calls.failList) throw new Error('roster unavailable');
+        return {
+          items: [...sessions.entries()].map(([sessionId, session]) => ({ sessionId, running: session.running })),
+        };
+      }
+      const request = args.request;
+      if (method === 'create') {
         calls.create += 1;
         calls.createRequests.push(request);
-        return { sessionId: `session-${calls.create}` };
-      },
-      async selectModel(request) {
+        const sessionId = `session-${calls.create}`;
+        sessions.set(sessionId, { running: false, events: [] });
+        return { sessionId };
+      }
+      if (method === 'rename') {
+        calls.renames.push(request);
+        return {};
+      }
+      if (method === 'selectModel') {
         calls.modelSelections.push(request);
         return { selected: request };
-      },
-      async modelCatalog() {
+      }
+      if (method === 'prompt') {
+        calls.prompt += 1;
+        const session = sessions.get(request.sessionId);
+        session.running = true;
+        try {
+          const result = await prompt(request, call.signal);
+          if (autoComplete) complete(request.sessionId);
+          return result;
+        } catch (error) {
+          session.running = false;
+          throw error;
+        }
+      }
+      if (method === 'page') {
+        const session = sessions.get(request.address.sessionId);
         return {
-          default: { provider: 'deepseek', model: 'deepseek-chat' },
-          routableProviders: ['deepseek'],
-          groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }] }],
-          failures: [],
+          records: (session?.events ?? []).map((event) => ({ type: 'event', event })),
+          hasMore: false,
         };
-      },
-      prompt,
+      }
+      throw new Error(`unexpected session method: ${method}`);
+    },
+    async stream(call) {
+      assert.equal(call.peer.principal.kind, 'owner');
+      assert.equal(call.method, 'follow');
+      const session = sessions.get(call.args.request.address.sessionId);
+      const events = session?.events ?? [];
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: 'snapshot',
+            cursor: events.at(-1)?.seq ?? 0,
+            records: events.map((event) => ({ type: 'event', event })),
+            hasMore: false,
+          };
+        },
+      };
+    },
+  };
+  const ctx = {
+    typertGateway: gateway,
+    workspaceRegistry: {
+      list: () => [
+        { id: 'workspace-default', path: 'D:\\agent-workspace', updatedAt: '2026-01-01T00:00:00Z' },
+        { id: 'workspace-work', path: 'D:\\work\\repo', updatedAt: '2026-01-02T00:00:00Z' },
+      ],
     },
     logger: { warn() {} },
   };
@@ -219,11 +307,11 @@ function runtimeWithPrompt(prompt) {
 }
 
 test('dispatch creates and prompts once, then deduplicates accepted todos', async () => {
-  const { runtime, calls } = runtimeWithPrompt(async (request, signal) => {
-    calls.prompt += 1;
+  const { runtime, calls } = runtimeWithPrompt(async (request) => {
+    
     assert.equal(request.sessionId, 'session-1');
-    assert.ok(signal instanceof AbortSignal);
-    assert.equal(signal.aborted, false);
+    assert.equal(request.mode, 'queue');
+    assert.match(request.requestId, /^gitlab-todo-/);
     return { accepted: true };
   });
   const [todo] = normalizeTodos([sessionTodo]);
@@ -236,35 +324,24 @@ test('dispatch creates and prompts once, then deduplicates accepted todos', asyn
   assert.equal(runtime.state.handled[todo.id].sessionId, 'session-1');
 });
 
-test('dispatch applies the configured workspace and model before prompting', async () => {
-  const events = [];
-  const { runtime, calls } = runtimeWithPrompt(async () => {
-    events.push('prompt');
-    return { accepted: true };
-  });
+test('dispatch resolves workspaceId and applies the fixed model before prompting', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
   runtime.state.settings.sessionCwd = 'D:\\work\\repo';
   runtime.state.settings.sessionModel = { provider: 'deepseek', model: 'deepseek-chat' };
-  const originalCreate = runtime.ctx.sessionController.create;
-  runtime.ctx.sessionController.create = async (request) => {
-    events.push('create');
-    return originalCreate(request);
-  };
-  const originalSelectModel = runtime.ctx.sessionController.selectModel;
-  runtime.ctx.sessionController.selectModel = async (request) => {
-    events.push('model');
-    return originalSelectModel(request);
-  };
   const [todo] = normalizeTodos([sessionTodo]);
   const result = await runtime.dispatch(todo);
   assert.equal(result.ok, true);
-  assert.deepEqual(calls.createRequests, [{ cwd: 'D:\\work\\repo' }]);
+  assert.deepEqual(calls.createRequests, [{ workspaceId: 'workspace-work' }]);
   assert.deepEqual(calls.modelSelections, [{ sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-chat' }]);
-  assert.deepEqual(events, ['create', 'model', 'prompt']);
+  assert.deepEqual(calls.renames, [{ sessionId: 'session-1', title: todo.title }]);
+  const methods = calls.invocations.map((call) => call.method);
+  assert.ok(methods.indexOf('create') < methods.indexOf('selectModel'));
+  assert.ok(methods.indexOf('selectModel') < methods.indexOf('prompt'));
 });
 
 test('a failed prompt reuses its pending session on the next dispatch', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => {
-    calls.prompt += 1;
+    
     if (calls.prompt === 1) throw new Error('temporary failure');
     return { accepted: true };
   });
@@ -282,7 +359,7 @@ test('a failed prompt reuses its pending session on the next dispatch', async ()
 
 test('non-mention MR dispatch marks GitLab done without a Session and survives reload', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => {
-    calls.prompt += 1;
+    
     return { accepted: true };
   });
   let marked = 0;
@@ -303,7 +380,7 @@ test('non-mention MR dispatch marks GitLab done without a Session and survives r
 
 test('direct MR note mention dispatch creates a Session instead of marking done', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => {
-    calls.prompt += 1;
+    
     return { accepted: true };
   });
   let marked = 0;
@@ -325,7 +402,7 @@ test('direct MR note mention dispatch creates a Session instead of marking done'
 
 test('automatic poll only dispatches direct note mentions from other users', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => {
-    calls.prompt += 1;
+    
     return { accepted: true };
   });
   let marked = 0;
@@ -354,19 +431,14 @@ test('automatic poll only dispatches direct note mentions from other users', asy
   }
 });
 
-test('auto dispatch holds concurrency slots until tracked sessions finish', async () => {
+test('auto dispatch holds concurrency slots until sessions actually settle', async () => {
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const waitFor = async (predicate) => {
     for (let i = 0; i < 400 && !predicate(); i += 1) await delay(5);
   };
-  const { runtime, calls } = runtimeWithPrompt(async () => {
-    await delay(5);
-    return { accepted: true };
-  });
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   runtime.config.slotWaitMs = 20;
-  runtime.ctx.sessionController.list = async () => ({
-    items: [...runtime.trackedSessions.keys()].map((id) => ({ sessionId: id, running: true })),
-  });
+  runtime.config.sessionPollMs = 20;
   runtime.state.settings.enabled = true;
   runtime.state.settings.autoProcess = true;
   runtime.state.settings.maxSessionsPerPoll = 4;
@@ -382,45 +454,67 @@ test('auto dispatch holds concurrency slots until tracked sessions finish', asyn
   assert.equal(calls.create, 2);
   assert.equal(runtime.occupiedSlots(), 2);
 
-  runtime.untrackSession('session-1');
+  // 第 1 个会话回合完成并结算后，槽位释放，队列启动第 3 个。
+  calls.complete('session-1');
   await waitFor(() => calls.create >= 3);
   assert.equal(calls.create, 3);
   assert.equal(runtime.occupiedSlots(), 2);
 
-  runtime.untrackSession('session-2');
-  runtime.untrackSession('session-3');
+  calls.complete('session-2');
+  calls.complete('session-3');
   await waitFor(() => calls.create >= 4);
   assert.equal(calls.create, 4);
 
-  runtime.untrackSession('session-4');
+  calls.complete('session-4');
+  await waitFor(() => runtime.occupiedSlots() === 0);
   await runtime.pump();
   assert.equal(runtime.dispatchQueue.length, 0);
-  assert.equal(runtime.occupiedSlots(), 0);
+  await runtime.stop();
 });
 
-test('status events release slots and list fallback removes stale sessions', async () => {
-  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
-  const events = new Map();
-  runtime.ctx.on = (name, listener) => {
-    events.set(name, listener);
-    return () => events.delete(name);
+test('reconcile settles executions by turn/end verdict and never misreads roster failures', async () => {
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const waitFor = async (predicate) => {
+    for (let i = 0; i < 400 && !predicate(); i += 1) await delay(5);
   };
-  runtime.installSessionStatusListeners();
-  assert.equal(runtime.statusEventsAvailable, true);
-  runtime.trackSession('session-a');
-  runtime.trackSession('session-b');
-  assert.equal(runtime.occupiedSlots(), 2);
-  events.get('api-session/status')('session-a', false);
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  runtime.config.sessionPollMs = 20;
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(runtime.state.handled.direct.executionStatus, 'running');
+
+  // 名册读取失败不是空闲：结算保持 running，不释放槽位。
+  calls.failList = true;
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.handled.direct.executionStatus, 'running');
   assert.equal(runtime.occupiedSlots(), 1);
-  events.get('api-session/removed')('session-b');
+
+  // 回合完成：结算 completed 并释放槽位。
+  calls.failList = false;
+  calls.complete('session-1');
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.handled.direct.executionStatus, 'completed');
   assert.equal(runtime.occupiedSlots(), 0);
 
-  runtime.ctx.sessionController.list = async () => ({ items: [{ sessionId: 'session-c', running: true }] });
-  runtime.trackSession('session-c');
-  runtime.trackSession('session-d');
-  await runtime.refreshTrackedSessions();
-  assert.equal(runtime.trackedSessions.has('session-c'), true);
-  assert.equal(runtime.trackedSessions.has('session-d'), false);
+  // 回合失败：结算 failed。
+  const [retry] = normalizeTodos([{ ...directNoteTodo, id: 'failing', target_url: 'https://gitlab.local/group/project/-/issues/7#note_77' }]);
+  await runtime.dispatch(retry, true);
+  calls.complete('session-2', 'error');
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.handled.failing.executionStatus, 'failed');
+  assert.ok(runtime.state.handled.failing.executionError.includes('error'));
+
+  // 会话从名册消失：结算 failed 而不是永久占槽。
+  const [vanishing] = normalizeTodos([{ ...directNoteTodo, id: 'vanishing', target_url: 'https://gitlab.local/group/project/-/issues/7#note_78' }]);
+  await runtime.dispatch(vanishing, true);
+  calls.sessions.delete('session-3');
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.handled.vanishing.executionStatus, 'failed');
+  assert.equal(runtime.occupiedSlots(), 0);
+  await runtime.stop();
 });
 
 test('manual refresh does not dispatch while automatic processing is disabled', async () => {

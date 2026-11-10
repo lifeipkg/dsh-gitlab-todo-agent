@@ -4,6 +4,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DshHostClient } from './dsh-host.js';
 import {
   buildTodoPrompt,
   classifyTodo,
@@ -53,11 +54,13 @@ export class GitlabTodoRuntime {
     this.stopping = false;
     this.unregisterRoute = null;
     this.gitlabUserId = null;
+    this.host = new DshHostClient(ctx);
     this.trackedSessions = new Map();
     this.slotReservations = 0;
     this.statusWaiters = new Set();
-    this.statusEventsAvailable = false;
-    this.removeStatusListeners = [];
+    this.sessionRosterKnown = false;
+    this.reconcilePromise = null;
+    this.sessionTimer = null;
     this.dispatchQueue = [];
     this.pumpPromise = null;
   }
@@ -106,29 +109,8 @@ export class GitlabTodoRuntime {
       requestBody: 'buffered',
       fetch: (request) => this.handleFetch(request),
     });
-    this.installSessionStatusListeners();
+    await this.reconcileSessions();
     this.resetTimer();
-  }
-
-  installSessionStatusListeners() {
-    if (typeof this.ctx.on !== 'function') return;
-    const onStatus = (sessionId, running) => {
-      if (typeof sessionId !== 'string' && typeof sessionId !== 'number') return;
-      if (!this.trackedSessions.has(String(sessionId))) return;
-      if (running === false) this.untrackSession(String(sessionId));
-    };
-    const onRemoved = (sessionId) => {
-      if (typeof sessionId === 'string' || typeof sessionId === 'number') {
-        this.untrackSession(String(sessionId));
-      }
-    };
-    try {
-      this.removeStatusListeners.push(this.ctx.on('api-session/status', onStatus));
-      this.removeStatusListeners.push(this.ctx.on('api-session/removed', onRemoved));
-      this.statusEventsAvailable = true;
-    } catch (error) {
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 订阅 Session 状态失败：${errorMessage(error)}`);
-    }
   }
 
   async stop() {
@@ -136,23 +118,23 @@ export class GitlabTodoRuntime {
     this.dispatchQueue = [];
     this.wakeWaiters();
     clearInterval(this.timer);
+    clearInterval(this.sessionTimer);
     clearTimeout(this.initialTimer);
     if (this.unregisterRoute) await this.unregisterRoute();
     this.unregisterRoute = null;
-    for (const dispose of this.removeStatusListeners.splice(0)) {
-      try { dispose?.(); } catch {}
-    }
     this.activeChild?.kill();
     await Promise.allSettled([
+      this.reconcilePromise?.catch(() => {}),
       this.pumpPromise?.catch(() => {}),
       this.writeChain.catch(() => {}),
     ]);
+    await this.host.dispose();
   }
 
   snapshot() {
     return {
       ...publicState(this.state, Boolean(this.pollPromise), this.gitlabUserId),
-      activeSessions: this.trackedSessions.size,
+      activeSessions: [...this.trackedSessions.values()].filter((record) => record.countsSlot).length,
       queuedSessions: this.dispatchQueue.length,
       storage: {
         directory: this.storageDirectory(),
@@ -218,11 +200,27 @@ export class GitlabTodoRuntime {
   }
 
   occupiedSlots() {
-    return this.trackedSessions.size + this.slotReservations;
+    const tracked = [...this.trackedSessions.values()].filter((record) => record.countsSlot).length;
+    return tracked + this.slotReservations;
   }
 
   hasFreeSlot() {
-    return this.occupiedSlots() < this.concurrencyLimit();
+    return this.sessionRosterKnown && this.occupiedSlots() < this.concurrencyLimit();
+  }
+
+  sessionPollMs() {
+    return Number.isFinite(this.config.sessionPollMs) ? Math.max(20, this.config.sessionPollMs) : 5000;
+  }
+
+  ensureSessionTimer() {
+    const needed = !this.stopping && (this.trackedSessions.size > 0 || this.dispatchQueue.length > 0);
+    if (needed && !this.sessionTimer) {
+      this.sessionTimer = setInterval(() => void this.reconcileSessions(), this.sessionPollMs());
+      this.sessionTimer.unref?.();
+    } else if (!needed && this.sessionTimer) {
+      clearInterval(this.sessionTimer);
+      this.sessionTimer = null;
+    }
   }
 
   wakeWaiters() {
@@ -259,40 +257,74 @@ export class GitlabTodoRuntime {
     this.wakeWaiters();
   }
 
-  trackSession(sessionId) {
+  trackSession(sessionId, todoId, startedAt = Date.now(), countsSlot = true) {
     if (!sessionId || this.trackedSessions.has(sessionId)) return;
-    this.trackedSessions.set(sessionId, Date.now());
+    this.trackedSessions.set(sessionId, { todoId, startedAt, countsSlot, unreadablePolls: 0 });
+    this.ensureSessionTimer();
   }
 
   untrackSession(sessionId) {
     if (this.trackedSessions.delete(sessionId)) this.wakeWaiters();
+    this.ensureSessionTimer();
   }
 
-  async refreshTrackedSessions() {
-    const list = this.ctx.sessionController?.list;
-    if (typeof list !== 'function' || this.trackedSessions.size === 0) return;
-    let value;
+  reconcileSessions() {
+    if (this.reconcilePromise) return this.reconcilePromise;
+    const operation = this.executeReconcile().finally(() => {
+      if (this.reconcilePromise === operation) this.reconcilePromise = null;
+    });
+    this.reconcilePromise = operation;
+    return operation;
+  }
+
+  async executeReconcile() {
+    if (this.stopping) return;
     try {
-      value = await list({}, new AbortController().signal);
-    } catch {
-      return;
-    }
-    const items = Array.isArray(value?.items) ? value.items : [];
-    const byId = new Map();
-    for (const item of items) {
-      if (item?.sessionId) byId.set(String(item.sessionId), item);
-    }
-    const now = Date.now();
-    const graceMs = Number.isFinite(this.config.slotGraceMs) ? Math.max(0, this.config.slotGraceMs) : 15000;
-    for (const [sessionId, trackedAt] of [...this.trackedSessions]) {
-      const summary = byId.get(sessionId);
-      if (!summary) {
-        this.untrackSession(sessionId);
-        continue;
+      const value = await this.host.listSessions();
+      if (!Array.isArray(value?.items)) throw new Error('session/list 响应缺少 items 数组。');
+      this.sessionRosterKnown = true;
+      const byId = new Map(value.items.map((item) => [String(item.sessionId), item]));
+      const owned = new Map();
+      for (const record of Object.values(this.state.handled)) {
+        if (record?.sessionId && record.automatic !== false) owned.set(record.sessionId, { todoId: record.id, startedAt: record.acceptedAt });
       }
-      if (!this.statusEventsAvailable && summary.running === false && now - trackedAt > graceMs) {
+      for (const record of Object.values(this.state.pending)) {
+        if (record?.sessionId && record.item?.id && record.automatic !== false) {
+          owned.set(record.sessionId, { todoId: record.item.id, startedAt: record.createdAt });
+        }
+      }
+      // 重启恢复：只接管名册明确报告 running 的插件历史会话，避免扫描所有旧历史。
+      for (const [sessionId, record] of owned) {
+        if (byId.get(sessionId)?.running === true && !this.trackedSessions.has(sessionId)) {
+          this.trackSession(sessionId, record.todoId, record.startedAt);
+        }
+      }
+
+      let changed = false;
+      for (const [sessionId, tracked] of [...this.trackedSessions]) {
+        const summary = byId.get(sessionId);
+        const inspection = await this.host.inspectSession(sessionId, tracked.startedAt, summary);
+        if (inspection.outcome === 'pending') {
+          tracked.unreadablePolls = inspection.unreadable ? tracked.unreadablePolls + 1 : 0;
+          if (tracked.unreadablePolls < 24) continue;
+          inspection.outcome = 'failed';
+          inspection.error = `会话空闲但执行历史持续不可读：${inspection.reason ?? '未知原因'}`;
+        }
+        const handled = this.state.handled[tracked.todoId];
+        if (handled?.sessionId === sessionId) {
+          handled.executionStatus = inspection.outcome === 'succeeded' ? 'completed' : 'failed';
+          handled.completedAt = Date.now();
+          handled.executionError = inspection.error ?? '';
+          changed = true;
+        }
         this.untrackSession(sessionId);
       }
+      if (changed) await this.persistQuietly('执行结算');
+      this.wakeWaiters();
+    } catch (error) {
+      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 会话状态核对失败：${errorMessage(error)}`);
+    } finally {
+      this.ensureSessionTimer();
     }
   }
 
@@ -303,6 +335,7 @@ export class GitlabTodoRuntime {
       if (queued.has(todo.id) || this.dispatches.has(todo.id) || this.state.handled[todo.id]) continue;
       this.dispatchQueue.push(todo);
     }
+    this.ensureSessionTimer();
   }
 
   pump() {
@@ -317,7 +350,7 @@ export class GitlabTodoRuntime {
   async executePump() {
     while (!this.stopping && this.dispatchQueue.length > 0) {
       if (!this.hasFreeSlot()) {
-        void this.refreshTrackedSessions();
+        void this.reconcileSessions();
         await this.waitForSlotSignal();
         continue;
       }
@@ -481,6 +514,29 @@ export class GitlabTodoRuntime {
     });
   }
 
+  resolveWorkspaceId() {
+    const items = this.ctx.workspaceRegistry?.list?.() ?? [];
+    const configured = this.state.settings.sessionCwd;
+    if (configured) {
+      const normalize = (value) => String(value ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+      const match = items.find((item) => normalize(item.path ?? item.cwd) === normalize(configured));
+      if (match?.id) return match.id;
+      throw new Error(`配置的工作区文件夹未在 DSH 工作区中注册：${configured}`);
+    }
+    let best;
+    let bestAt = Number.NEGATIVE_INFINITY;
+    for (const item of items) {
+      const at = Date.parse(item.updatedAt);
+      if (Number.isFinite(at) && at > bestAt) {
+        best = item;
+        bestAt = at;
+      }
+    }
+    const workspaceId = best?.id ?? items[0]?.id;
+    if (!workspaceId) throw new Error('DSH 尚未注册工作区，请先创建或选择一个工作区。');
+    return workspaceId;
+  }
+
   async dispatchById(id) {
     const todo = this.state.todos.find((item) => item.id === id);
     if (!todo) return { ok: false, error: '当前轮询结果中找不到该 Todo，请先重新检查。' };
@@ -488,6 +544,10 @@ export class GitlabTodoRuntime {
   }
 
   async dispatch(todo, force = false, options = {}) {
+    const existingSessionId = this.state.handled[todo.id]?.sessionId ?? this.state.pending[todo.id]?.sessionId;
+    if (force && existingSessionId && this.trackedSessions.has(existingSessionId)) {
+      return { ok: false, error: '该 Todo 的 Session 仍在执行，请等待当前执行结束后再重新处理。' };
+    }
     if (!force && this.state.handled[todo.id]) {
       return { ok: true, sessionId: this.state.handled[todo.id].sessionId, duplicate: true };
     }
@@ -529,44 +589,47 @@ export class GitlabTodoRuntime {
         this.reserveSlot();
         reserved = true;
       }
-      if (sessionId) this.trackSession(sessionId);
+      if (sessionId) this.trackSession(sessionId, todo.id, Date.now(), trackSlot);
       if (!sessionId) {
-        const request = {};
-        if (this.state.settings.sessionCwd) request.cwd = this.state.settings.sessionCwd;
+        const request = {
+          workspaceId: this.resolveWorkspaceId(),
+        };
         if (typeof this.config.agentPreset === 'string' && this.config.agentPreset) {
           request.agentPreset = this.config.agentPreset;
         }
-        const created = await this.ctx.sessionController.create(request);
-        sessionId = created.sessionId;
-        this.trackSession(sessionId);
+        sessionId = await this.host.createSession(request);
+        this.trackSession(sessionId, todo.id, Date.now(), trackSlot);
         this.state.pending[todo.id] = {
           sessionId,
           createdAt: Date.now(),
+          automatic: trackSlot,
           item: todo,
         };
         await this.persistQuietly('pending Session');
+        await this.host.renameSession(sessionId, todo.title);
       }
       if (reserved) {
         this.releaseReservation();
         reserved = false;
       }
       if (this.state.settings.sessionModel) {
-        await this.ctx.sessionController.selectModel({
+        await this.host.selectModel({
           sessionId,
           ...this.state.settings.sessionModel,
         });
       }
-      await this.ctx.sessionController.prompt({
+      await this.host.prompt({
         requestId: `gitlab-todo-${randomUUID()}`,
         sessionId,
         mode: 'queue',
         content: [{ type: 'text', text: buildTodoPrompt(todo) }],
-        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      }, new AbortController().signal);
+      });
       const record = {
         id: todo.id,
         sessionId,
         outcome: 'session-accepted',
+        executionStatus: 'running',
+        automatic: trackSlot,
         acceptedAt: Date.now(),
         title: todo.title,
         url: todo.url,
@@ -583,7 +646,7 @@ export class GitlabTodoRuntime {
         this.releaseReservation();
         reserved = false;
       }
-      if (trackSlot && sessionId) this.untrackSession(sessionId);
+      if (sessionId) this.untrackSession(sessionId);
       this.state.lastDispatchError = `Todo ${todo.id} 创建或驱动 Session 失败：${errorMessage(error)}`;
       await this.persistQuietly('派发错误');
       this.ctx.logger?.warn?.(`[gitlab-todo-agent] ${this.state.lastDispatchError}`);
@@ -598,7 +661,7 @@ export class GitlabTodoRuntime {
         return jsonResponse(200, { ok: true, state: this.snapshot() });
       }
       if (request.method === 'GET' && url.searchParams.get('action') === 'models') {
-        return jsonResponse(200, { ok: true, catalog: await this.ctx.sessionController.modelCatalog() });
+        return jsonResponse(200, { ok: true, catalog: await this.host.modelCatalog() });
       }
       if (request.method !== 'POST') {
         return jsonResponse(405, { ok: false, error: '不支持的请求方法。' });
@@ -630,7 +693,7 @@ export class GitlabTodoRuntime {
   }
 }
 
-export const inject = ['connection', 'sessionController'];
+export const inject = ['connection', 'typertGateway', 'workspaceRegistry'];
 
 export function apply(ctx, config = {}) {
   const runtime = new GitlabTodoRuntime(ctx, config);

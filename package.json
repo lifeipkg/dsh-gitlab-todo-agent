@@ -1,33 +1,9 @@
 {
   "name": "@local/dsh-gitlab-todo-agent",
-  "version": "1.7.1",
-  "private": false,
-  "description": "GitLab Todo watcher for DeepSeek Harness: reads your GitLab todos via glab, opens isolated DSH sessions for direct comment mentions from other users, with running-session concurrency control.",
+  "version": "1.8.0",
+  "private": true,
+  "description": "Poll GitLab todos directly with glab and dispatch direct comment mentions to DSH sessions.",
   "type": "module",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/lifeipkg/dsh-gitlab-todo-agent.git"
-  },
-  "bugs": {
-    "url": "https://github.com/lifeipkg/dsh-gitlab-todo-agent/issues"
-  },
-  "homepage": "https://github.com/lifeipkg/dsh-gitlab-todo-agent#readme",
-  "author": "lifeipkg",
-  "license": "MIT",
-  "keywords": [
-    "dsh",
-    "deepseek-harness",
-    "dsh-plugin",
-    "dsh-bundle",
-    "gitlab",
-    "todo"
-  ],
-  "publishConfig": {
-    "access": "public"
-  },
-  "engines": {
-    "node": ">=20"
-  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -43,7 +19,6 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "LICENSE",
     "tests/*.test.js"
   ],
   "scripts": {
@@ -51,7 +26,6 @@
     "check": "node --check index.js && node --check core.js && node --check client.js"
   },
   "dsh": {
-    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },

@@ -19,10 +19,11 @@ window.__ModuleLoader__.load({
       todoList: 'Todo list', noTodos: 'No todos. Run a check to refresh.',
       directMention: 'Comment @ me',
       process: 'Open session', reprocess: 'Process again', dispatched: 'Accepted', waiting: 'Waiting',
+      executionRunning: 'Running', executionCompleted: 'Completed', executionFailed: 'Failed',
       openSession: 'Open session',
       interval: 'Poll interval (seconds)', limit: 'Maximum new sessions per poll', concurrency: 'Automatic dispatch concurrency',
       cwd: 'GitLab working directory', cwdHint: 'Leave empty to use the Host process directory.',
-      sessionCwd: 'New session workspace folder', sessionCwdHint: 'Example: D:\\agent-workspace. Leave empty for the DSH default workspace.',
+      sessionCwd: 'New session workspace folder', sessionCwdHint: 'A folder registered as a DSH workspace, e.g. D:\\agent-workspace. Leave empty to use the most recently used workspace.',
       sessionModel: 'New session model', sessionModelDefault: 'Use the DSH default model',
       sessionModelPinDefault: 'Pin the current default model', sessionModelFixedHint: 'Selecting a concrete model pins every new session to that provider/model; it will not follow future default changes.',
       sessionModelUnavailable: 'Currently configured model (not in the available catalog)',
@@ -45,10 +46,11 @@ window.__ModuleLoader__.load({
       todoList: 'Todo 列表', noTodos: '当前没有 Todo，可点击“立即检查”刷新。',
       directMention: '评论中 @ 我',
       process: '开 Session 处理', reprocess: '重新处理', dispatched: '已接受', waiting: '待处理',
+      executionRunning: '执行中', executionCompleted: '执行完成', executionFailed: '执行失败',
       openSession: '打开 Session',
       interval: '轮询间隔（秒）', limit: '每轮最多创建 Session 数', concurrency: '自动处理并发数',
       cwd: 'GitLab 工作目录', cwdHint: '留空使用 Host 进程目录。',
-      sessionCwd: '新开会话的工作区文件夹', sessionCwdHint: '例如 D:\\agent-workspace；留空使用 DSH 默认工作区。',
+      sessionCwd: '新开会话的工作区文件夹', sessionCwdHint: '须为 DSH 已注册的工作区路径，例如 D:\\agent-workspace；留空使用最近使用的工作区。',
       sessionModel: '新开会话使用的模型', sessionModelDefault: '跟随 DSH 默认模型',
       sessionModelPinDefault: '固定当前默认模型', sessionModelFixedHint: '选择具体模型后，新会话会固定使用该 provider/model，不再随 DSH 默认模型变化。',
       sessionModelUnavailable: '当前配置模型（不在可用目录中）',
@@ -84,6 +86,14 @@ window.__ModuleLoader__.load({
     function isMergeRequest(todo) {
       return String(todo.targetType ?? '').toLowerCase().replace(/[^a-z]/g, '') === 'mergerequest'
         || /\/-\/merge_requests(?:\/|$)/i.test(todo.url ?? '');
+    }
+
+    function todoStatusLabel(todo, t) {
+      if (todo.outcome === 'merge-request-done') return t('mrDone');
+      if (todo.executionStatus === 'running') return t('executionRunning');
+      if (todo.executionStatus === 'completed') return t('executionCompleted');
+      if (todo.executionStatus === 'failed') return t('executionFailed');
+      return todo.handled ? t('dispatched') : t('waiting');
     }
 
     function sessionModelKey(selection) {
@@ -314,7 +324,7 @@ window.__ModuleLoader__.load({
                         ? h('a', { href: todo.url, target: '_blank', rel: 'noreferrer' }, todo.title)
                         : h('span', null, todo.title),
                       todo.directMention && h('span', { className: 'gta-tag gta-tag-mention' }, t('directMention')),
-                      h('span', { className: `gta-tag ${todo.handled ? 'gta-tag-success' : ''}` }, todo.handled ? (todo.outcome === 'merge-request-done' ? t('mrDone') : t('dispatched')) : t('waiting')),
+                      h('span', { className: `gta-tag ${todo.executionStatus === 'completed' || todo.outcome === 'merge-request-done' ? 'gta-tag-success' : ''}` }, todoStatusLabel(todo, t)),
                     ),
                     h('div', { className: 'gta-muted gta-meta' }, [`#${todo.id}`, todo.project, todo.targetType, todo.action, todo.author && `@${todo.author}`].filter(Boolean).join(' · ')),
                   ),
@@ -322,7 +332,7 @@ window.__ModuleLoader__.load({
                     todo.sessionId && h(Button, { onClick: () => openSession(todo.sessionId) }, t('openSession')),
                     (!todo.handled || todo.outcome !== 'merge-request-done') && h(Button, {
                       primary: !todo.handled,
-                      disabled: Boolean(busy),
+                      disabled: Boolean(busy) || todo.executionStatus === 'running',
                       onClick: () => perform(`dispatch:${todo.id}`, () => post('dispatch', { id: todo.id })),
                     }, busy === `dispatch:${todo.id}` ? '…' : todo.handled ? t('reprocess') : isMergeRequest(todo) && !todo.directMention ? t('markDone') : t('process')),
                   ),
