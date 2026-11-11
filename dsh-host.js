@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { CLOSURE_MARKER, parseClosureReport } from './core.js';
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
@@ -14,6 +15,45 @@ function turnFailure(data) {
   const kind = data?.reason?.kind;
   if (kind === 'completed') return null;
   return typeof kind === 'string' ? kind : 'unknown';
+}
+
+/** 助手消息里的全部正文文本：优先 content 中的 text 块，退回递归收集字符串。 */
+function assistantTexts(message) {
+  const content = Array.isArray(message?.content) ? message.content : null;
+  if (content) {
+    const texts = content
+      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text);
+    if (texts.length > 0) return texts;
+  }
+  const out = [];
+  const visit = (value, depth) => {
+    if (out.length >= 200 || depth > 6) return;
+    if (typeof value === 'string') out.push(value);
+    else if (Array.isArray(value)) for (const entry of value) visit(entry, depth + 1);
+    else if (value && typeof value === 'object') for (const entry of Object.values(value)) visit(entry, depth + 1);
+  };
+  visit(message, 0);
+  return out;
+}
+
+/**
+ * 在本次执行的助手消息里找最后一份结案报告（[TODO-CLOSURE] {...}）。
+ * 只看 assistant/message，提示词（user/message）里的格式模板不参与匹配。
+ */
+function findClosureReport(events, startedAt, originUrl) {
+  const messages = events
+    .filter((event) => event?.type === 'assistant/message' && (startedAt <= 0 || event.time >= startedAt))
+    .sort((a, b) => b.seq - a.seq);
+  for (const event of messages) {
+    const texts = assistantTexts(event.data?.message);
+    for (let index = texts.length - 1; index >= 0; index -= 1) {
+      if (!texts[index].includes(CLOSURE_MARKER)) continue;
+      const report = parseClosureReport(texts[index], originUrl);
+      if (report) return report;
+    }
+  }
+  return null;
 }
 
 /**
@@ -129,7 +169,7 @@ export class DshHostClient {
    * 按 task-board 的执行结算方式读取一个会话：running=true 时仍在执行；
    * 空闲后从 follow 的开场帧与 page 历史中找到本次启动后的 turn/end。
    */
-  async inspectSession(sessionId, startedAt = 0, summary) {
+  async inspectSession(sessionId, startedAt = 0, summary, options = {}) {
     if (summary?.running) return { outcome: 'pending' };
     if (!summary) return { outcome: 'cancelled', error: '执行会话已不存在。' };
 
@@ -185,11 +225,13 @@ export class DshHostClient {
     const turnEnd = events
       .filter((event) => event?.type === 'turn/end' && (startedAt <= 0 || event.time >= startedAt))
       .sort((a, b) => a.seq - b.seq)[0];
-    if (!turnEnd) return { outcome: 'pending' };
+    // idle=true：会话空闲、历史可读，但没有本次执行的回合结束记录（未启动或被中断）。
+    if (!turnEnd) return { outcome: 'pending', idle: true };
     const failure = turnFailure(turnEnd.data);
+    const report = findClosureReport(events, startedAt, options.originUrl ?? '');
     return failure === null
-      ? { outcome: 'succeeded' }
-      : { outcome: 'failed', error: `Agent 回合未成功完成：${failure}` };
+      ? { outcome: 'succeeded', report }
+      : { outcome: 'failed', error: `Agent 回合未成功完成：${failure}`, report };
   }
 
   async dispose() {

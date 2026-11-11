@@ -44,7 +44,13 @@ window.__ModuleLoader__.load({
       autoProcess: 'Automatically open sessions only for direct comment mentions from other users',
       precheckEnabled: 'Fast pre-judgment during each poll: mentions that need no handling are marked done directly, in parallel, without opening sessions',
       ruleSkipEnabled: 'Mark pipeline notifications, self-mentions, and description-body mentions done directly by rule (no model call)',
-      autoArchive: 'Archive the session automatically after its execution completes (plugin-created sessions only)',
+      autoArchive: 'Archive plugin sessions once their loop is closed or a follow-up is scheduled (sessions that need a human stay unarchived)',
+      followUpEnabled: 'Close the loop automatically: when a session ends without closing its todo, open a follow-up session later',
+      maxFollowUps: 'Maximum automatic follow-up rounds per todo', followUpDelay: 'Follow-up wait (minutes)',
+      followUpHint: 'A loop is closed when the todo is marked done and the original note has our reply. Waiting on CI and similar conditions is retried after the wait (doubling each round); when rounds run out, or the session reports that a human is needed, the todo is left for you.',
+      closureClosed: 'Loop closed', closureFollowUp: 'Follow-up scheduled', closureNeedsHuman: 'Needs you', closureVerifying: 'Verifying',
+      followUpCount: 'Awaiting follow-up', needsHumanCount: 'Needs you',
+      roundLabel: 'Round', nextAttempt: 'Next follow-up',
       loading: 'Loading GitLab Todo panel…', renderError: 'The panel failed to render', retry: 'Retry rendering',
       localError: 'Action failed',
       defaultPaused: 'Polling starts paused so installation never dispatches your real todos automatically.',
@@ -87,7 +93,13 @@ window.__ModuleLoader__.load({
       autoProcess: '仅为其他用户在评论中直接 @ 我的 Todo 自动创建 Session',
       precheckEnabled: '每轮轮询先并行快速预判：不需要处理的提及直接标记完成，不开会话',
       ruleSkipEnabled: '流水线通知、自己 @ 自己、正文 @ 提及等规则噪声直接标记完成，不经过模型',
-      autoArchive: '执行完成后自动归档会话（仅插件创建的会话）',
+      autoArchive: '闭环或已排续办后自动归档会话（仅插件创建的会话；需人工接手的保留不归档）',
+      followUpEnabled: '自动续办：会话结束但 Todo 没有闭环时，稍后自动新开续办会话',
+      maxFollowUps: '每条 Todo 最多自动续办轮数', followUpDelay: '续办等待时间（分钟）',
+      followUpHint: '闭环 = Todo 已标记完成且原 note 有我方回复。等待 CI 等条件的按等待时间续办（逐轮翻倍）；轮数用尽或会话判定需要人接手时，保留给你处理。',
+      closureClosed: '已闭环', closureFollowUp: '待续办', closureNeedsHuman: '需人工', closureVerifying: '核对中',
+      followUpCount: '待续办', needsHumanCount: '需人工',
+      roundLabel: '轮次', nextAttempt: '下次续办',
       loading: '正在加载 GitLab Todo 面板…', renderError: '面板渲染失败', retry: '重新渲染',
       localError: '操作失败',
       defaultPaused: '插件默认停用，避免安装后立即处理真实 Todo。',
@@ -125,9 +137,29 @@ window.__ModuleLoader__.load({
       if (todo.outcome === 'precheck-skipped') return t('precheckSkipped');
       if (todo.outcome === 'rule-skipped') return t('ruleSkipped');
       if (todo.executionStatus === 'running') return t('executionRunning');
+      const closure = closureLabel(todo.closure, t);
+      if (closure) return closure;
       if (todo.executionStatus === 'completed') return t('executionCompleted');
       if (todo.executionStatus === 'failed') return t('executionFailed');
       return todo.handled ? t('dispatched') : t('waiting');
+    }
+
+    /** 闭环状态标签；旧记录或尚未结算的记录没有闭环状态，返回空串。 */
+    function closureLabel(closure, t) {
+      if (closure === 'closed') return t('closureClosed');
+      if (closure === 'follow-up') return t('closureFollowUp');
+      if (closure === 'needs-human') return t('closureNeedsHuman');
+      if (closure === 'verifying') return t('closureVerifying');
+      return '';
+    }
+
+    /** 列表里的闭环补充信息：第几轮、结论说明、下次续办时间。 */
+    function closureMeta(record, t) {
+      return [
+        record.round > 1 && `${t('roundLabel')} ${record.round}`,
+        record.closureNote,
+        record.closure === 'follow-up' && record.nextAttemptAt && `${t('nextAttempt')} ${formatTime(record.nextAttemptAt, '')}`,
+      ].filter(Boolean);
     }
 
     /**
@@ -397,6 +429,15 @@ window.__ModuleLoader__.load({
               type: 'text', value: draft.cwd, placeholder: t('cwdHint'),
               onChange: (event) => setDraft({ ...draft, cwd: event.target.value }),
             })),
+            h('label', null, t('maxFollowUps'), h('input', {
+              type: 'number', min: 0, max: 10, value: draft.maxFollowUps ?? 3, disabled: draft.followUpEnabled === false,
+              onChange: (event) => setDraft({ ...draft, maxFollowUps: Number(event.target.value) }),
+            })),
+            h('label', null, t('followUpDelay'), h('input', {
+              type: 'number', min: 1, max: 1440, value: draft.followUpDelayMinutes ?? 15, disabled: draft.followUpEnabled === false,
+              onChange: (event) => setDraft({ ...draft, followUpDelayMinutes: Number(event.target.value) }),
+            })),
+            h('p', { className: 'gta-muted gta-wide' }, t('followUpHint')),
           ),
           h('label', { className: 'gta-check' }, h('input', {
             type: 'checkbox', checked: draft.autoProcess,
@@ -414,6 +455,10 @@ window.__ModuleLoader__.load({
             type: 'checkbox', checked: draft.autoArchive,
             onChange: (event) => setDraft({ ...draft, autoArchive: event.target.checked }),
           }), t('autoArchive')),
+          h('label', { className: 'gta-check' }, h('input', {
+            type: 'checkbox', checked: draft.followUpEnabled !== false,
+            onChange: (event) => setDraft({ ...draft, followUpEnabled: event.target.checked }),
+          }), t('followUpEnabled')),
           h('div', { className: 'gta-form-actions' },
             h(Button, { primary: true, disabled: Boolean(busy), onClick: () => saveGeneralSettings().then((saved) => { if (saved) setDraft(null); }) }, t('save')),
             h(Button, { disabled: Boolean(busy), onClick: () => setDraft(null) }, t('cancel')),
@@ -426,6 +471,8 @@ window.__ModuleLoader__.load({
           h('div', { className: 'gta-stat' }, h('span', null, t('handled')), h('strong', null, snapshot.handledCount)),
           h('div', { className: 'gta-stat' }, h('span', null, t('activeSessions')), h('strong', { className: snapshot.activeSessions > 0 ? 'gta-success' : '' }, `${snapshot.activeSessions ?? 0}/${snapshot.settings.maxConcurrentSessions}`)),
           h('div', { className: 'gta-stat' }, h('span', null, t('queuedSessions')), h('strong', null, snapshot.queuedSessions ?? 0)),
+          h('div', { className: 'gta-stat' }, h('span', null, t('followUpCount')), h('strong', null, snapshot.closure?.followUp ?? 0)),
+          h('div', { className: 'gta-stat' }, h('span', null, t('needsHumanCount')), h('strong', { className: (snapshot.closure?.needsHuman ?? 0) > 0 ? 'gta-attention' : '' }, snapshot.closure?.needsHuman ?? 0)),
           h('div', { className: 'gta-stat gta-stat-time' }, h('span', null, t('lastSuccess')), h('strong', null, formatTime(snapshot.lastSuccessAt, t('never')))),
         ),
         snapshot && h('div', { className: 'gta-tabs', role: 'tablist' },
@@ -460,9 +507,9 @@ window.__ModuleLoader__.load({
                         ? h('a', { href: todo.url, target: '_blank', rel: 'noreferrer' }, todo.title)
                         : h('span', null, todo.title),
                       todo.directMention && h('span', { className: 'gta-tag gta-tag-mention' }, t('directMention')),
-                      h('span', { className: `gta-tag ${todo.executionStatus === 'completed' || todo.outcome === 'merge-request-done' || todo.outcome === 'precheck-skipped' ? 'gta-tag-success' : ''}` }, todoStatusLabel(todo, t)),
+                      h('span', { className: `gta-tag ${(todo.executionStatus === 'completed' && (!todo.closure || todo.closure === 'closed')) || todo.outcome === 'merge-request-done' || todo.outcome === 'precheck-skipped' ? 'gta-tag-success' : ''}` }, todoStatusLabel(todo, t)),
                     ),
-                    h('div', { className: 'gta-muted gta-meta' }, [`#${todo.id}`, todo.project, todo.targetType, todo.action, todo.author && `@${todo.author}`, todo.skipReason].filter(Boolean).join(' · ')),
+                    h('div', { className: 'gta-muted gta-meta' }, [`#${todo.id}`, todo.project, todo.targetType, todo.action, todo.author && `@${todo.author}`, todo.skipReason, ...closureMeta(todo, t)].filter(Boolean).join(' · ')),
                   ),
                   h('div', { className: 'gta-todo-actions' },
                     todo.sessionId && h(Button, { onClick: () => openSession(todo.sessionId) }, t('openSession')),
@@ -492,11 +539,12 @@ window.__ModuleLoader__.load({
                           : record.executionStatus === 'failed' ? t('executionFailed')
                           : record.executionStatus === 'starting' ? t('sessionStarting')
                           : t('sessionAccepted')),
+                      closureLabel(record.closure, t) && h('span', { className: `gta-tag ${record.closure === 'closed' ? 'gta-tag-success' : ''}` }, closureLabel(record.closure, t)),
                       h('span', { className: 'gta-tag gta-tag-mention' }, record.automatic ? t('autoDispatch') : t('manualDispatch')),
                       record.archived && h('span', { className: 'gta-tag gta-tag-success' }, t('sessionArchived')),
                     ),
                     h('div', { className: 'gta-muted gta-meta' },
-                      [record.sessionTitle, record.project, record.executionError, record.archiveError].filter(Boolean).join(' · ')),
+                      [record.sessionTitle, record.project, record.executionError, ...closureMeta(record, t), record.archiveError].filter(Boolean).join(' · ')),
                   ),
                   h('div', { className: 'gta-todo-actions' },
                     !record.archived && h(Button, { onClick: () => openSession(record.sessionId) }, t('openSession')),
@@ -551,7 +599,7 @@ window.__ModuleLoader__.load({
       .gta-root *{box-sizing:border-box}.gta-root h1{font-size:24px;line-height:1.25;margin:0;font-weight:650}.gta-root h2{font-size:16px;margin:0 0 12px;font-weight:600}.gta-root p{margin:6px 0 0}
       .gta-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;max-width:1180px;margin:0 auto}.gta-title-row{display:flex;align-items:center;gap:12px}.gta-title-icon{color:var(--dsw-alias-brand-primary);display:flex}.gta-heading p{color:var(--dsw-alias-label-secondary)}
       .gta-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.gta-model-quick{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary)}.gta-model-quick select{width:auto;min-width:200px;max-width:280px}.gta-button{appearance:none;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer;white-space:nowrap}.gta-button:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-brand-primary)}.gta-button:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}.gta-button:disabled{opacity:.45;cursor:default}.gta-primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
-      .gta-paused{max-width:1180px;margin:10px auto 18px!important}.gta-muted{color:var(--dsw-alias-label-secondary);font-size:12px}.gta-success{color:var(--dsw-alias-state-success-primary)}
+      .gta-paused{max-width:1180px;margin:10px auto 18px!important}.gta-muted{color:var(--dsw-alias-label-secondary);font-size:12px}.gta-success{color:var(--dsw-alias-state-success-primary)}.gta-attention{color:var(--dsw-alias-state-warn-primary)}
       .gta-banner{max-width:1180px;margin:10px auto;padding:10px 12px;border-radius:8px;border:1px solid var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-1)}.gta-warn{border-color:var(--dsw-alias-state-warn-primary)}
       .gta-card,.gta-stats,.gta-section{max-width:1180px;margin:16px auto}.gta-card{border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);padding:18px}.gta-form-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.gta-form-grid label{display:flex;flex-direction:column;gap:6px;color:var(--dsw-alias-label-secondary);font-size:12px}.gta-wide{grid-column:1/-1}
       .gta-root input[type=text],.gta-root input[type=number],.gta-root select{width:100%;border:1px solid var(--dsw-alias-border-l2);border-radius:7px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;padding:8px 10px}.gta-check{display:flex;align-items:center;gap:8px;margin:16px 0 0}.gta-form-actions{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap}
