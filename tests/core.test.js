@@ -17,6 +17,7 @@ import {
   isDescriptionMention,
   isNoteMention,
   isSelfMention,
+  LEGACY_WORKFLOW_RULES,
   normalizeState,
   normalizeTodos,
   publicState,
@@ -134,6 +135,10 @@ test('settings validation preserves supported fields and drops legacy script fie
   assert.equal(configured.sessionCwd, 'D:\\work\\repo');
   assert.deepEqual(configured.sessionModel, { provider: 'deepseek', model: 'deepseek-chat' });
   assert.equal(validateSettings({ sessionModel: null }, configured).sessionModel, null);
+  assert.equal(configured.customRules, '');
+  assert.equal(validateSettings({ customRules: '  保持现有合并授权规则  ' }, defaultSettings()).customRules, '保持现有合并授权规则');
+  assert.throws(() => validateSettings({ customRules: 42 }, defaultSettings()), /自定义附加规则/);
+  assert.throws(() => validateSettings({ customRules: 'x'.repeat(4001) }, defaultSettings()), /自定义附加规则/);
   const judged = validateSettings({
     ruleSkipEnabled: false,
     judgeModel: { provider: ' deepseek ', model: ' fast-chat ' },
@@ -171,13 +176,18 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   assert.match(prompt, /discussions\/<discussion-id>\/notes/);
   assert.match(prompt, /不可信/);
   assert.match(prompt, /只有实际完成/);
-  // MR 自动合并条款：Jev 裁决 + CI 双通过才直接合并，且豁免只覆盖本 Session 新建的 MR。
-  assert.match(prompt, /按 JEV-GATE\.md 完成 Jev 裁决并留痕/);
-  assert.match(prompt, /CI 全部通过后，直接合并该 MR/);
-  assert.match(prompt, /无需人类授权/);
-  assert.match(prompt, /仅适用于本 Session 新建的 MR/);
-  assert.match(prompt, /Jev 裁决未通过或 CI 未通过时不得合并/);
-  assert.match(prompt, /第 5 条已豁免的 MR 合并授权除外/);
+  // MR 合并条款（通用默认）：遵循工作区/目标仓库既有规则，未明确允许不自行合并。
+  assert.match(prompt, /AGENTS\.md／CLAUDE\.md/);
+  assert.match(prompt, /是否合并、何时合并遵循当前工作区与目标仓库的既有规则/);
+  assert.match(prompt, /规则未明确允许自动合并时不要自行合并/);
+  // 未配置 customRules 时不出现第 9 条；配置后以附加规则形式追加，且声明冲突时优先。
+  assert.equal(prompt.includes('9. 以下是部署本插件的用户配置的附加规则'), false);
+  const customized = buildTodoPrompt(normalizeTodos([directNoteTodo])[0], {
+    customRules: '  按 JEV-GATE.md 完成 Jev 裁决并留痕\nCI 全绿后直接合并，无需人类授权。  ',
+  });
+  assert.match(customized, /9\. 以下是部署本插件的用户配置的附加规则；与本提示词其他条款冲突时，以本条为准：/);
+  assert.match(customized, /   按 JEV-GATE\.md 完成 Jev 裁决并留痕/);
+  assert.match(customized, /   CI 全绿后直接合并，无需人类授权。/);
   assert.match(prompt, /#note_10/);
   assert.match(prompt, /other-user/);
 });
@@ -475,7 +485,7 @@ test('state normalization migrates v1 and v2 script states to v3', () => {
       lastNewCount: 0,
     };
     const state = normalizeState(legacy);
-    assert.equal(state.version, 3);
+    assert.equal(state.version, 4);
     assert.equal('shell' in state.settings, false);
     assert.equal('script' in state.settings, false);
     assert.equal(state.settings.enabled, true);
@@ -483,6 +493,21 @@ test('state normalization migrates v1 and v2 script states to v3', () => {
     assert.equal(state.todos[0].id, 'x');
   }
   assert.throws(() => normalizeState({ version: 99 }), /版本不受支持/);
+});
+
+test('v3 states are prefilled with the legacy workflow rules; fresh installs keep the generic prompt', () => {
+  const v3 = { ...initialState(), version: 3 };
+  delete v3.settings.customRules;
+  const migrated = normalizeState(JSON.parse(JSON.stringify(v3)));
+  assert.equal(migrated.version, 4);
+  assert.equal(migrated.settings.customRules, LEGACY_WORKFLOW_RULES);
+  assert.match(migrated.settings.customRules, /JEV-GATE\.md/);
+  // 已自行配置过 customRules 的 v3 状态不会被覆盖。
+  const customized = normalizeState(JSON.parse(JSON.stringify({ ...v3, settings: { ...v3.settings, customRules: '我的规则' } })));
+  assert.equal(customized.settings.customRules, '我的规则');
+  // 全新安装（initialState 即 v4）：customRules 为空，会话提示词保持通用。
+  assert.equal(initialState().version, 4);
+  assert.equal(initialState().settings.customRules, '');
 });
 
 function runtimeWithPrompt(prompt, options = {}) {
@@ -1208,7 +1233,7 @@ test('follow-up prompt hands over history, carried MRs, missing reply and relate
   assert.match(prompt, /不要重复发布内容相同的回复/);
   assert.match(prompt, /插件记录的前序 MR/);
   assert.match(prompt, /merge_requests\/12/);
-  assert.match(prompt, /以及上文“插件记录的前序 MR”清单内的 MR/);
+  assert.match(prompt, /或属于上文“插件记录的前序 MR”清单/);
   assert.match(prompt, /Todo 900：https:\/\/gitlab\.local\/group\/project\/-\/issues\/7#note_5（上次结论：等待决策）/);
   assert.match(prompt, /todos\/<该 Todo ID>\/mark_as_done/);
   assert.equal(buildSessionTitle(todo, 2), '[协助]-issue-7-note-10-续1');
@@ -1621,7 +1646,7 @@ test('startup upgrades script-era state without creating script files', async ()
     assert.equal('scriptPath' in state.storage, false);
     assert.equal(state.todos[0].id, 'direct');
     const stored = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
-    assert.equal(stored.version, 3);
+    assert.equal(stored.version, 4);
     assert.equal('script' in stored.settings, false);
     assert.equal('shell' in stored.settings, false);
     await assert.rejects(readFile(join(directory, 'gitlab-todos.py'), 'utf8'), /ENOENT/);

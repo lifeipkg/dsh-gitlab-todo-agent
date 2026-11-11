@@ -1123,6 +1123,7 @@ export class GitlabTodoRuntime {
             maxRounds: trackSlot ? Math.max(round, 1 + followUpsAllowed) : round,
             autoFollowUp,
             followUpDelayMinutes: settings.followUpDelayMinutes,
+            customRules: settings.customRules,
             waitBudgetMinutes: WAIT_BUDGET_MINUTES,
             history,
             carriedMrs,

@@ -1,9 +1,28 @@
 {
-  "name": "@local/dsh-gitlab-todo-agent",
-  "version": "2.12.0",
-  "private": true,
-  "description": "Poll GitLab todos directly with glab and dispatch direct comment mentions to DSH sessions.",
+  "name": "dsh-gitlab-todo-agent",
+  "version": "2.13.0",
+  "description": "DSH bundle: poll GitLab todos via glab and dispatch comment mentions to DSH sessions with closed-loop verification.",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lifeipkg/dsh-gitlab-todo-agent.git"
+  },
+  "homepage": "https://github.com/lifeipkg/dsh-gitlab-todo-agent#readme",
+  "bugs": {
+    "url": "https://github.com/lifeipkg/dsh-gitlab-todo-agent/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-bundle",
+    "gitlab",
+    "todo",
+    "agent",
+    "glab"
+  ],
+  "engines": {
+    "node": ">=22.15.0"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
