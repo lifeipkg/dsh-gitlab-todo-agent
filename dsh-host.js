@@ -145,17 +145,25 @@ export class DshHostClient {
   }
 
   /**
-   * 归档会话：workspace 命名空间，owner-only。
-   * 不带 stopActivity——仍有工作在跑的会话会被 Host 以 workspace/session-active 拒绝，
+   * 归档/取消归档会话：workspace 命名空间，owner-only。
+   * 归档不带 stopActivity——仍有工作在跑的会话会被 Host 以 workspace/session-active 拒绝，
    * 调用方据此把失败记录下来而不是强行停止任何工作。
    */
-  archiveSession(sessionId) {
+   archiveSession(sessionId) {
+    return this.workspaceArchiveCall('archiveSession', sessionId);
+  }
+
+  unarchiveSession(sessionId) {
+    return this.workspaceArchiveCall('unarchiveSession', sessionId);
+  }
+
+  workspaceArchiveCall(method, sessionId) {
     if (!this.gateway || typeof this.gateway.invoke !== 'function') {
-      throw new Error('当前 Host 不提供 typertGateway.invoke，无法归档会话。');
+      throw new Error(`当前 Host 不提供 typertGateway.invoke，无法${method === 'archiveSession' ? '归档' : '恢复'}会话。`);
     }
     return this.gateway.invoke({
       namespace: 'workspace',
-      method: 'archiveSession',
+      method,
       args: { request: { sessionId } },
       peer: this.peer,
     });

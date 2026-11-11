@@ -21,6 +21,7 @@ import {
   parseJudgeReply,
   publicState,
   selectPendingTodos,
+  sessionPage,
   STATE_VERSION,
   targetKey,
   validateSettings,
@@ -998,6 +999,32 @@ export class GitlabTodoRuntime {
     await this.runGlab(['api', '-X', 'POST', `todos/${encodeURIComponent(todo.id)}/mark_as_done`]);
   }
 
+  /**
+   * 手动切换一个插件会话的归档状态（面板“最近会话”快捷操作）。
+   * 只作用于插件自己派发过的会话；归档仍在执行的会话会被 Host 拒绝，原样把错误带回去。
+   */
+  async setSessionArchived(sessionId, archived) {
+    if (typeof sessionId !== 'string' || !sessionId) return { ok: false, error: '缺少 sessionId。' };
+    if (typeof archived !== 'boolean') return { ok: false, error: 'archived 必须是布尔值。' };
+    const record = Object.values(this.state.handled).find((item) => item?.sessionId === sessionId);
+    if (!record) return { ok: false, error: '该会话不是插件创建的会话。' };
+    if (archived && this.trackedSessions.has(sessionId)) {
+      return { ok: false, error: '会话仍在执行，结算后再变更归档状态。' };
+    }
+    try {
+      if (archived) await this.host.archiveSession(sessionId);
+      else await this.host.unarchiveSession(sessionId);
+      record.archived = archived;
+      if (archived) record.archiveError = '';
+      await this.persistQuietly('会话归档状态');
+      return { ok: true };
+    } catch (error) {
+      if (archived) record.archiveError = errorMessage(error);
+      await this.persistQuietly('会话归档状态');
+      throw error;
+    }
+  }
+
   async executeDispatch(todo, force, options = {}) {
     const trackSlot = Boolean(options.trackSlot);
     const followUp = Boolean(options.followUp);
@@ -1185,6 +1212,14 @@ export class GitlabTodoRuntime {
       if (body.action === 'poll') {
         const state = await this.poll('manual');
         return jsonResponse(200, { ok: true, state });
+      }
+      if (body.action === 'sessions') {
+        // “最近会话”分页：首页默认 30 条，limit 上限 100，offset 由客户端翻页推进。
+        return jsonResponse(200, { ok: true, ...sessionPage(this.state, body.offset, body.limit) });
+      }
+      if (body.action === 'setSessionArchived' && typeof body.sessionId === 'string') {
+        const result = await this.setSessionArchived(body.sessionId, body.archived === true);
+        return jsonResponse(200, { ok: true, result, state: this.snapshot() });
       }
       if (body.action === 'updateSettings') {
         const state = await this.updateSettings(body.settings);

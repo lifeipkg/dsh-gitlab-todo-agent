@@ -21,6 +21,7 @@ import {
   normalizeTodos,
   publicState,
   selectPendingTodos,
+  sessionPage,
   validateSettings,
 } from '../core.js';
 import { GitlabTodoRuntime } from '../index.js';
@@ -494,6 +495,7 @@ function runtimeWithPrompt(prompt, options = {}) {
     renames: [],
     invocations: [],
     archives: [],
+    unarchives: [],
     failArchive: false,
     sessions,
     failList: false,
@@ -533,8 +535,12 @@ function runtimeWithPrompt(prompt, options = {}) {
       calls.invocations.push(call);
       assert.equal(call.peer.principal.kind, 'owner');
       if (call.namespace === 'workspace') {
-        assert.equal(call.method, 'archiveSession');
+        assert.ok(['archiveSession', 'unarchiveSession'].includes(call.method));
         assert.deepEqual(call.args, { request: { sessionId: call.args.request.sessionId } });
+        if (call.method === 'unarchiveSession') {
+          calls.unarchives.push(call.args.request.sessionId);
+          return { archivedSessionIds: [] };
+        }
         if (calls.failArchive) throw new Error('workspace/session-active');
         calls.archives.push(call.args.request.sessionId);
         return { archivedSessionIds: [call.args.request.sessionId] };
@@ -939,6 +945,93 @@ test('built-in fetch reads the current user once and paginates todos', async () 
   assert.equal(requests.filter((args) => args.includes('todos')).length, 2);
   assert.equal(requests[1].at(-1), 'page=1');
   assert.equal(requests[2].at(-1), 'page=2');
+});
+
+test('session page paginates recent plugin sessions newest-first', () => {
+  const base = initialState();
+  for (let index = 0; index < 35; index += 1) {
+    base.handled[`t${index}`] = {
+      id: `t${index}`, sessionId: `s${index}`, acceptedAt: 1000 + index, executionStatus: 'completed',
+      automatic: true, title: `T${index}`, url: '', project: '', round: 1, closure: 'closed',
+    };
+  }
+  // 没有 sessionId 的记录（规则跳过）不计入会话列表。
+  base.handled.skip = { id: 'skip', sessionId: null, outcome: 'rule-skipped', acceptedAt: 9999, title: 'x' };
+  const first = sessionPage(base);
+  assert.equal(first.total, 35);
+  assert.equal(first.items.length, 30);
+  assert.equal(first.items[0].sessionId, 's34');
+  assert.equal(first.items[29].sessionId, 's5');
+  const second = sessionPage(base, 30, 30);
+  assert.equal(second.items.length, 5);
+  assert.equal(second.items[0].sessionId, 's4');
+  // 越界与非法参数按默认处理，不抛错。
+  assert.equal(sessionPage(base, 100, 30).items.length, 0);
+  assert.equal(sessionPage(base, -5, 500).items.length, 35 > 100 ? 100 : 35);
+});
+
+test('bridge sessions action serves the first page and archive toggling', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.state.settings.precheckEnabled = false;
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  calls.complete('session-1', 'completed', `完成\n[TODO-CLOSURE] {"status":"done","summary":"已处理","resumeAfterMinutes":0,"openMrs":[]}`);
+  runtime.fetchTodos = async () => [];
+  await runtime.reconcileSessions();
+  // 再补 31 条历史会话记录，凑够两页。
+  for (let index = 0; index < 31; index += 1) {
+    runtime.state.handled[`hist-${index}`] = {
+      id: `hist-${index}`, sessionId: `hist-session-${index}`, acceptedAt: 100 + index,
+      executionStatus: 'completed', automatic: true, title: `H${index}`, url: '', project: '',
+    };
+  }
+  const post = (payload) => runtime.handleFetch(new Request('http://127.0.0.1/api/gitlab-todo-agent', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  }));
+  const page1 = await (await post({ action: 'sessions' })).json();
+  assert.equal(page1.ok, true);
+  assert.equal(page1.total, 32);
+  assert.equal(page1.items.length, 30);
+  assert.equal(page1.items[0].sessionId, 'session-1');
+  const page2 = await (await post({ action: 'sessions', offset: 30, limit: 30 })).json();
+  assert.equal(page2.items.length, 2);
+
+  // 归档切换：完成态会话可归档、可取消归档；状态随持久化记录保留。
+  const record = runtime.state.handled.direct;
+  assert.equal(record.archived, true); // 闭环时已自动归档
+  const restore = await (await post({ action: 'setSessionArchived', sessionId: 'session-1', archived: false })).json();
+  assert.equal(restore.ok, true);
+  assert.deepEqual(calls.unarchives, ['session-1']);
+  assert.equal(runtime.state.handled.direct.archived, false);
+  const rearchive = await (await post({ action: 'setSessionArchived', sessionId: 'session-1', archived: true })).json();
+  assert.equal(rearchive.ok, true);
+  assert.equal(runtime.state.handled.direct.archived, true);
+  // 非插件会话拒绝；执行中的插件会话拒绝归档。
+  const foreign = await (await post({ action: 'setSessionArchived', sessionId: 'not-mine', archived: true })).json();
+  assert.equal(foreign.ok, true);
+  assert.equal(foreign.result.ok, false);
+  const busy = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  busy.runtime.state.settings.enabled = true;
+  busy.runtime.state.settings.autoProcess = true;
+  busy.runtime.state.settings.precheckEnabled = false;
+  busy.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await busy.runtime.executePoll('test');
+  await busy.runtime.pump();
+  const busyResponse = await busy.runtime.handleFetch(new Request('http://127.0.0.1/api/gitlab-todo-agent', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'setSessionArchived', sessionId: 'session-1', archived: true }),
+  }));
+  const running = await busyResponse.json();
+  assert.equal(running.result.ok, false);
+  assert.match(running.result.error, /仍在执行/);
+  await runtime.stop();
+  await busy.runtime.stop();
 });
 
 test('fetch handler returns state and validates settings updates', async () => {
