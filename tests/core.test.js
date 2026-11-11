@@ -388,40 +388,49 @@ test('state normalization migrates the legacy shared cwd to new sessions', () =>
   assert.equal(state.settings.sessionModel, null);
 });
 
-test('buildWorkspaceOverview joins workspaces, roster, and plugin sessions', () => {
+test('buildWorkspaceOverview groups roster sessions by cwd with prefix fallback and unassigned bucket', () => {
   const overview = buildWorkspaceOverview(
     [
-      { id: 'w1', path: 'D:\\agent-workspace', title: 'Agent', sessionIds: ['s1', 's2', 's3'], updatedAt: '2026-01-02T00:00:00Z' },
+      { id: 'w1', path: 'D:\\agent-workspace', title: 'Agent', sessionIds: ['s1', 's3', 's9'], updatedAt: '2026-01-02T00:00:00Z' },
       { id: 'w2', path: 'D:\\work\\repo', sessionIds: [] },
     ],
     [
+      // 精确命中工作区根。
       { sessionId: 's1', running: true, updatedAt: 300, cwd: 'D:\\agent-workspace' },
-      { sessionId: 's2', running: false, updatedAt: 500 },
+      // 工作区子目录：最长前缀归入 w1。
+      { sessionId: 's2', running: false, updatedAt: 500, cwd: 'D:\\agent-workspace\\sub\\repo' },
+      // 不属于任何工作区 → 未归属桶。
+      { sessionId: 's5', running: false, updatedAt: 700, cwd: 'E:\\elsewhere' },
+      // 无 cwd → 未归属桶。
+      { sessionId: 's6', running: false, updatedAt: 900, cwd: '' },
+      // 空白草稿不展示。
+      { sessionId: 's7', running: false, updatedAt: 800, blank: true },
     ],
     [{ sessionId: 's2', sessionTitle: '[协助]-issue-1', automatic: true, archived: true, url: 'https://gitlab.local/i/1' }],
     'd:/agent-workspace/',
   );
-  assert.equal(overview.length, 2);
-  const [w1, w2] = overview;
+  assert.equal(overview.length, 3);
+  const [w1, w2, unassigned] = overview;
   assert.equal(w1.workspaceId, 'w1');
   assert.equal(w1.title, 'Agent');
-  assert.equal(w1.sessionCount, 3);
   // 配置路径比较忽略大小写、正反斜杠与结尾分隔符。
   assert.equal(w1.configured, true);
   assert.equal(w2.configured, false);
-  // 会话按 updatedAt 倒序，名册缺项（known=false）排最后。
-  assert.equal(w1.sessions[0].sessionId, 's2');
+  // 名册（s1、s2）+ 注册表补充（s3、s9，known=false）；按 updatedAt 倒序。
+  assert.equal(w1.sessionCount, 4);
+  assert.deepEqual(w1.sessions.map((s) => s.sessionId), ['s2', 's1', 's3', 's9']);
   assert.equal(w1.sessions[0].plugin, true);
   assert.equal(w1.sessions[0].sessionTitle, '[协助]-issue-1');
   assert.equal(w1.sessions[0].archived, true);
-  assert.equal(w1.sessions[0].automatic, true);
-  assert.equal(w1.sessions[1].sessionId, 's1');
+  assert.equal(w1.sessions[0].cwd, 'D:\\agent-workspace\\sub\\repo');
   assert.equal(w1.sessions[1].running, true);
-  assert.equal(w1.sessions[1].cwd, 'D:\\agent-workspace');
-  assert.equal(w1.sessions[2].sessionId, 's3');
   assert.equal(w1.sessions[2].known, false);
   assert.equal(w1.sessions[2].updatedAt, null);
   assert.equal(w2.sessionCount, 0);
+  // 未归属桶：无 cwd 的 s6 与 cwd 命不中任何工作区的 s5；空白草稿 s7 被过滤。
+  assert.equal(unassigned.unassigned, true);
+  assert.equal(unassigned.sessionCount, 2);
+  assert.deepEqual(unassigned.sessions.map((s) => s.sessionId), ['s6', 's5']);
 });
 
 test('state normalization migrates v1 and v2 script states to v3', () => {
@@ -468,6 +477,8 @@ function runtimeWithPrompt(prompt, options = {}) {
     failArchive: false,
     sessions,
     failList: false,
+    listRequests: [],
+    listResponses: null,
   };
   const autoComplete = options.autoComplete !== false;
   const complete = (sessionId, kind = 'completed') => {
@@ -506,7 +517,10 @@ function runtimeWithPrompt(prompt, options = {}) {
         return catalog;
       }
       if (method === 'list') {
-        assert.deepEqual(args, { _request: {} });
+        calls.listRequests.push(args._request ?? {});
+        if (Array.isArray(calls.listResponses) && calls.listResponses.length > 0) {
+          return calls.listResponses.shift();
+        }
         if (calls.failList) throw new Error('roster unavailable');
         return {
           items: [...sessions.entries()].map(([sessionId, session]) => ({ sessionId, running: session.running })),
@@ -931,23 +945,46 @@ test('workspace overview survives roster failures and tags plugin sessions', asy
   runtime.ctx.workspaceRegistry.list = () => [
     { id: 'w1', path: 'D:\\agent-workspace', title: 'Agent', sessionIds: ['session-1', 'other-1'] },
   ];
+  // 名册带 cwd：插件会话与非插件会话都应出现在对应工作区下。
+  runtime.host.listSessions = async () => ({
+    items: [
+      { sessionId: 'session-1', running: false, updatedAt: 5, cwd: 'D:\\agent-workspace' },
+      { sessionId: 'other-1', running: false, updatedAt: 9, cwd: 'D:\\agent-workspace\\repo' },
+    ],
+  });
   const overview = await runtime.workspaceOverview();
   assert.equal(overview.length, 1);
   assert.equal(overview[0].configured, false);
   assert.equal(overview[0].sessionCount, 2);
-  const [pluginSession, otherSession] = overview[0].sessions;
+  const [otherSession, pluginSession] = overview[0].sessions;
+  assert.equal(otherSession.sessionId, 'other-1');
+  assert.equal(otherSession.plugin, false);
   assert.equal(pluginSession.sessionId, 'session-1');
   assert.equal(pluginSession.plugin, true);
   assert.equal(pluginSession.sessionTitle, '[协助]-issue-7');
-  assert.equal(pluginSession.known, true);
-  assert.equal(otherSession.plugin, false);
-  assert.equal(otherSession.known, false);
 
-  calls.failList = true;
+  // 名册整体不可用：降级为注册表补充（known=false），插件标记保留。
+  runtime.host.listSessions = async () => { throw new Error('roster unavailable'); };
   const degraded = await runtime.workspaceOverview();
   assert.equal(degraded.length, 1);
-  assert.equal(degraded[0].sessions[0].plugin, true);
-  assert.equal(degraded[0].sessions[0].known, false);
+  assert.equal(degraded[0].sessionCount, 2);
+  assert.equal(degraded[0].sessions.every((session) => session.known === false), true);
+  assert.equal(degraded[0].sessions.some((session) => session.plugin), true);
+  assert.equal(calls.create, 1);
+  await runtime.stop();
+});
+
+test('listSessions follows pagination cursors to enumerate all stored sessions', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  calls.listResponses = [
+    { items: [{ sessionId: 'a', running: false }], cursor: 'page-2' },
+    { items: [{ sessionId: 'b', running: true }], cursor: 'page-3' },
+    { items: [{ sessionId: 'c', running: false }] },
+  ];
+  const roster = await runtime.host.listSessions();
+  assert.deepEqual(roster.items.map((item) => item.sessionId), ['a', 'b', 'c']);
+  assert.deepEqual(calls.listRequests, [{}, { cursor: 'page-2' }, { cursor: 'page-3' }]);
+  await runtime.stop();
 });
 
 test('startup upgrades script-era state without creating script files', async () => {

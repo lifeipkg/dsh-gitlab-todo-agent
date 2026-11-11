@@ -68,8 +68,24 @@ export class DshHostClient {
     return this.invoke('modelCatalog');
   }
 
-  listSessions() {
-    return this.invoke('list', {});
+  /**
+   * 完整会话名册：跟随 cursor 分页读取全部已存储会话（session/list 默认每页 100）。
+   * 只取一页会漏掉更早的会话；工作区总览依赖它枚举非插件会话。
+   */
+  async listSessions(options = {}) {
+    const maxPages = Number.isSafeInteger(options.maxPages)
+      ? Math.max(1, Math.min(options.maxPages, 50))
+      : 20;
+    const items = [];
+    let cursor = null;
+    for (let page = 0; page < maxPages; page += 1) {
+      const value = await this.invoke('list', cursor ? { cursor } : {});
+      if (!Array.isArray(value?.items)) throw new Error('session/list 响应缺少 items 数组。');
+      items.push(...value.items);
+      cursor = typeof value?.cursor === 'string' && value.cursor ? value.cursor : null;
+      if (!cursor) break;
+    }
+    return { items };
   }
 
   async createSession(request) {

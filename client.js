@@ -31,6 +31,7 @@ window.__ModuleLoader__.load({
       sessionCwd: 'New session workspace', sessionCwdHint: 'Pick the DSH workspace for new sessions. "Auto" follows the most recently used workspace.',
       sessionCwdAuto: 'Auto (most recently used workspace)', sessionCwdUnregistered: 'Current setting (not registered)',
       workspacesTitle: 'Workspaces', noWorkspaces: 'No DSH workspace is registered yet.',
+      unassignedWorkspace: 'Sessions outside any workspace',
       workspacesError: 'Could not load the DSH workspace list',
       configuredWorkspace: 'plugin target', pluginSessionTag: 'plugin',
       sessionUnknown: 'Untitled session', lastActive: 'Last activity',
@@ -73,6 +74,7 @@ window.__ModuleLoader__.load({
       sessionCwd: '新开会话的工作区', sessionCwdHint: '选择新会话归属的 DSH 工作区；“自动”跟随最近使用的工作区。',
       sessionCwdAuto: '自动（最近使用的工作区）', sessionCwdUnregistered: '当前配置（未注册）',
       workspacesTitle: '工作区', noWorkspaces: 'DSH 尚未注册工作区。',
+      unassignedWorkspace: '未归属工作区的会话',
       workspacesError: '无法加载 DSH 工作区列表',
       configuredWorkspace: '插件目标', pluginSessionTag: '插件',
       sessionUnknown: '未命名会话', lastActive: '最近活动',
@@ -301,9 +303,14 @@ window.__ModuleLoader__.load({
       const normalizePathKey = (value) => String(value ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
       const registeredWorkspacePaths = new Set(workspaceOptions.map((workspace) => normalizePathKey(workspace.path)));
       const draftSessionCwdUnregistered = Boolean(draft?.sessionCwd) && !registeredWorkspacePaths.has(normalizePathKey(draft.sessionCwd));
-      const sessionDisplayName = (session, label) => session.sessionTitle
-        || (session.cwd ? String(session.cwd).split(/[\\/]+/).filter(Boolean).pop() : '')
-        || label;
+      const sessionDisplayName = (session, label, workspacePath) => {
+        if (session.sessionTitle) return session.sessionTitle;
+        const sameAsWorkspace = workspacePath && normalizePathKey(session.cwd) === normalizePathKey(workspacePath);
+        if (session.cwd && !sameAsWorkspace) {
+          return String(session.cwd).split(/[\\/]+/).filter(Boolean).pop();
+        }
+        return label;
+      };
 
       return h('div', { className: 'gta-root' },
         h('style', { children: CSS }),
@@ -503,10 +510,11 @@ window.__ModuleLoader__.load({
           workspaceOptions.length === 0 && !workspaceError && h('div', { className: 'gta-empty' }, t('noWorkspaces')),
           h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('workspacesTitle') },
             workspaceOptions.map((workspace) =>
-              h('article', { className: 'gta-todo gta-workspace', key: workspace.workspaceId },
+              h('article', { className: 'gta-todo gta-workspace', key: workspace.workspaceId || 'unassigned' },
                 h('div', { className: 'gta-todo-main' },
                   h('div', { className: 'gta-todo-title' },
-                    h('span', { className: 'gta-workspace-name', title: workspace.path }, workspace.title || workspace.path || workspace.workspaceId),
+                    h('span', { className: 'gta-workspace-name', title: workspace.path },
+                      workspace.unassigned ? t('unassignedWorkspace') : workspace.title || workspace.path || workspace.workspaceId),
                     workspace.configured && h('span', { className: 'gta-tag gta-tag-mention' }, t('configuredWorkspace')),
                     h('span', { className: 'gta-muted' }, `${t('sessionsTitle')}：${workspace.sessionCount}`),
                   ),
@@ -518,11 +526,11 @@ window.__ModuleLoader__.load({
                       : workspace.sessions.map((session) =>
                           h('div', { className: 'gta-workspace-session', key: session.sessionId },
                             session.archived
-                              ? h('span', { className: 'gta-session-name', title: session.sessionId }, sessionDisplayName(session, t('sessionUnknown')))
+                              ? h('span', { className: 'gta-session-name', title: session.sessionId }, sessionDisplayName(session, t('sessionUnknown'), workspace.path))
                               : h('button', {
                                   type: 'button', className: 'gta-session-link', title: session.sessionId,
                                   onClick: () => openSession(session.sessionId),
-                                }, sessionDisplayName(session, t('sessionUnknown'))),
+                                }, sessionDisplayName(session, t('sessionUnknown'), workspace.path)),
                             h('span', { className: `gta-tag ${session.running ? '' : 'gta-tag-success'}` },
                               session.running ? t('executionRunning') : t('idle')),
                             session.plugin && h('span', { className: 'gta-tag gta-tag-mention' }, t('pluginSessionTag')),

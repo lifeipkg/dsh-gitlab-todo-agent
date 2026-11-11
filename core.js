@@ -405,53 +405,110 @@ export function normalizeWorkspacePath(value) {
 }
 
 /**
- * 组装 DSH 工作区总览：workspaceRegistry 的工作区条目（sessionIds 为权威归属）
- * 与 session/list 名册（运行状态、updatedAt）join，再叠加插件自己的会话记录。
- * 名册缺项的会话仍列出（known=false），名册整体不可用时调用方传空数组即可降级。
+ * 组装 DSH 工作区总览。名册（session/list，含全部已存储会话与 cwd）驱动分组：
+ * 按 cwd 精确匹配工作区路径，其次最长前缀（会话开在工作区子目录内），
+ * 都不命中归入“未归属”桶；registry 的 sessionIds 仅作补充（名册缺项时仍列出）。
+ * 不依赖 workspaceRegistry 实体 getter——它会按内部头索引过滤，旧会话可能被悄悄丢弃。
  */
 export function buildWorkspaceOverview(workspaces, roster, pluginSessions = [], configuredPath = '') {
   const items = Array.isArray(workspaces) ? workspaces : [];
-  const rosterItems = Array.isArray(roster) ? roster : [];
-  const rosterById = new Map(rosterItems.map((item) => [String(item?.sessionId ?? ''), item]));
+  const rosterItems = (Array.isArray(roster) ? roster : []).filter((item) => item && item.sessionId);
+  const rosterById = new Map(rosterItems.map((item) => [String(item.sessionId), item]));
   const pluginById = new Map(
     (Array.isArray(pluginSessions) ? pluginSessions : [])
       .filter((item) => item?.sessionId)
       .map((item) => [String(item.sessionId), item]),
   );
   const configured = normalizeWorkspacePath(configuredPath);
-  return items.map((item, index) => {
-    const sessionIds = Array.isArray(item?.sessionIds) ? item.sessionIds.map((id) => String(id ?? '')) : [];
-    const sessions = sessionIds
-      .filter(Boolean)
-      .map((sessionId) => {
-        const summary = rosterById.get(sessionId);
-        const plugin = pluginById.get(sessionId);
-        return {
-          sessionId,
-          known: Boolean(summary),
-          running: summary?.running === true,
-          updatedAt: typeof summary?.updatedAt === 'number' && Number.isFinite(summary.updatedAt) ? summary.updatedAt : null,
-          cwd: typeof summary?.cwd === 'string' ? summary.cwd : '',
-          plugin: Boolean(plugin),
-          sessionTitle: typeof plugin?.sessionTitle === 'string' ? plugin.sessionTitle : '',
-          automatic: plugin ? plugin.automatic !== false : null,
-          archived: plugin ? plugin.archived === true : false,
-          url: typeof plugin?.url === 'string' ? plugin.url : '',
-        };
-      })
-      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  const sessionRow = (sessionId, summary, plugin) => ({
+    sessionId,
+    known: Boolean(summary),
+    running: summary?.running === true,
+    updatedAt: typeof summary?.updatedAt === 'number' && Number.isFinite(summary.updatedAt) ? summary.updatedAt : null,
+    cwd: typeof summary?.cwd === 'string' ? summary.cwd : '',
+    plugin: Boolean(plugin),
+    sessionTitle: typeof plugin?.sessionTitle === 'string' ? plugin.sessionTitle : '',
+    automatic: plugin ? plugin.automatic !== false : null,
+    archived: plugin ? plugin.archived === true : false,
+    url: typeof plugin?.url === 'string' ? plugin.url : '',
+  });
+  const byUpdatedAtDesc = (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+
+  const views = items.map((item, index) => {
     const path = String(item?.path ?? item?.cwd ?? '');
     return {
       workspaceId: String(item?.id ?? item?.workspaceId ?? `workspace-${index}`),
       path,
+      normalizedPath: normalizeWorkspacePath(path),
       title: String(item?.title ?? ''),
       configured: Boolean(configured) && normalizeWorkspacePath(path) === configured,
       createdAt: item?.createdAt ?? null,
       updatedAt: item?.updatedAt ?? null,
-      sessionCount: sessions.length,
-      sessions,
+      registryIds: Array.isArray(item?.sessionIds) ? item.sessionIds.map((id) => String(id ?? '')) : [],
+      sessions: [],
     };
   });
+
+  // 1) 名册优先：cwd 精确命中工作区 → 最长前缀（子目录）→ 未归属。空白草稿不展示。
+  const unassigned = [];
+  for (const summary of rosterItems) {
+    if (summary.blank === true) continue;
+    const sessionId = String(summary.sessionId);
+    const normalizedCwd = normalizeWorkspacePath(summary.cwd);
+    let target = null;
+    if (normalizedCwd) {
+      target = views.find((view) => view.normalizedPath && view.normalizedPath === normalizedCwd) ?? null;
+      if (!target) {
+        let bestLength = -1;
+        for (const view of views) {
+          if (view.normalizedPath && normalizedCwd.startsWith(`${view.normalizedPath}/`) && view.normalizedPath.length > bestLength) {
+            target = view;
+            bestLength = view.normalizedPath.length;
+          }
+        }
+      }
+    }
+    const row = sessionRow(sessionId, summary, pluginById.get(sessionId));
+    (target ? target.sessions : unassigned).push(row);
+  }
+
+  // 2) 注册表补充：名册中没有、但 registry 仍登记的会话（known=false）保留展示。
+  const accounted = new Set(rosterItems.map((item) => String(item.sessionId)));
+  for (const view of views) {
+    for (const id of view.registryIds) {
+      if (!id || accounted.has(id)) continue;
+      accounted.add(id);
+      view.sessions.push(sessionRow(id, rosterById.get(id), pluginById.get(id)));
+    }
+    view.sessions.sort(byUpdatedAtDesc);
+  }
+  unassigned.sort(byUpdatedAtDesc);
+
+  const result = views.map((view) => ({
+    workspaceId: view.workspaceId,
+    unassigned: false,
+    path: view.path,
+    title: view.title,
+    configured: view.configured,
+    createdAt: view.createdAt,
+    updatedAt: view.updatedAt,
+    sessionCount: view.sessions.length,
+    sessions: view.sessions,
+  }));
+  if (unassigned.length > 0) {
+    result.push({
+      workspaceId: '',
+      unassigned: true,
+      path: '',
+      title: '',
+      configured: false,
+      createdAt: null,
+      updatedAt: null,
+      sessionCount: unassigned.length,
+      sessions: unassigned,
+    });
+  }
+  return result;
 }
 
 export function sessionProjection(state) {
