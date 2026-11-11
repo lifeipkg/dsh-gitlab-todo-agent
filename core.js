@@ -287,13 +287,22 @@ export function buildTodoPrompt(todo) {
     createdAt: todo.createdAt,
   }, null, 2);
   const markDoneCommand = `glab api -X POST todos/${encodeURIComponent(todo.id)}/mark_as_done`;
+  // 回复正文的必含要素：做了什么 + MR 清单 + 未合并 MR 的阻塞与继续时机。
+  const replyBodyRules = [
+    '   回复内容必须包含：① 处理结果摘要（实际做了什么、改了哪些内容）；② 本次新建或更新的全部 MR 清单（编号、标题、链接）。',
+    '   ③ 如有未合并的 MR，必须单独列明每一条：为什么暂时不能合并（阻塞原因）、在等什么条件、建议什么时候继续处理——后续接手的人会依据这段话在回复评论时提醒继续推进该 MR。',
+  ].join('\n');
   const replyInstruction = todo.noteId
     ? [
-        `4. 正常处理结束后，必须回复原 note（ID: ${todo.noteId}）所属的讨论串，回应提出该 note 的人${todo.author ? `（@${todo.author}）` : ''}，说明处理结果、实际改动或阻塞原因；不要只新建顶层评论。`,
+        `4. 每条被处理的评论都必须获得回复，这是硬性要求，不得省略：正常处理结束后，必须回复原 note（ID: ${todo.noteId}）所属的讨论串，回应提出该 note 的人${todo.author ? `（@${todo.author}）` : ''}；不要只新建顶层评论，也不要只把结论留在 Session 里。`,
         '   先读取目标对象的 discussions，找到包含该 note ID 的 discussion。MR 可用 glab mr note create <iid> --repo <project> --reply <discussion-id> -m "<回复内容>"；Issue/WorkItem 可用 glab api -X POST projects/<project-id>/issues/<iid>/discussions/<discussion-id>/notes -F body=@reply.md。',
-        '   如果因权限或接口限制无法回复，不要假装已经回复；必须在 Session 中说明原因。',
+        replyBodyRules,
+        '   如果因权限或接口限制确实无法回复，不要假装已经回复；必须在 Session 中说明原因。',
       ].join('\n')
-    : '4. 如果该事项由评论触发，正常处理结束后应在原评论所属讨论串回应提出评论的人；若没有对应评论，则在目标对象下说明处理结果。';
+    : [
+        '4. 每条被处理的评论都必须获得回复，这是硬性要求，不得省略：正常处理结束后，应在原评论所属讨论串回应提出评论的人；若没有对应评论，则在目标对象下说明处理结果。不要只把结论留在 Session 里。',
+        replyBodyRules,
+      ].join('\n');
   const mergeInstruction = [
     '5. 如果本次处理新建了 MR（由本 Session 创建）：按 JEV-GATE.md 完成 Jev 裁决并留痕，且该 MR 的 CI 全部通过后，直接合并该 MR（例如 glab mr merge <iid> --repo <project> --yes），无需人类授权。本条是对 AGENTS.md「合并 main 须人类授权」在插件会话中的显式豁免，仅适用于本 Session 新建的 MR。',
     '   Jev 裁决未通过或 CI 未通过时不得合并：先修复再重跑；仍无法通过则保留 MR，在 Session 中说明原因并附证据。非本 Session 创建的 MR 一律不适用本条。',
@@ -310,7 +319,7 @@ export function buildTodoPrompt(todo) {
     mergeInstruction,
     '6. 只有实际完成该 Todo 后，才运行下面的命令，仅将这一条 Todo 标记为已处理：',
     `   ${markDoneCommand}`,
-    '7. 如果无法完成或需要人类决策（第 5 条已豁免的 MR 合并授权除外），不要运行上述标记命令；正常情况下仍应回应原 note，并在 Session 中记录已完成部分、阻塞原因和下一步。',
+    '7. 如果无法完成或需要人类决策（第 5 条已豁免的 MR 合并授权除外），不要运行上述标记命令；但仍必须按第 4 条回复原 note，并在回复与 Session 中记录已完成部分、阻塞原因和下一步。',
     '',
     'Todo 元数据：',
     details,

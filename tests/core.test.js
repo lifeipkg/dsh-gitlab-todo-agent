@@ -150,6 +150,15 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   assert.match(prompt, /glab api -X POST todos\/direct\/mark_as_done/);
   assert.match(prompt, /原 note（ID: 10）/);
   assert.match(prompt, /@other-user/);
+  // 回复是硬性要求，且必须汇报 MR 清单与未合并 MR 的阻塞原因和继续时机。
+  assert.match(prompt, /每条被处理的评论都必须获得回复/);
+  assert.match(prompt, /不要只把结论留在 Session 里/);
+  assert.match(prompt, /MR 清单/);
+  assert.match(prompt, /未合并的 MR/);
+  assert.match(prompt, /阻塞原因/);
+  assert.match(prompt, /建议什么时候继续处理/);
+  assert.match(prompt, /提醒继续推进该 MR/);
+  assert.match(prompt, /仍必须按第 4 条回复原 note/);
   assert.match(prompt, /不要只新建顶层评论/);
   assert.match(prompt, /--reply <discussion-id>/);
   assert.match(prompt, /discussions\/<discussion-id>\/notes/);
