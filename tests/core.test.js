@@ -38,6 +38,8 @@ const gitlabTodo = {
 };
 const sessionTodo = {
   ...gitlabTodo,
+  // 派发路径测试用非指派动作（指派类现在直接标记完成，不开会话）。
+  action_name: 'build_failed',
   target_type: 'Issue',
   target_url: 'https://gitlab.local/group/project/-/issues/7',
   target: { ...gitlabTodo.target, web_url: 'https://gitlab.local/group/project/-/issues/7' },
@@ -94,8 +96,8 @@ test('note mentions from another user are actionable in both action forms', () =
   assert.equal(classifyTodo(description, '106'), 'description-mention');
   assert.equal(isDescriptionMention(description, '106'), true);
   assert.equal(isNoteMention(description, '106'), false);
-  // 非 @ 类 action、缺作者仍不进入处理。
-  assert.equal(classifyTodo({ ...direct, action: 'assigned' }, '106'), 'other');
+  // 指派通知（assigned）与缺作者：都不进入处理；指派由规则直接标记完成。
+  assert.equal(classifyTodo({ ...direct, action: 'assigned' }, '106'), 'assignment-notify');
   assert.equal(classifyTodo({ ...direct, authorId: '' }, '106'), 'other');
 });
 
@@ -106,7 +108,8 @@ test('direct MR note mentions create work instead of being classified as MR clea
     target_url: 'https://gitlab.local/group/project/-/merge_requests/7#note_10',
   }]);
   assert.equal(classifyTodo(directMr, '106'), 'direct-mention');
-  assert.equal(classifyTodo(normalizeTodos([gitlabTodo])[0], '106'), 'merge-request');
+  // 指派类 MR 现在归类为指派通知（规则标记完成），不再当作待清理的 MR。
+  assert.equal(classifyTodo(normalizeTodos([gitlabTodo])[0], '106'), 'assignment-notify');
   assert.equal(classifyTodo({ targetType: '', url: 'https://gitlab.local/group/project/-/merge_requests/8', action: '' }, '106'), 'merge-request');
 });
 
@@ -693,10 +696,37 @@ test('non-mention MR dispatch marks GitLab done without a Session and survives r
   assert.equal(marked, 1);
   assert.equal(calls.create, 0);
   assert.equal(calls.prompt, 0);
-  assert.equal(runtime.state.handled[todo.id].outcome, 'merge-request-done');
+  // 指派类 MR：手动派发同样只标记完成，不开会话。
+  assert.equal(runtime.state.handled[todo.id].outcome, 'rule-skipped');
+  assert.match(runtime.state.handled[todo.id].skipReason, /指派通知/);
   const restored = normalizeState(JSON.parse(JSON.stringify(runtime.state)));
-  assert.equal(restored.handled[todo.id].outcome, 'merge-request-done');
-  assert.equal(publicState(restored, false, '106').todos[0].outcome, 'merge-request-done');
+  assert.equal(restored.handled[todo.id].outcome, 'rule-skipped');
+  assert.equal(publicState(restored, false, '106').todos[0].outcome, 'rule-skipped');
+});
+
+test('assigned issues are rule-skipped in polls and marked done on manual dispatch', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  let marked = 0;
+  runtime.markTodoDone = async () => { marked += 1; };
+  const assignedIssue = { ...gitlabTodo, target_type: 'Issue', target_url: 'https://gitlab.local/group/project/-/issues/7', target: { ...gitlabTodo.target, web_url: 'https://gitlab.local/group/project/-/issues/7' } };
+  const [todo] = normalizeTodos([assignedIssue]);
+  runtime.state.todos = [todo];
+  // 轮询：规则直接标记完成。
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.fetchTodos = async () => [todo];
+  await runtime.executePoll('test');
+  assert.equal(marked, 1);
+  assert.equal(calls.create, 0);
+  assert.equal(runtime.state.handled[todo.id].outcome, 'rule-skipped');
+  assert.match(runtime.state.handled[todo.id].skipReason, /指派通知/);
+  // 手动派发（强制重跑）也只标记完成。
+  const result = await runtime.dispatchById(todo.id);
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, true);
+  assert.equal(marked, 2);
+  assert.equal(calls.create, 0);
+  await runtime.stop();
 });
 
 test('direct MR note mention dispatch creates a Session instead of marking done', async () => {
@@ -743,22 +773,20 @@ test('automatic poll only dispatches direct note mentions from other users', asy
   runtime.fetchTodos = async () => normalizeTodos([gitlabTodo, directNoteTodo, directMr, selfMention, descriptionMention, ordinaryMention]);
   await runtime.executePoll('test');
   await runtime.pump();
-  // 自己 @ 自己、正文 @ 提及：规则直接标记完成，零模型零会话。
-  assert.equal(marked, 2);
+  // 自己 @ 自己、正文 @ 提及、指派通知：规则直接标记完成，零模型零会话。
+  assert.equal(marked, 3);
   assert.equal(runtime.state.handled.self.outcome, 'rule-skipped');
   assert.match(runtime.state.handled.self.skipReason, /自己 @ 自己/);
   assert.equal(runtime.state.handled.description.outcome, 'rule-skipped');
   assert.match(runtime.state.handled.description.skipReason, /正文 @ 提及/);
+  assert.equal(runtime.state.handled['12345'].outcome, 'rule-skipped');
+  assert.match(runtime.state.handled['12345'].skipReason, /指派通知/);
   // 三种他人评论提及（开头 @ / MR 评论 @ / 文中 @）都开会话。
   assert.equal(calls.create, 3);
   assert.equal(calls.prompt, 3);
   assert.equal(runtime.state.handled.direct.outcome, 'session-accepted');
   assert.equal(runtime.state.handled['direct-mr'].outcome, 'session-accepted');
   assert.equal(runtime.state.handled.mentioned.outcome, 'session-accepted');
-  // 指派类 MR 仍不进入处理。
-  for (const id of ['12345']) {
-    assert.equal(runtime.state.handled[id], undefined);
-  }
 });
 
 test('auto dispatch holds concurrency slots until sessions actually settle', async () => {

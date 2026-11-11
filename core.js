@@ -228,6 +228,8 @@ export function classifyTodo(todo, currentUserId) {
   if (isSelfMention(todo, currentUserId)) return 'self-mention';
   if (isDescriptionMention(todo, currentUserId)) return 'description-mention';
   if (isNoiseTodo(todo)) return 'pipeline-notify';
+  // 指派通知（Issue/MR 被指派给我）只是知会，不是行动请求；评论中的 @ 已在上面优先分类。
+  if (String(todo.action ?? '').toLowerCase() === 'assigned') return 'assignment-notify';
   const targetType = String(todo.targetType ?? '').toLowerCase().replace(/[^a-z]/g, '');
   if (targetType === 'mergerequest' || /\/-\/merge_requests(?:\/|$)/i.test(todo.url ?? '')) {
     return 'merge-request';
@@ -680,7 +682,7 @@ export function normalizeState(value) {
     for (const [id, record] of Object.entries(value.handled)) {
       if (!isRecord(record)) continue;
       const sessionId = typeof record.sessionId === 'string' && record.sessionId ? record.sessionId : null;
-      const outcome = record.outcome === 'merge-request-done' || record.outcome === 'precheck-skipped' || record.outcome === 'rule-skipped'
+      const outcome = ['merge-request-done', 'precheck-skipped', 'rule-skipped'].includes(record.outcome)
         ? record.outcome : 'session-accepted';
       if (!sessionId && outcome === 'session-accepted') continue;
       const acceptedAt = timestamp(record.acceptedAt) ?? Date.now();

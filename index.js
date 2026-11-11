@@ -38,6 +38,7 @@ const RULE_SKIP_REASONS = {
   'pipeline-notify': '流水线通知，规则判定无需处理',
   'self-mention': '自己 @ 自己，规则判定无需处理',
   'description-mention': '正文 @ 提及（非评论），规则判定无需处理',
+  'assignment-notify': '指派通知（Issue/MR 被指派给我），规则判定无需处理',
 };
 /** 核对“讨论串里有没有我方回复”时最多翻的 discussions 页数（每页 100）。 */
 const MAX_DISCUSSION_PAGES = 10;
@@ -1020,13 +1021,15 @@ export class GitlabTodoRuntime {
     const sessionTitle = buildSessionTitle(todo, round);
     let reserved = false;
     try {
-      if (classifyTodo(todo, this.gitlabUserId) === 'merge-request') {
+      const kind = classifyTodo(todo, this.gitlabUserId);
+      if (kind === 'merge-request' || kind === 'assignment-notify') {
         await this.markTodoDone(todo);
         const record = {
           id: todo.id,
           sessionId: null,
-          outcome: 'merge-request-done',
+          outcome: kind === 'assignment-notify' ? 'rule-skipped' : 'merge-request-done',
           acceptedAt: Date.now(),
+          skipReason: kind === 'assignment-notify' ? RULE_SKIP_REASONS['assignment-notify'] : '',
           title: todo.title,
           url: todo.url,
           project: todo.project,
