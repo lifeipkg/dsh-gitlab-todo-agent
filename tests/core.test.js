@@ -1105,6 +1105,7 @@ test('closure report parsing takes the last valid report and only same-origin MR
     status: 'waiting',
     summary: '等待 {CI} 完成',
     resumeAfterMinutes: 30,
+    noAction: false,
     openMrs: ['https://gitlab.local/group/project/-/merge_requests/12'],
   });
   // JSON 不合法时退回正则，仍能拿到状态。
@@ -1409,6 +1410,49 @@ test('sessions interrupted by a restart are adopted and settled instead of stayi
   assert.match(runtime.state.handled.cut.executionError, /没有回合结束记录/);
   assert.equal(runtime.state.handled.cut.closure, 'closed');
   await runtime.stop();
+});
+
+test('mention-only rule appears in both the judge prompt and the session prompt', () => {
+  const [todo] = normalizeTodos([directNoteTodo]);
+  assert.match(buildJudgePrompt(todo), /“仅被提及”也判定为不需要处理/);
+  assert.match(buildJudgePrompt(todo), /拿不准时按需要处理/);
+  const prompt = buildTodoPrompt(todo);
+  assert.match(prompt, /0\. 先判断这条评论是否真的需要我处理/);
+  assert.match(prompt, /不要回复或发表评论/);
+  assert.match(prompt, /"noAction":true/);
+  assert.equal(parseClosureReport('[TODO-CLOSURE] {"status":"done","summary":"cc 知会","noAction":true}').noAction, true);
+  // noAction 只在 done 时有效。
+  assert.equal(parseClosureReport('[TODO-CLOSURE] {"status":"waiting","summary":"x","noAction":true}').noAction, false);
+});
+
+test('a mention-only session closes without a thread reply', async () => {
+  const { runtime, calls } = autoRuntime();
+  let pending = [directNoteTodo];
+  runtime.fetchTodos = async () => normalizeTodos(pending);
+  runtime.runGlab = async () => JSON.stringify([{ id: 'd1', notes: [{ id: 10, author: { id: 52 } }] }]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  pending = [];
+  calls.complete('session-1', 'completed', closureLine({ status: 'done', summary: 'cc 知会，无需行动', noAction: true, resumeAfterMinutes: 0, openMrs: [] }));
+  await runtime.reconcileSessions();
+  const record = runtime.state.handled.direct;
+  assert.equal(record.closure, 'closed');
+  assert.equal(record.replied, null);
+  assert.match(record.closureNote, /仅被提及，无需处理：cc 知会/);
+  assert.equal(record.archived, true);
+  // 没有 noAction 标记时，同样的无回复仍判缺回复。
+  const strict = autoRuntime();
+  let pendingStrict = [directNoteTodo];
+  strict.runtime.fetchTodos = async () => normalizeTodos(pendingStrict);
+  strict.runtime.runGlab = async () => JSON.stringify([{ id: 'd1', notes: [{ id: 10, author: { id: 52 } }] }]);
+  await strict.runtime.executePoll('test');
+  await strict.runtime.pump();
+  pendingStrict = [];
+  strict.calls.complete('session-1', 'completed', closureLine({ status: 'done', summary: '已处理', resumeAfterMinutes: 0, openMrs: [] }));
+  await strict.runtime.reconcileSessions();
+  assert.equal(strict.runtime.state.handled.direct.closure, 'follow-up');
+  await runtime.stop();
+  await strict.runtime.stop();
 });
 
 test('settings validation covers the follow-up controls', () => {

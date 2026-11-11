@@ -461,6 +461,7 @@ export class GitlabTodoRuntime {
           handled.reportStatus = report?.status ?? '';
           handled.reportSummary = report?.summary ?? '';
           handled.resumeAfterMinutes = report?.resumeAfterMinutes ?? null;
+          handled.reportNoAction = report?.noAction === true;
           if (report) handled.openMrs = normalizeMrUrls(report.openMrs, handled.url);
           changed = true;
           settled = true;
@@ -526,7 +527,9 @@ export class GitlabTodoRuntime {
   async concludeRecord(record, todoPending) {
     const settings = this.state.settings;
     const item = record.item ?? this.state.todos.find((todo) => todo.id === record.id) ?? null;
-    const replied = item?.noteId ? await this.checkReplied(item) : null;
+    // 会话判定为“仅被提及”且 Todo 已标记完成：本就不该回复，不核对讨论串。
+    const mentionOnly = record.reportNoAction === true && !todoPending;
+    const replied = item?.noteId && !mentionOnly ? await this.checkReplied(item) : null;
     const round = record.round ?? 1;
     let followUpBlocked = '';
     if (record.automatic === false) followUpBlocked = '手动派发的会话不自动续办';
@@ -547,6 +550,7 @@ export class GitlabTodoRuntime {
       baseDelayMinutes: settings.followUpDelayMinutes,
     });
     record.replied = replied;
+    if (mentionOnly && verdict.closure === 'closed') verdict.note = `仅被提及，无需处理：${record.reportSummary || '会话判定无行动要求'}`.slice(0, 500);
     record.closure = verdict.closure;
     record.closureNote = verdict.note;
     record.nextAttemptAt = verdict.closure === 'follow-up' ? Date.now() + verdict.delayMinutes * 60000 : null;
