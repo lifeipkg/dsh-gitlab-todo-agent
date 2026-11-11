@@ -29,6 +29,11 @@ const TODO_PAGE_SIZE = 100;
 const MAX_TODO_PAGES = 20;
 const MAX_RULE_SKIPS_PER_POLL = 20;
 const PRECHECK_CONCURRENCY = 3;
+/** 规则即可判定无需处理的类别 → 标记理由（零模型调用）。 */
+const RULE_SKIP_REASONS = {
+  'pipeline-notify': '流水线通知，规则判定无需处理',
+  'self-mention': '自己 @ 自己，规则判定无需处理',
+};
 const BRIDGE_PATH = '/api/gitlab-todo-agent';
 const MAX_REQUEST_BYTES = 128 * 1024;
 
@@ -488,10 +493,10 @@ export class GitlabTodoRuntime {
         .filter((todo) => !this.dispatches.has(todo.id));
       this.state.lastNewCount = candidates.length;
       if (this.state.settings.enabled && this.state.settings.autoProcess) {
-        // 1) 规则跳过：流水线通知等噪声零模型调用，程序内直接标记完成。
+        // 1) 规则跳过：流水线通知、自己 @ 自己——零模型调用，程序内直接标记完成。
         if (this.state.settings.ruleSkipEnabled !== false) {
           const noise = candidates
-            .filter((todo) => classifyTodo(todo, this.gitlabUserId) === 'pipeline-notify')
+            .filter((todo) => RULE_SKIP_REASONS[classifyTodo(todo, this.gitlabUserId)])
             .slice(0, MAX_RULE_SKIPS_PER_POLL);
           for (const todo of noise) {
             try {
@@ -502,7 +507,7 @@ export class GitlabTodoRuntime {
                 outcome: 'rule-skipped',
                 automatic: true,
                 acceptedAt: Date.now(),
-                skipReason: '流水线通知，规则判定无需处理',
+                skipReason: RULE_SKIP_REASONS[classifyTodo(todo, this.gitlabUserId)],
                 title: todo.title,
                 url: todo.url,
                 project: todo.project,

@@ -11,7 +11,8 @@ import {
   classifyTodo,
   defaultSettings,
   initialState,
-  isDirectNoteMention,
+  isNoteMention,
+  isSelfMention,
   normalizeState,
   normalizeTodos,
   publicState,
@@ -72,14 +73,21 @@ test('pending selection skips accepted ids and enforces the batch limit', () => 
   assert.deepEqual(selectPendingTodos(todos, new Set(['a', 'b']), 5).map((item) => item.id), ['c']);
 });
 
-test('only direct note mentions from another user are actionable', () => {
+test('note mentions from another user are actionable in both action forms', () => {
   const [direct] = normalizeTodos([directNoteTodo]);
   assert.equal(direct.noteId, '10');
-  assert.equal(isDirectNoteMention(direct, '106'), true);
+  assert.equal(isNoteMention(direct, '106'), true);
   assert.equal(classifyTodo(direct, '106'), 'direct-mention');
-  assert.equal(classifyTodo(direct, '52'), 'other');
+  // @ 出现在评论正文中（action=mentioned）同样进入处理——历史上只认 directly_addressed 会漏掉这类。
+  assert.equal(classifyTodo({ ...direct, action: 'mentioned' }, '106'), 'direct-mention');
+  assert.equal(isNoteMention({ ...direct, action: 'mentioned' }, '106'), true);
+  // 自己 @ 自己：规则直接标记完成，不开会话。
+  assert.equal(classifyTodo(direct, '52'), 'self-mention');
+  assert.equal(isSelfMention(direct, '52'), true);
+  assert.equal(isNoteMention(direct, '52'), false);
+  // 描述性提及（无 #note_ 锚点）、非提及 action、缺作者仍不进入处理。
   assert.equal(classifyTodo({ ...direct, url: 'https://gitlab.local/group/project/-/issues/7' }, '106'), 'other');
-  assert.equal(classifyTodo({ ...direct, action: 'mentioned' }, '106'), 'other');
+  assert.equal(classifyTodo({ ...direct, action: 'assigned' }, '106'), 'other');
   assert.equal(classifyTodo({ ...direct, authorId: '' }, '106'), 'other');
 });
 
@@ -679,6 +687,7 @@ test('automatic poll only dispatches direct note mentions from other users', asy
   runtime.markTodoDone = async () => { marked += 1; };
   runtime.state.settings.enabled = true;
   runtime.state.settings.autoProcess = true;
+  runtime.state.settings.maxSessionsPerPoll = 4;
   const directMr = {
     ...directNoteTodo,
     id: 'direct-mr',
@@ -691,12 +700,18 @@ test('automatic poll only dispatches direct note mentions from other users', asy
   runtime.fetchTodos = async () => normalizeTodos([gitlabTodo, directNoteTodo, directMr, selfMention, descriptionMention, ordinaryMention]);
   await runtime.executePoll('test');
   await runtime.pump();
-  assert.equal(marked, 0);
-  assert.equal(calls.create, 2);
-  assert.equal(calls.prompt, 2);
+  // 自己 @ 自己：规则直接标记完成，零模型零会话。
+  assert.equal(marked, 1);
+  assert.equal(runtime.state.handled.self.outcome, 'rule-skipped');
+  assert.match(runtime.state.handled.self.skipReason, /自己 @ 自己/);
+  // 三种他人评论提及（开头 @ / MR 评论 @ / 文中 @）都开会话。
+  assert.equal(calls.create, 3);
+  assert.equal(calls.prompt, 3);
   assert.equal(runtime.state.handled.direct.outcome, 'session-accepted');
   assert.equal(runtime.state.handled['direct-mr'].outcome, 'session-accepted');
-  for (const id of ['12345', 'self', 'description', 'mentioned']) {
+  assert.equal(runtime.state.handled.mentioned.outcome, 'session-accepted');
+  // 指派类 MR 与描述性提及仍不进入处理。
+  for (const id of ['12345', 'description']) {
     assert.equal(runtime.state.handled[id], undefined);
   }
 });

@@ -143,15 +143,34 @@ export function selectPendingTodos(todos, handled, limit) {
   return todos.filter((todo) => !handledIds.has(todo.id)).slice(0, limit);
 }
 
-export function isDirectNoteMention(todo, currentUserId) {
+/**
+ * 触发“评论中 @ 我”的 GitLab action 集合：
+ * - directly_addressed：@ 出现在评论开头（直接称呼，如 "@me 帮我看看…"）。
+ * - mentioned：@ 出现在评论正文中（如 "这个问题 @me 帮忙看下，另外…"）。
+ * 只认 directly_addressed 会漏掉所有“文中 @”，这是历史上提及未进处理的原因。
+ */
+export const NOTE_MENTION_ACTIONS = ['directly_addressed', 'mentioned'];
+
+/** 他人评论中的 @ 提及（两种 action 均算），且必须有 #note_<id> 锚点排除描述性提及。 */
+export function isNoteMention(todo, currentUserId) {
   const action = String(todo.action ?? '').toLowerCase();
   const authorId = String(todo.authorId ?? '').trim();
   const userId = String(currentUserId ?? '').trim();
-  return action === 'directly_addressed'
+  return NOTE_MENTION_ACTIONS.includes(action)
     && /#note_\d+/i.test(todo.url ?? '')
     && Boolean(authorId)
     && Boolean(userId)
     && authorId !== userId;
+}
+
+/** 自己 @ 自己（评论或描述）：规则直接标记完成，无需任何处理。 */
+export function isSelfMention(todo, currentUserId) {
+  const action = String(todo.action ?? '').toLowerCase();
+  const authorId = String(todo.authorId ?? '').trim();
+  const userId = String(currentUserId ?? '').trim();
+  return NOTE_MENTION_ACTIONS.includes(action)
+    && Boolean(userId)
+    && authorId === userId;
 }
 
 /** 规则即可判定无需处理的 GitLab action_name 噪声集合（零模型调用直接标记完成）。 */
@@ -163,7 +182,8 @@ export function isNoiseTodo(todo) {
 }
 
 export function classifyTodo(todo, currentUserId) {
-  if (isDirectNoteMention(todo, currentUserId)) return 'direct-mention';
+  if (isNoteMention(todo, currentUserId)) return 'direct-mention';
+  if (isSelfMention(todo, currentUserId)) return 'self-mention';
   if (isNoiseTodo(todo)) return 'pipeline-notify';
   const targetType = String(todo.targetType ?? '').toLowerCase().replace(/[^a-z]/g, '');
   if (targetType === 'mergerequest' || /\/-\/merge_requests(?:\/|$)/i.test(todo.url ?? '')) {
@@ -477,7 +497,7 @@ export function publicState(state, running = false, currentUserId = null) {
     },
     todos: state.todos.map((todo) => ({
       ...todo,
-      directMention: isDirectNoteMention(todo, currentUserId),
+      directMention: isNoteMention(todo, currentUserId),
       handled: Boolean(state.handled[todo.id]),
       outcome: state.handled[todo.id]?.outcome ?? null,
       executionStatus: state.handled[todo.id]?.executionStatus ?? null,

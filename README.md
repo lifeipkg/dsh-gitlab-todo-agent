@@ -14,13 +14,13 @@
 
 Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再使用只读的 `glab api -X GET todos` 分页读取当前用户的待办，每页 100 条、最多 20 页。响应由 Host 直接解析、校验和归一化。
 
-只有同时满足以下条件的 Todo 才属于“他人在评论中直接 @ 我”：
+只有同时满足以下条件的 Todo 才属于“他人在评论中 @ 我”：
 
-- `action_name=directly_addressed`：GitLab 将其识别为直接提及，而不是普通提及、指派或其他通知。
+- `action_name` 为 `directly_addressed` **或 `mentioned`**：前者是 @ 出现在评论开头（直接称呼），后者是 @ 出现在评论正文中。**只认 `directly_addressed` 会漏掉所有“文中 @ 我”的评论**——这是 v2.5 之前部分提及未进入处理的原因。
 - `target_url` 包含 `#note_<id>`：Todo 来源于评论，而不是 Issue/MR 描述。
-- `author.id` 不等于当前用户 ID：排除自己在评论中 @ 自己产生的 Todo。
+- `author.id` 不等于当前用户 ID：自己的提及走规则跳过，不进入处理。
 
-该规则不限制 Issue、WorkItem 或 MergeRequest。普通 `mentioned`、指派、评审请求和其他通知仅保留在列表中，不自动创建 Session。
+该规则不限制 Issue、WorkItem 或 MergeRequest。普通指派、评审请求和其他通知仅保留在列表中，不自动创建 Session。
 
 ## 分类与处理规则
 
@@ -28,7 +28,12 @@ Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再�
 
 ### 规则跳过（零模型调用）
 
-开启 **流水线通知等规则噪声直接标记完成**（默认开启）后，`build_failed` 等 GitLab 流水线通知类 Todo（`NOISE_ACTIONS` 集合）在轮询阶段由程序内直接执行 `mark_as_done`，记录为 **已跳过（流水线通知）**，完全不经过模型，也不创建会话。每轮最多处理 20 条，标记失败的留到下一轮。直接提及永远优先于规则跳过，不会被误杀。
+开启 **流水线通知、自己 @ 自己等规则噪声直接标记完成**（默认开启）后，两类 Todo 在轮询阶段由程序内直接执行 `mark_as_done`，记录为 **已跳过（规则）**，完全不经过模型，也不创建会话：
+
+- **流水线通知**：`build_failed` 等 `NOISE_ACTIONS` 集合内的 action。
+- **自己 @ 自己**：`directly_addressed`/`mentioned` 且作者就是当前用户的提及（评论或描述均算）。
+
+每轮最多处理 20 条，标记失败的留到下一轮。他人的评论提及永远优先于规则跳过，不会被误杀。
 
 ### 快速预检
 
