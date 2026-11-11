@@ -1412,6 +1412,16 @@ test('sessions interrupted by a restart are adopted and settled instead of stayi
   await runtime.stop();
 });
 
+test('prompt requires UTF-8 when writing note bodies through glab', () => {
+  const withNote = buildTodoPrompt(normalizeTodos([directNoteTodo])[0]);
+  const withoutNote = buildTodoPrompt(normalizeTodos([sessionTodo])[0]);
+  for (const prompt of [withNote, withoutNote]) {
+    assert.match(prompt, /都必须以 UTF-8 编码/);
+    assert.match(prompt, /UTF-8（无 BOM）文件/);
+    assert.match(prompt, /读回该 note/);
+  }
+});
+
 test('mention-only rule appears in both the judge prompt and the session prompt', () => {
   const [todo] = normalizeTodos([directNoteTodo]);
   assert.match(buildJudgePrompt(todo), /“仅被提及”也判定为不需要处理/);

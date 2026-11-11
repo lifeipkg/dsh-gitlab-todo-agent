@@ -24,6 +24,9 @@ export const CLOSURE_STATES = ['verifying', 'closed', 'follow-up', 'needs-human'
 export const REPORT_STATUSES = ['done', 'waiting', 'needs-human'];
 export const CLOSURE_MARKER = '[TODO-CLOSURE]';
 
+/** 用 glab 写 GitLab（note、描述等正文）时的编码规则，避免中文变成乱码或问号。 */
+export const UTF8_WRITE_RULE = '   用 glab 写入任何正文（回复 note、评论、描述、MR 说明）都必须以 UTF-8 编码：先把正文写入 UTF-8（无 BOM）文件，再用 -F body=@文件 以文件方式传入（MR 也可用 glab api 的 discussions/notes 接口，不必用 glab mr note create -m）；不要在命令行参数里直接内联中文，也不要通过管道传中文。执行前在同一 shell 设置 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) 与 $OutputEncoding = [Text.UTF8Encoding]::new($false)。发布后用 glab api 读回该 note，确认中文没有变成 ? 或乱码；有乱码就立即用 PUT 修正为正确内容，不要留下乱码 note。';
+
 /** 仅提及不处理的判别规则：预检提示词与会话提示词共用，保持口径一致。 */
 export const MENTION_ONLY_RULE = '“仅被提及”也判定为不需要处理：@ 我只是为了知会、抄送（cc）、引用我此前的发言或方案、署名致谢、说明某事与我有关或由我负责，或者是在评论里向别人提问/交代任务而顺带点到我，评论中没有任何要我本人做的事、回答的问题或要出的结论。判断依据是评论的整体语义，而不是有没有 @：先看这条评论到底希望谁做什么；只有我是被要求行动或回答的对象时才需要处理。拿不准时按需要处理。';
 
@@ -589,6 +592,7 @@ export function buildTodoPrompt(todo, context = {}) {
   const replyBodyRules = [
     '   回复内容必须包含：① 处理结果摘要（实际做了什么、改了哪些内容）；② 本次新建或更新的全部 MR 清单（编号、标题、链接）。',
     '   ③ 如有未合并的 MR，必须单独列明每一条：为什么暂时不能合并（阻塞原因）、在等什么条件、建议什么时候继续处理——后续接手的人会依据这段话在回复评论时提醒继续推进该 MR。',
+    UTF8_WRITE_RULE,
   ].join('\n');
   const replyInstruction = todo.noteId
     ? [
