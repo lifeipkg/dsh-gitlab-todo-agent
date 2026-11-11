@@ -173,6 +173,18 @@ export function isSelfMention(todo, currentUserId) {
     && authorId === userId;
 }
 
+/** 他人 @ 我但不在评论中（Issue/WorkItem/MR 正文等，URL 无 #note_ 锚点）：规则直接标记完成。 */
+export function isDescriptionMention(todo, currentUserId) {
+  const action = String(todo.action ?? '').toLowerCase();
+  const authorId = String(todo.authorId ?? '').trim();
+  const userId = String(currentUserId ?? '').trim();
+  return NOTE_MENTION_ACTIONS.includes(action)
+    && !/#note_\d+/i.test(todo.url ?? '')
+    && Boolean(authorId)
+    && Boolean(userId)
+    && authorId !== userId;
+}
+
 /** 规则即可判定无需处理的 GitLab action_name 噪声集合（零模型调用直接标记完成）。 */
 export const NOISE_ACTIONS = ['build_failed'];
 
@@ -184,6 +196,7 @@ export function isNoiseTodo(todo) {
 export function classifyTodo(todo, currentUserId) {
   if (isNoteMention(todo, currentUserId)) return 'direct-mention';
   if (isSelfMention(todo, currentUserId)) return 'self-mention';
+  if (isDescriptionMention(todo, currentUserId)) return 'description-mention';
   if (isNoiseTodo(todo)) return 'pipeline-notify';
   const targetType = String(todo.targetType ?? '').toLowerCase().replace(/[^a-z]/g, '');
   if (targetType === 'mergerequest' || /\/-\/merge_requests(?:\/|$)/i.test(todo.url ?? '')) {

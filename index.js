@@ -33,6 +33,7 @@ const PRECHECK_CONCURRENCY = 3;
 const RULE_SKIP_REASONS = {
   'pipeline-notify': '流水线通知，规则判定无需处理',
   'self-mention': '自己 @ 自己，规则判定无需处理',
+  'description-mention': '正文 @ 提及（非评论），规则判定无需处理',
 };
 const BRIDGE_PATH = '/api/gitlab-todo-agent';
 const MAX_REQUEST_BYTES = 128 * 1024;

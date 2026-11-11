@@ -11,6 +11,7 @@ import {
   classifyTodo,
   defaultSettings,
   initialState,
+  isDescriptionMention,
   isNoteMention,
   isSelfMention,
   normalizeState,
@@ -85,8 +86,12 @@ test('note mentions from another user are actionable in both action forms', () =
   assert.equal(classifyTodo(direct, '52'), 'self-mention');
   assert.equal(isSelfMention(direct, '52'), true);
   assert.equal(isNoteMention(direct, '52'), false);
-  // 描述性提及（无 #note_ 锚点）、非提及 action、缺作者仍不进入处理。
-  assert.equal(classifyTodo({ ...direct, url: 'https://gitlab.local/group/project/-/issues/7' }, '106'), 'other');
+  // 正文 @ 提及（无 #note_ 锚点，如 work-item 正文）：规则直接标记完成，不进入处理。
+  const description = { ...direct, url: 'https://gitlab.local/group/project/-/work_items/209' };
+  assert.equal(classifyTodo(description, '106'), 'description-mention');
+  assert.equal(isDescriptionMention(description, '106'), true);
+  assert.equal(isNoteMention(description, '106'), false);
+  // 非 @ 类 action、缺作者仍不进入处理。
   assert.equal(classifyTodo({ ...direct, action: 'assigned' }, '106'), 'other');
   assert.equal(classifyTodo({ ...direct, authorId: '' }, '106'), 'other');
 });
@@ -714,18 +719,20 @@ test('automatic poll only dispatches direct note mentions from other users', asy
   runtime.fetchTodos = async () => normalizeTodos([gitlabTodo, directNoteTodo, directMr, selfMention, descriptionMention, ordinaryMention]);
   await runtime.executePoll('test');
   await runtime.pump();
-  // 自己 @ 自己：规则直接标记完成，零模型零会话。
-  assert.equal(marked, 1);
+  // 自己 @ 自己、正文 @ 提及：规则直接标记完成，零模型零会话。
+  assert.equal(marked, 2);
   assert.equal(runtime.state.handled.self.outcome, 'rule-skipped');
   assert.match(runtime.state.handled.self.skipReason, /自己 @ 自己/);
+  assert.equal(runtime.state.handled.description.outcome, 'rule-skipped');
+  assert.match(runtime.state.handled.description.skipReason, /正文 @ 提及/);
   // 三种他人评论提及（开头 @ / MR 评论 @ / 文中 @）都开会话。
   assert.equal(calls.create, 3);
   assert.equal(calls.prompt, 3);
   assert.equal(runtime.state.handled.direct.outcome, 'session-accepted');
   assert.equal(runtime.state.handled['direct-mr'].outcome, 'session-accepted');
   assert.equal(runtime.state.handled.mentioned.outcome, 'session-accepted');
-  // 指派类 MR 与描述性提及仍不进入处理。
-  for (const id of ['12345', 'description']) {
+  // 指派类 MR 仍不进入处理。
+  for (const id of ['12345']) {
     assert.equal(runtime.state.handled[id], undefined);
   }
 });
