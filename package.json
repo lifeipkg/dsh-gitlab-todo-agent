@@ -1,6 +1,6 @@
 {
   "name": "dsh-gitlab-todo-agent",
-  "version": "2.14.0",
+  "version": "2.15.0",
   "description": "DSH bundle: poll GitLab todos via glab and dispatch comment mentions to DSH sessions with closed-loop verification.",
   "type": "module",
   "license": "MIT",

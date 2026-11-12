@@ -26,7 +26,7 @@ export const REPORT_STATUSES = ['done', 'waiting', 'needs-human'];
 export const CLOSURE_MARKER = '[TODO-CLOSURE]';
 
 /** 用 glab 写 GitLab（note、描述等正文）时的编码规则，避免中文变成乱码或问号；跨平台适用。 */
-export const UTF8_WRITE_RULE = '   用 glab 写入任何正文（回复 note、评论、描述、MR 说明）都必须以 UTF-8 编码：优先把正文写入 UTF-8（无 BOM）文件，再用 -F body=@文件 以文件方式传入（MR 也可用 glab api 的 discussions/notes 接口，不必用 glab mr note create -m）；不要在命令行参数里直接内联非 ASCII 文本，也不要通过管道传正文。Windows PowerShell 下先在同一 shell 执行 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) 与 $OutputEncoding = [Text.UTF8Encoding]::new($false)；bash/zsh 等 POSIX shell 下先执行 export LC_ALL=C.UTF-8（或系统可用的 UTF-8 locale）。发布后用 glab api 读回该 note，确认中文没有变成 ? 或乱码；有乱码就立即用 PUT 修正为正确内容，不要留下乱码 note。';
+export const UTF8_WRITE_RULE = '   用 glab 写入任何正文（回复 note、评论、描述、MR 说明）都必须以 UTF-8 编码：把正文写入 UTF-8（无 BOM）文件后用 -F body=@文件 传入，不要在命令行参数内联或用管道传非 ASCII 文本；Windows PowerShell 先在同一 shell 把 [Console]::OutputEncoding 与 $OutputEncoding 设为 [Text.UTF8Encoding]::new($false)，bash/zsh 等 POSIX shell 先 export LC_ALL=C.UTF-8。写入后读回该 note 确认无乱码，有乱码立即用 PUT 修正，不要留下乱码内容。';
 
 /** v3 及更早版本内嵌在会话提示词里的工作区专属规则。v3→v4 迁移时预填进 customRules，保证老部署行为不变；新安装默认为空。 */
 export const LEGACY_WORKFLOW_RULES = [
@@ -472,7 +472,8 @@ export function buildJudgePrompt(todo) {
     url: todo.url,
   }, null, 2);
   return [
-    '你是 GitLab Todo 预检器。判断下面这条“其他用户在评论中直接 @ 我”的 Todo 是否需要我实际处理（回答问题、执行任务、审查代码、查找资料等）。',
+    '你是 GitLab Todo 预检器。插件轮询 GitLab Todo 后自动触发本预检，整条链路无人值守：判定为需要处理时会由无人值守会话实际处理；判定为不需要处理时该 Todo 会被直接标记完成，之后不会再有任何处理。',
+    '判断下面这条“其他用户在评论中直接 @ 我”的 Todo 是否需要我实际处理（回答问题、执行任务、审查代码、查找资料等）。',
     '以下情况判定为不需要处理：纯感谢/客套/招呼、纯表情或 +1 式附和、与本工作无关的闲聊、不需要我回应的通报、测试性提及。',
     MENTION_ONLY_RULE,
     '只要存在向我提出的具体问题或行动请求，即使很小，也判定为需要处理。',
@@ -541,11 +542,13 @@ function buildEnvironmentLines(todo, context) {
     '- 会话性质：这是无人值守的单轮会话。没有人会在本会话里回答提问或追加指令；本回合结束后插件立即结算，会话随即归档，不会有第二回合。',
     '- 因此不要向用户提问后停下等待，不要以“稍后继续”“等确认后再处理”收尾，也不要依赖回合结束后仍需存活的后台任务或定时器；能在本回合做完的事必须在本回合做完。',
     '- 触发方式：本会话由插件轮询 GitLab Todo 自动触发，不是任何人当面委派你做事；原 note 与其讨论串是唯一的任务来源，也是“可以做某事”的唯一授权依据。',
-    '- 危险操作护栏：未经他人明确要求或明确同意（以原 note 或讨论串中相关人员的原话为准），不得执行影响他人或共享环境的写操作——包括但不限于触发或重试 CI/CD 流水线与部署任务（retry、play、rebuild、deploy 类任务，如 rebuild_dev）、合并或关闭他人创建的 MR、approve 他人 MR、强推、删除分支/标签、修改仓库或项目设置。看到流水线红、部署失败等问题时只读取与记录，在回复中说明现状并等明确要求，绝不主动触发、重试或“顺手修复”。',
+    '- 危险操作护栏（默认只读 + 写操作白名单）：本会话对 GitLab 与仓库的写操作只允许四类——① 在原 note 所在讨论串回复，或在该目标对象下发表说明处理结果的评论；② 标记本条 Todo 完成（第 6 条命令），以及本次处理已实际覆盖的同对象遗留 Todo；③ 在目标仓库新建/更新自己的分支、提交与 MR；④ 第 5 条或附加规则明确豁免的（本会话或前序会话创建的）MR 合并。其余一切写操作——触发或重试 CI/CD 流水线与部署任务（retry、play、rebuild、deploy 类，如 rebuild_dev）、合并/关闭/approve 他人的 MR、强推、删除分支/标签、修改仓库或项目设置、改动 issue/MR 的指派/里程碑/标签等——没有授权一律不做。',
+    '- 授权判定：授权必须是相关人员（原 note 作者、目标对象指派人、目标仓库成员）在原 note 或其讨论串中的明确祈使句或明确同意，并与要执行的操作逐字对应；疑问、玩笑、猜测、旁观者转述、模糊表态都不算。拿不准就视为没有授权。',
+    '- 看到流水线红、部署失败等异常时只读取与记录，在回复中说明现状并等明确要求，绝不主动触发、重试或“顺手修复”。',
     '- 工作范围：只做原 note（及讨论串中随后明确要求）的事；顺带发现的其他问题一律写进回复供人决策，不要扩大范围。',
     `- 你的 GitLab 身份：${identity}。讨论串里该账号发出的 note 就是“我方”此前的回复，你的回复也以该账号发出。`,
     `- 本会话：${sessionLabel}；当前时间：${now}。`,
-    `- 等待预算：需要等 CI、流水线等外部条件时，在本回合内轮询等待，累计不超过约 ${waitBudget} 分钟；超出就按“未闭环”收尾，不要无限等待。`,
+    `- 等待预算：需要等 CI、流水线等外部条件时，在本回合内轮询等待，累计不超过约 ${waitBudget} 分钟，轮询间隔 60–120 秒（用 sleep 控制，不要高频请求）；超出预算就按“未闭环”收尾，不要无限等待。`,
     '- 闭环判定：回合结束后插件会自行核对，不以你的自述为准——① 该 Todo 是否已 mark_as_done；② 原 note 所在讨论串里是否有我方回复；③ 你输出的结案报告（见第 8 条）。',
     context.autoFollowUp
       ? `- 未闭环时的后续：插件会在稍后（默认约 ${delay} 分钟，或按结案报告的 resumeAfterMinutes）自动新开“续办会话”继续处理。续办会话看不到本会话的任何上下文，只能读到 GitLab 上的内容和插件记录的 MR 清单，所以续办所需的一切信息都必须写进回复 note。`
@@ -608,9 +611,10 @@ export function buildTodoPrompt(todo, context = {}) {
     createdAt: todo.createdAt,
   }, null, 2);
   const markDoneCommand = `glab api -X POST todos/${encodeURIComponent(todo.id)}/mark_as_done`;
-  // 回复正文的必含要素：做了什么 + MR 清单 + 未合并 MR 的阻塞与继续时机。
+  // 回复正文的必含要素：可极简；展开时必须包含做了什么 + MR 清单 + 未合并 MR 的阻塞与继续时机。
   const replyBodyRules = [
-    '   回复内容必须包含：① 处理结果摘要（实际做了什么、改了哪些内容）；② 本次新建或更新的全部 MR 清单（编号、标题、链接）。',
+    '   回复可长可短：一句话能说清的（纯问答、查证结论、确认状态）就回一句结论加必要链接，不必长篇。',
+    '   需要展开时必须包含：① 处理结果摘要（实际做了什么、改了哪些内容）；② 本次新建或更新的全部 MR 清单（编号、标题、链接），没有就写“无”。',
     '   ③ 如有未合并的 MR，必须单独列明每一条：为什么暂时不能合并（阻塞原因）、在等什么条件、建议什么时候继续处理——后续接手的人会依据这段话在回复评论时提醒继续推进该 MR。',
     UTF8_WRITE_RULE,
   ].join('\n');
@@ -637,7 +641,7 @@ export function buildTodoPrompt(todo, context = {}) {
   const closureInstruction = [
     '8. 结案报告（必须）：本回合最后一条消息的最后一行，按下面的格式输出单行文本。插件据此决定归档、续办还是转人工：',
     `   ${CLOSURE_MARKER} {"status":"<done|waiting|needs-human>","summary":"<一句话结论>","resumeAfterMinutes":<waiting 时建议多少分钟后续办，其余填 0>,"openMrs":["<本 Todo 各轮会话创建且尚未合并的 MR 链接>"]}`,
-    '   done 只在 Todo 已标记完成且已回复原 note 时使用（第 0 条判定为“仅被提及”的除外，此时不回复，并在 JSON 中加 "noAction":true）；openMrs 没有就写 []；除这一行外不要再输出其他同名标记。',
+    '   done 只在 Todo 已标记完成且已回复原 note 时使用（第 0 条判定为“仅被提及”的除外，此时不回复，并在 JSON 中加 "noAction":true）；summary 内不要用双引号（需要引用时用「」或单引号），也不要换行；openMrs 没有就写 []；除这一行外不要再输出其他同名标记。',
   ].join('\n');
   return [
     '[GITLAB TODO WATCHER]',

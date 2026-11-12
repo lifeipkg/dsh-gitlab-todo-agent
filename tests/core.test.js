@@ -179,10 +179,20 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   // 危险操作护栏：自动触发、未经他人明确要求或同意不执行危险写操作（rebuild_dev 事件后加入）。
   assert.match(prompt, /由插件轮询 GitLab Todo 自动触发/);
   assert.match(prompt, /唯一的任务来源/);
-  assert.match(prompt, /危险操作护栏/);
+  assert.match(prompt, /危险操作护栏（默认只读 \+ 写操作白名单）/);
+  assert.match(prompt, /写操作只允许四类/);
   assert.match(prompt, /rebuild_dev/);
+  assert.match(prompt, /改动 issue\/MR 的指派\/里程碑\/标签/);
+  assert.match(prompt, /授权必须是相关人员/);
+  assert.match(prompt, /疑问、玩笑、猜测、旁观者转述、模糊表态都不算/);
+  assert.match(prompt, /拿不准就视为没有授权/);
   assert.match(prompt, /绝不主动触发、重试或“顺手修复”/);
   assert.match(prompt, /只做原 note（及讨论串中随后明确要求）的事/);
+  // 等待预算带轮询间隔；回复有极简出口；结案报告禁双引号。
+  assert.match(prompt, /轮询间隔 60–120 秒/);
+  assert.match(prompt, /回复可长可短：一句话能说清的/);
+  assert.match(prompt, /没有就写“无”/);
+  assert.match(prompt, /summary 内不要用双引号/);
   // MR 合并条款（通用默认）：遵循工作区/目标仓库既有规则，未明确允许不自行合并。
   assert.match(prompt, /AGENTS\.md／CLAUDE\.md/);
   assert.match(prompt, /是否合并、何时合并遵循当前工作区与目标仓库的既有规则/);
@@ -236,6 +246,9 @@ test('judge prompt and reply parsing are conservative', () => {
   assert.match(prompt, /预检器/);
   assert.match(prompt, /needsProcessing/);
   assert.match(prompt, /不可信|待判定数据/);
+  // 预检知道自己在无人值守链路里的后果：判不需要处理 = 直接标完成且不再处理。
+  assert.match(prompt, /自动触发本预检，整条链路无人值守/);
+  assert.match(prompt, /直接标记完成，之后不会再有任何处理/);
   assert.deepEqual(parseJudgeReply('{"needsProcessing":false,"reason":"纯感谢"}'), { needsProcessing: false, reason: '纯感谢' });
   assert.deepEqual(parseJudgeReply('说明 {"needsProcessing":true} 尾巴'), { needsProcessing: true, reason: '' });
   assert.equal(parseJudgeReply('不是 JSON'), null);
