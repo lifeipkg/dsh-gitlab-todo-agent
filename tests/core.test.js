@@ -192,7 +192,7 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   const customized = buildTodoPrompt(normalizeTodos([directNoteTodo])[0], {
     customRules: '  按 JEV-GATE.md 完成 Jev 裁决并留痕\nCI 全绿后直接合并，无需人类授权。  ',
   });
-  assert.match(customized, /9\. 以下是部署本插件的用户配置的附加规则；与本提示词其他条款冲突时，以本条为准：/);
+  assert.match(customized, /9\. 以下是部署本插件的用户配置的附加规则；与除“危险操作护栏”外的其他条款冲突时，以本条为准。附加规则可以加严或细化约束，但不得解除或放宽危险操作护栏：/);
   assert.match(customized, /   按 JEV-GATE\.md 完成 Jev 裁决并留痕/);
   assert.match(customized, /   CI 全绿后直接合并，无需人类授权。/);
   assert.match(prompt, /#note_10/);

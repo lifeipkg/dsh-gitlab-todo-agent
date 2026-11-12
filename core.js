@@ -658,7 +658,7 @@ export function buildTodoPrompt(todo, context = {}) {
     unfinishedInstruction,
     closureInstruction,
     ...(customRules ? [
-      '9. 以下是部署本插件的用户配置的附加规则；与本提示词其他条款冲突时，以本条为准：',
+      '9. 以下是部署本插件的用户配置的附加规则；与除“危险操作护栏”外的其他条款冲突时，以本条为准。附加规则可以加严或细化约束，但不得解除或放宽危险操作护栏：',
       `   ${customRules.replace(/\r?\n/g, '\n   ')}`,
     ] : []),
     '',
