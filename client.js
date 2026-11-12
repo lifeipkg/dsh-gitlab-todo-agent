@@ -54,6 +54,15 @@ window.__ModuleLoader__.load({
       closureClosed: 'Loop closed', closureFollowUp: 'Follow-up scheduled', closureNeedsHuman: 'Needs you', closureVerifying: 'Verifying',
       followUpCount: 'Awaiting follow-up', needsHumanCount: 'Needs you',
       roundLabel: 'Round', nextAttempt: 'Next follow-up',
+      routeScope: 'Route scope', routeScopePlugin: 'Only plugin-created sessions', routeScopeAny: 'Any unarchived session',
+      autoRoute: 'Automatically continue the same MR/Issue in its most recent session',
+      busyRouteMode: 'Busy-session routing', busyRouteQueue: 'Queue after the current turn', busyRouteSteer: 'Insert at the next step of the current turn',
+      maxQueuePerSession: 'Maximum unresolved todos per session',
+      routeToSession: 'Route to session', routeSearch: 'Search by title, session ID, or working directory',
+      routeLoading: 'Loading routable sessions…', routeEmpty: 'No sessions are available for routing.', routeNoMatches: 'No sessions match your search.',
+      refresh: 'Refresh', routeSameTarget: 'Same MR/Issue', routeModeQueue: 'Queue', routeModeSteer: 'Steer',
+      routeLoad: 'Load', routeNotAccepting: 'Not accepting', routeConfirm: 'Route to selected session',
+      routedQueue: 'Routed · queued', routedSteer: 'Routed · steering', routeFailed: 'Could not route the todo',
       loading: 'Loading GitLab Todo panel…', renderError: 'The panel failed to render', retry: 'Retry rendering',
       localError: 'Action failed',
       defaultPaused: 'Polling starts paused so installation never dispatches your real todos automatically.',
@@ -106,6 +115,15 @@ window.__ModuleLoader__.load({
       closureClosed: '已闭环', closureFollowUp: '待续办', closureNeedsHuman: '需人工', closureVerifying: '核对中',
       followUpCount: '待续办', needsHumanCount: '需人工',
       roundLabel: '轮次', nextAttempt: '下次续办',
+      routeScope: '路由范围', routeScopePlugin: '仅插件创建的会话', routeScopeAny: '任意未归档会话',
+      autoRoute: '同一 MR/Issue 自动续到最近会话',
+      busyRouteMode: '忙碌会话路由方式', busyRouteQueue: '当前回合结束后处理', busyRouteSteer: '插入当前回合的下一步引导',
+      maxQueuePerSession: '每个会话最大未结算任务数',
+      routeToSession: '路由到会话', routeSearch: '按标题、sessionId 或 cwd 搜索',
+      routeLoading: '正在加载可路由会话…', routeEmpty: '当前没有可路由的会话。', routeNoMatches: '没有符合搜索条件的会话。',
+      refresh: '刷新', routeSameTarget: '同目标', routeModeQueue: '排队', routeModeSteer: '引导',
+      routeLoad: '负载', routeNotAccepting: '不接受', routeConfirm: '确认路由到所选会话',
+      routedQueue: '已路由·排队', routedSteer: '已路由·引导', routeFailed: '路由 Todo 失败',
       loading: '正在加载 GitLab Todo 面板…', renderError: '面板渲染失败', retry: '重新渲染',
       localError: '操作失败',
       defaultPaused: '插件默认停用，避免安装后立即处理真实 Todo。',
@@ -136,6 +154,18 @@ window.__ModuleLoader__.load({
     function isMergeRequest(todo) {
       return String(todo.targetType ?? '').toLowerCase().replace(/[^a-z]/g, '') === 'mergerequest'
         || /\/-\/merge_requests(?:\/|$)/i.test(todo.url ?? '');
+    }
+
+    /** 路由与 dispatch 共用可见性边界，但不接受“MR 直接完成”和规则跳过项。 */
+    function canRouteTodo(todo) {
+      if (todo.outcome === 'rule-skipped' || String(todo.action ?? '').toLowerCase() === 'assigned') return false;
+      if (isMergeRequest(todo) && !todo.directMention) return false;
+      return !todo.handled || todo.outcome !== 'merge-request-done';
+    }
+
+    function routedLabel(record, t) {
+      if (record.routed !== true) return '';
+      return record.routeMode === 'steer' ? t('routedSteer') : t('routedQueue');
     }
 
     function todoStatusLabel(todo, t) {
@@ -237,6 +267,13 @@ window.__ModuleLoader__.load({
       const [modelCatalogError, setModelCatalogError] = React.useState(null);
       const [workspaceData, setWorkspaceData] = React.useState(null);
       const [workspaceError, setWorkspaceError] = React.useState(null);
+      const [routeTodo, setRouteTodo] = React.useState(null);
+      const [routeData, setRouteData] = React.useState(null);
+      const [routeLoading, setRouteLoading] = React.useState(false);
+      const [routeError, setRouteError] = React.useState(null);
+      const [routeSearch, setRouteSearch] = React.useState('');
+      const [routeSelection, setRouteSelection] = React.useState('');
+      const routeRequest = React.useRef(0);
 
       React.useEffect(() => {
         let disposed = false;
@@ -354,6 +391,69 @@ window.__ModuleLoader__.load({
         }
       };
 
+      const closeRouteTargets = () => {
+        routeRequest.current += 1;
+        setRouteTodo(null);
+        setRouteData(null);
+        setRouteLoading(false);
+        setRouteError(null);
+        setRouteSearch('');
+        setRouteSelection('');
+      };
+      const loadRouteTargets = async (todoId) => {
+        const request = ++routeRequest.current;
+        setRouteLoading(true);
+        setRouteError(null);
+        setRouteSelection('');
+        try {
+          const data = await post('routeTargets', { todoId });
+          if (request !== routeRequest.current) return;
+          setRouteData({ ...data, items: Array.isArray(data.items) ? data.items : [] });
+        } catch (cause) {
+          if (request !== routeRequest.current) return;
+          setRouteError(cause.message);
+        } finally {
+          if (request === routeRequest.current) setRouteLoading(false);
+        }
+      };
+      const openRouteTargets = (todo) => {
+        setRouteTodo(todo);
+        setRouteData(null);
+        setRouteSearch('');
+        setRouteSelection('');
+        setRouteError(null);
+        void loadRouteTargets(todo.id);
+      };
+      React.useEffect(() => {
+        if (!routeTodo) return undefined;
+        const onKeyDown = (event) => {
+          if (event.key === 'Escape') closeRouteTargets();
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+        // 关闭函数只需跟随当前弹层生命周期，无需随每次渲染重建监听。
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [routeTodo]);
+      const routeToSession = (target) => {
+        if (!routeTodo || !target || target.accepting === false || busy) return;
+        const todoId = routeTodo.id;
+        setRouteError(null);
+        void perform(`route:${todoId}`, async () => {
+          try {
+            const data = await post('route', { id: todoId, sessionId: target.sessionId });
+            if (data.result?.ok === false) setRouteError(data.result.error || t('routeFailed'));
+            return data;
+          } catch (cause) {
+            setRouteError(cause.message);
+            throw cause;
+          }
+        }).then((done) => {
+          if (!done) return;
+          closeRouteTargets();
+          void refreshSessions();
+        });
+      };
+
       const updateSettings = (settings) => perform('settings', () => post('updateSettings', { settings }));
       const saveGeneralSettings = () => updateSettings(draft);
       const openSession = (sessionId) => ctx.uiWorkspace.openSession(sessionId);
@@ -398,6 +498,19 @@ window.__ModuleLoader__.load({
         }
         return label;
       };
+      const allRouteItems = Array.isArray(routeData?.items) ? routeData.items : [];
+      const routeQuery = routeSearch.trim().toLowerCase();
+      const routeUpdatedAt = (value) => {
+        const parsed = typeof value === 'number' ? value : Date.parse(value ?? '');
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
+      const routeItems = allRouteItems
+        .filter((item) => !routeQuery || [item.title, item.sessionId, item.cwd]
+          .some((value) => String(value ?? '').toLowerCase().includes(routeQuery)))
+        .sort((a, b) => Number(b.sameTarget === true) - Number(a.sameTarget === true)
+          || routeUpdatedAt(b.updatedAt) - routeUpdatedAt(a.updatedAt));
+      const selectedRouteTarget = allRouteItems.find((item) => item.sessionId === routeSelection) ?? null;
+      const routeMaxQueue = routeData?.maxQueuePerSession ?? 3;
 
       return h('div', { className: 'gta-root' },
         h('style', { children: CSS }),
@@ -455,6 +568,24 @@ window.__ModuleLoader__.load({
               type: 'number', min: 1, max: 10, value: draft.maxConcurrentSessions,
               onChange: (event) => setDraft({ ...draft, maxConcurrentSessions: Number(event.target.value) }),
             })),
+            h('label', null, t('routeScope'), h('select', {
+              value: draft.routeScope ?? 'plugin',
+              onChange: (event) => setDraft({ ...draft, routeScope: event.target.value }),
+            },
+              h('option', { value: 'plugin' }, t('routeScopePlugin')),
+              h('option', { value: 'any' }, t('routeScopeAny')),
+            )),
+            h('label', null, t('busyRouteMode'), h('select', {
+              value: draft.busyRouteMode ?? 'queue',
+              onChange: (event) => setDraft({ ...draft, busyRouteMode: event.target.value }),
+            },
+              h('option', { value: 'queue' }, t('busyRouteQueue')),
+              h('option', { value: 'steer' }, t('busyRouteSteer')),
+            )),
+            h('label', null, t('maxQueuePerSession'), h('input', {
+              type: 'number', min: 1, max: 10, value: draft.maxQueuePerSession ?? 3,
+              onChange: (event) => setDraft({ ...draft, maxQueuePerSession: Number(event.target.value) }),
+            })),
             h('label', null, t('sessionModel'), h('select', {
               value: sessionModelKey(draft.sessionModel),
               onChange: (event) => setDraft({
@@ -502,6 +633,10 @@ window.__ModuleLoader__.load({
             type: 'checkbox', checked: draft.autoProcess,
             onChange: (event) => setDraft({ ...draft, autoProcess: event.target.checked }),
           }), t('autoProcess')),
+          h('label', { className: 'gta-check' }, h('input', {
+            type: 'checkbox', checked: draft.autoRoute !== false,
+            onChange: (event) => setDraft({ ...draft, autoRoute: event.target.checked }),
+          }), t('autoRoute')),
           h('label', { className: 'gta-check' }, h('input', {
             type: 'checkbox', checked: draft.precheckEnabled,
             onChange: (event) => setDraft({ ...draft, precheckEnabled: event.target.checked }),
@@ -567,6 +702,7 @@ window.__ModuleLoader__.load({
                         : h('span', null, todo.title),
                       todo.directMention && h('span', { className: 'gta-tag gta-tag-mention' }, t('directMention')),
                       h('span', { className: `gta-tag ${(todo.executionStatus === 'completed' && (!todo.closure || todo.closure === 'closed')) || todo.outcome === 'merge-request-done' || todo.outcome === 'precheck-skipped' ? 'gta-tag-success' : ''}` }, todoStatusLabel(todo, t)),
+                      routedLabel(todo, t) && h('span', { className: 'gta-tag gta-tag-routed' }, routedLabel(todo, t)),
                     ),
                     h('div', { className: 'gta-muted gta-meta' }, [`#${todo.id}`, todo.project, todo.targetType, todo.action, todo.author && `@${todo.author}`, todo.skipReason, ...closureMeta(todo, t)].filter(Boolean).join(' · ')),
                   ),
@@ -577,6 +713,10 @@ window.__ModuleLoader__.load({
                       disabled: Boolean(busy) || todo.executionStatus === 'running',
                       onClick: () => perform(`dispatch:${todo.id}`, () => post('dispatch', { id: todo.id })),
                     }, busy === `dispatch:${todo.id}` ? '…' : todo.handled ? t('reprocess') : isMergeRequest(todo) && !todo.directMention ? t('markDone') : t('process')),
+                    canRouteTodo(todo) && h(Button, {
+                      disabled: Boolean(busy) || todo.executionStatus === 'running',
+                      onClick: () => openRouteTargets(todo),
+                    }, t('routeToSession')),
                   ),
                 ),
               )),
@@ -600,6 +740,7 @@ window.__ModuleLoader__.load({
                           : record.executionStatus === 'failed' ? t('executionFailed')
                           : record.executionStatus === 'starting' ? t('sessionStarting')
                           : t('sessionAccepted')),
+                      routedLabel(record, t) && h('span', { className: 'gta-tag gta-tag-routed' }, routedLabel(record, t)),
                       closureLabel(record.closure, t) && h('span', { className: `gta-tag ${record.closure === 'closed' ? 'gta-tag-success' : ''}` }, closureLabel(record.closure, t)),
                       h('span', { className: 'gta-tag gta-tag-mention' }, record.automatic ? t('autoDispatch') : t('manualDispatch')),
                       record.archived && h('span', { className: 'gta-tag gta-tag-success' }, t('sessionArchived')),
@@ -609,7 +750,7 @@ window.__ModuleLoader__.load({
                   ),
                   h('div', { className: 'gta-todo-actions' },
                     !record.archived && h(Button, { onClick: () => openSession(record.sessionId) }, t('openSession')),
-                    record.executionStatus !== 'starting' && h(Button, {
+                    record.executionStatus !== 'starting' && record.routed !== true && h(Button, {
                       disabled: Boolean(busy) || (record.archived !== true && record.executionStatus === 'running'),
                       onClick: () => toggleSessionArchive(record),
                     }, busy === `archive:${record.sessionId}` ? '…' : (record.archived ? t('unarchiveSession') : t('archiveSession'))),
@@ -658,6 +799,72 @@ window.__ModuleLoader__.load({
               )),
           ),
         ),
+        routeTodo && h('div', {
+          className: 'gta-route-backdrop',
+          onMouseDown: (event) => { if (event.target === event.currentTarget) closeRouteTargets(); },
+        },
+          h('section', {
+            className: 'gta-route-dialog', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'gta-route-title',
+          },
+            h('div', { className: 'gta-route-header' },
+              h('div', { className: 'gta-route-heading' },
+                h('h2', { id: 'gta-route-title' }, t('routeToSession')),
+                h('p', { className: 'gta-muted gta-route-todo', title: routeTodo.title }, routeTodo.title),
+              ),
+              h(Button, { onClick: closeRouteTargets }, t('close')),
+            ),
+            routeData && h('div', { className: 'gta-route-summary gta-muted' },
+              h('span', null, `${t('routeScope')}：${routeData.scope === 'any' ? t('routeScopeAny') : t('routeScopePlugin')}`),
+              h('span', null, `${t('busyRouteMode')}：${routeData.busyRouteMode === 'steer' ? t('busyRouteSteer') : t('busyRouteQueue')}`),
+              h('span', null, `${t('maxQueuePerSession')}：${routeMaxQueue}`),
+            ),
+            routeError && h('div', { className: 'gta-banner gta-error gta-route-error', role: 'alert' }, `${t('localError')}：${routeError}`),
+            h('div', { className: 'gta-route-tools' },
+              h('input', {
+                type: 'text', value: routeSearch, placeholder: t('routeSearch'), 'aria-label': t('routeSearch'),
+                disabled: !routeData || routeLoading,
+                onChange: (event) => setRouteSearch(event.target.value),
+              }),
+              h(Button, {
+                disabled: routeLoading || Boolean(busy),
+                onClick: () => loadRouteTargets(routeTodo.id),
+              }, routeLoading ? '…' : t('refresh')),
+            ),
+            routeLoading && !routeData && h('div', { className: 'gta-empty' }, t('routeLoading')),
+            routeData && !routeLoading && allRouteItems.length === 0 && h('div', { className: 'gta-empty' }, t('routeEmpty')),
+            routeData && !routeLoading && allRouteItems.length > 0 && routeItems.length === 0 && h('div', { className: 'gta-empty' }, t('routeNoMatches')),
+            routeData && routeItems.length > 0 && h('div', { className: 'gta-route-targets', role: 'listbox', 'aria-label': t('routeToSession') },
+              routeItems.map((item) => h('button', {
+                type: 'button', role: 'option', key: item.sessionId,
+                className: `gta-route-target${routeSelection === item.sessionId ? ' gta-route-target-selected' : ''}`,
+                'aria-selected': routeSelection === item.sessionId,
+                disabled: item.accepting === false || Boolean(busy),
+                onClick: () => setRouteSelection(item.sessionId),
+              },
+                h('div', { className: 'gta-route-target-main' },
+                  h('div', { className: 'gta-route-target-title' },
+                    h('span', { className: 'gta-route-target-name', title: item.title }, item.title || t('sessionUnknown')),
+                    item.sameTarget === true && h('span', { className: 'gta-tag gta-tag-mention' }, t('routeSameTarget')),
+                    item.plugin === true && h('span', { className: 'gta-tag gta-tag-mention' }, t('pluginSessionTag')),
+                    item.running === true && h('span', { className: 'gta-tag' }, t('executionRunning')),
+                    item.running === true && h('span', { className: 'gta-tag gta-tag-routed' },
+                      routeData.busyRouteMode === 'steer' ? t('routeModeSteer') : t('routeModeQueue')),
+                    item.accepting === false && h('span', { className: 'gta-tag' }, t('routeNotAccepting')),
+                  ),
+                  h('div', { className: 'gta-muted gta-route-target-meta' },
+                    [item.sessionId, item.cwd, item.updatedAt ? `${t('lastActive')}：${formatTime(item.updatedAt, '')}` : ''].filter(Boolean).join(' · ')),
+                ),
+                h('span', { className: 'gta-route-load', title: t('maxQueuePerSession') }, `${t('routeLoad')} ${item.load ?? 0}/${routeMaxQueue}`),
+              ))),
+            h('div', { className: 'gta-route-footer' },
+              h(Button, {
+                primary: true,
+                disabled: !selectedRouteTarget || selectedRouteTarget.accepting === false || routeLoading || Boolean(busy),
+                onClick: () => routeToSession(selectedRouteTarget),
+              }, busy === `route:${routeTodo.id}` ? '…' : t('routeConfirm')),
+            ),
+          ),
+        ),
       );
     }
 
@@ -674,6 +881,17 @@ window.__ModuleLoader__.load({
       .gta-section-title{display:flex;align-items:baseline;justify-content:space-between;gap:16px}.gta-tabs{max-width:1180px;margin:16px auto 0;display:flex;gap:4px;border-bottom:1px solid var(--dsw-alias-border-l1)}.gta-tab{appearance:none;margin-bottom:-1px;padding:9px 18px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;white-space:nowrap}.gta-tab:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}.gta-tab:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}.gta-tab-active{border-bottom-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);font-weight:600}.gta-list{display:flex;flex-direction:column;gap:8px}.gta-load-more{display:flex;justify-content:center;padding:10px 0 2px}.gta-scroll-list{max-height:min(52vh,480px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-gutter:stable;padding:2px 6px 2px 2px}.gta-scroll-list::-webkit-scrollbar{width:8px}.gta-scroll-list::-webkit-scrollbar-track{background:transparent}.gta-scroll-list::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l2);border-radius:4px}.gta-scroll-list::-webkit-scrollbar-thumb:hover{background:var(--dsw-alias-label-tertiary,var(--dsw-alias-border-l2))}.gta-todo{display:flex;align-items:center;gap:16px;padding:14px 16px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}.gta-todo-main{min-width:0;flex:1}.gta-todo-title{display:flex;align-items:center;gap:10px;font-weight:550}.gta-todo-title>a{color:var(--dsw-alias-label-primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-todo-title>a:hover{color:var(--dsw-alias-brand-primary);text-decoration:underline}.gta-tag{flex:none;font-size:11px;padding:1px 7px;border-radius:10px;color:var(--dsw-alias-state-warn-primary);border:1px solid var(--dsw-alias-state-warn-primary)}.gta-tag-success{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}.gta-tag-mention{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}.gta-meta{margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-todo-actions{display:flex;gap:8px;flex:none}.gta-session-list{max-height:min(40vh,360px)}
       .gta-workspace{flex-direction:column;align-items:stretch;gap:10px}.gta-workspace-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-workspace-sessions{display:flex;flex-direction:column;gap:6px;margin-top:4px}.gta-workspace-session{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-base);min-width:0}.gta-session-link{appearance:none;border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-weight:550;padding:0;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;min-width:0}.gta-session-link:hover{color:var(--dsw-alias-brand-primary);text-decoration:underline}.gta-session-name{font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;min-width:0}.gta-session-meta{margin-left:auto;flex:none}
       .gta-empty{padding:24px;border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;text-align:center;color:var(--dsw-alias-label-secondary)}.gta-fatal{max-width:720px;margin:48px auto;padding:24px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}.gta-fatal p{white-space:pre-wrap;word-break:break-word;margin:12px 0 20px;color:var(--dsw-alias-state-error-primary)}
+      .gta-root .gta-tag-routed{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
+      .gta-root .gta-route-backdrop{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgb(0 0 0 / .38)}
+      .gta-root .gta-route-dialog{display:flex;flex-direction:column;width:min(760px,100%);max-height:min(78vh,760px);overflow:hidden;padding:18px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);box-shadow:0 18px 60px rgb(0 0 0 / .25)}
+      .gta-root .gta-route-header{display:flex;align-items:flex-start;gap:16px;flex:none}.gta-root .gta-route-heading{min-width:0;flex:1}.gta-root .gta-route-heading h2{margin:0}.gta-root .gta-route-todo{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .gta-root .gta-route-summary{display:flex;gap:6px 16px;flex-wrap:wrap;flex:none;margin-top:12px}.gta-root .gta-route-error{max-width:none;margin:10px 0;flex:none}
+      .gta-root .gta-route-tools{display:flex;align-items:center;gap:8px;flex:none;margin:14px 0 10px}.gta-root .gta-route-tools input{flex:1;min-width:0}.gta-root .gta-route-dialog>.gta-empty{flex:none}
+      .gta-root .gta-route-targets{display:flex;flex:1 1 auto;flex-direction:column;gap:8px;min-height:80px;overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-width:thin}
+      .gta-root .gta-route-target{appearance:none;width:100%;display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;text-align:left;cursor:pointer}.gta-root .gta-route-target:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2)}.gta-root .gta-route-target:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}.gta-root .gta-route-target:disabled{opacity:.5;cursor:default}.gta-root .gta-route-target-selected:not(:disabled){border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2)}
+      .gta-root .gta-route-target-main{min-width:0;flex:1}.gta-root .gta-route-target-title{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-weight:550}.gta-root .gta-route-target-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-root .gta-route-target-meta{margin-top:5px;word-break:break-all}.gta-root .gta-route-load{flex:none;margin-left:auto;color:var(--dsw-alias-label-secondary);font-size:12px;white-space:nowrap}
+      .gta-root .gta-route-footer{display:flex;justify-content:flex-end;gap:8px;flex:none;padding-top:14px}
+      @media(max-width:640px){.gta-root .gta-route-backdrop{padding:12px}.gta-root .gta-route-dialog{padding:14px}.gta-root .gta-route-target{align-items:flex-start;flex-direction:column}.gta-root .gta-route-load{margin-left:0}}
       @media(max-width:900px){.gta-root{padding:20px 18px 36px}.gta-header{flex-direction:column}.gta-actions{justify-content:flex-start}.gta-form-grid{grid-template-columns:1fr}.gta-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.gta-scroll-list{max-height:min(60vh,420px)}.gta-todo{align-items:flex-start;flex-direction:column}.gta-todo-actions{width:100%;justify-content:flex-end}}
     `;
 

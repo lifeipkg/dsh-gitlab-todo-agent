@@ -1,4 +1,4 @@
-export const STATE_VERSION = 4;
+export const STATE_VERSION = 5;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   enabled: false,
@@ -17,7 +17,17 @@ export const DEFAULT_SETTINGS = Object.freeze({
   maxFollowUps: 3,
   followUpDelayMinutes: 15,
   customRules: '',
+  // 会话路由：同目标的 Todo 优先投递给已有会话，而不是每次新开。
+  routeScope: 'plugin',
+  autoRoute: true,
+  busyRouteMode: 'queue',
+  maxQueuePerSession: 3,
 });
+
+/** 路由目标的时效：超过该时长没有新消息的旧会话不再作为自动路由目标。 */
+export const ROUTE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** busyRouteMode 与 routeMode 的合法取值：queue 排队下一回合，steer 在当前回合下一步插入引导。 */
+export const ROUTE_MODES = ['queue', 'steer'];
 
 /** 闭环状态：'' 为尚未结算或旧版本记录；verifying 为回合已结束、等待核对 GitLab 事实。 */
 export const CLOSURE_STATES = ['verifying', 'closed', 'follow-up', 'needs-human'];
@@ -62,7 +72,7 @@ export function defaultSettings() {
 export function validateSettings(input, current = defaultSettings()) {
   if (!isRecord(input)) throw new Error('设置必须是 JSON 对象。');
   const next = { ...current };
-  for (const key of ['enabled', 'autoProcess', 'precheckEnabled', 'ruleSkipEnabled', 'autoArchive', 'followUpEnabled']) {
+  for (const key of ['enabled', 'autoProcess', 'precheckEnabled', 'ruleSkipEnabled', 'autoArchive', 'followUpEnabled', 'autoRoute']) {
     if (key in input) {
       if (typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值。`);
       next[key] = input[key];
@@ -102,6 +112,25 @@ export function validateSettings(input, current = defaultSettings()) {
       throw new Error('续办等待时间必须是 1 到 1440 分钟之间的整数。');
     }
     next.followUpDelayMinutes = value;
+  }
+  if ('routeScope' in input) {
+    if (input.routeScope !== 'plugin' && input.routeScope !== 'any') {
+      throw new Error('路由范围必须是 plugin 或 any。');
+    }
+    next.routeScope = input.routeScope;
+  }
+  if ('busyRouteMode' in input) {
+    if (!ROUTE_MODES.includes(input.busyRouteMode)) {
+      throw new Error('忙碌会话投递方式必须是 queue 或 steer。');
+    }
+    next.busyRouteMode = input.busyRouteMode;
+  }
+  if ('maxQueuePerSession' in input) {
+    const value = input.maxQueuePerSession;
+    if (!Number.isSafeInteger(value) || value < 1 || value > 10) {
+      throw new Error('单会话排队上限必须是 1 到 10 之间的整数。');
+    }
+    next.maxQueuePerSession = value;
   }
   for (const key of ['cwd', 'sessionCwd']) {
     if (key in input) {
@@ -295,6 +324,32 @@ export function targetKey(url) {
 }
 
 /**
+ * 自动路由目标：同一目标对象（同 MR/Issue/WorkItem）上最近的插件会话。
+ * 匹配条件：记录带 sessionId、未归档、距接受未超过 ROUTE_MAX_AGE_MS、
+ * 且该会话当前挂载的未结算消息数（loadOf）未达上限。
+ * 只在插件自己的记录里找——插件只知道自己会话的负载与归属。
+ */
+export function findRouteTarget(handled, todo, { loadOf = () => 0, maxQueue = 3, now = Date.now() } = {}) {
+  const key = targetKey(todo?.url ?? '');
+  if (!key) return null;
+  const limit = Number.isSafeInteger(maxQueue) && maxQueue >= 1 ? maxQueue : 3;
+  const candidates = [];
+  for (const record of Object.values(handled ?? {})) {
+    if (!record?.sessionId || record.archived === true) continue;
+    if (targetKey(record.url ?? record.item?.url ?? '') !== key) continue;
+    const age = now - (record.acceptedAt ?? 0);
+    if (!(age >= 0) || age > ROUTE_MAX_AGE_MS) continue;
+    candidates.push(record);
+  }
+  candidates.sort((a, b) => (b.acceptedAt ?? 0) - (a.acceptedAt ?? 0));
+  for (const record of candidates) {
+    // 最新会话满员时继续找同目标的较早可用会话，而不是立即放弃路由。
+    if (loadOf(record.sessionId) < limit) return { sessionId: record.sessionId, record };
+  }
+  return null;
+}
+
+/**
  * Todo 目标对应的 discussions REST 路径，用于核对“原 note 讨论串里是否有我方回复”。
  * 仅支持项目级 Issue / WorkItem / MR；解析不了返回空串（核对结果按未知处理）。
  */
@@ -394,7 +449,11 @@ export function parseClosureReport(source, originUrl = '') {
     }
     if (isRecord(value) && REPORT_STATUSES.includes(value.status)) {
       const minutes = Number(value.resumeAfterMinutes);
+      const todoId = (typeof value.todoId === 'string' || typeof value.todoId === 'number')
+        ? String(value.todoId).trim().slice(0, 100)
+        : '';
       return {
+        ...(todoId ? { todoId } : {}),
         status: value.status,
         summary: text(value.summary).replace(/\s+/g, ' ').slice(0, 300),
         resumeAfterMinutes: Number.isFinite(minutes) && minutes > 0 ? Math.min(Math.round(minutes), 1440) : null,
@@ -537,11 +596,17 @@ function buildEnvironmentLines(todo, context) {
   ].filter(Boolean).join('，');
   const now = formatLocalTime(context.now ?? Date.now());
   const selfRef = username ? `\`@${username}\`` : '我方账号';
+  const route = isRecord(context.route) ? context.route : null;
+  const routeModeLabel = route?.mode === 'steer' ? '插入引导（在当前回合的最近步骤边界送达）' : '排队（当前回合结束后处理）';
   const lines = [
     '运行环境（请据此规划，目标是在本回合内把这条 Todo 闭环）：',
-    '- 会话性质：这是无人值守的单轮会话。没有人会在本会话里回答提问或追加指令；本回合结束后插件立即结算，会话随即归档，不会有第二回合。',
+    route
+      ? `- 会话性质：本条消息是无人值守的单回合任务。当前会话此前的上下文与本次目标相关时直接利用（不必重新从零了解）；无关时忽略，不影响本条任务的要求。没有人会在本回合里回答提问或追加指令；本回合结束后插件立即对本条任务结算。`
+      : '- 会话性质：这是无人值守的单轮会话。没有人会在本会话里回答提问或追加指令；本回合结束后插件立即结算，会话随即归档，不会有第二回合。',
     '- 因此不要向用户提问后停下等待，不要以“稍后继续”“等确认后再处理”收尾，也不要依赖回合结束后仍需存活的后台任务或定时器；能在本回合做完的事必须在本回合做完。',
-    '- 触发方式：本会话由插件轮询 GitLab Todo 自动触发，不是任何人当面委派你做事；原 note 与其讨论串是唯一的任务来源，也是“可以做某事”的唯一授权依据。',
+    route
+      ? `- 触发与来源：本条消息由 GitLab Todo 插件路由到当前会话${route.mode === 'steer' ? `，投递方式为${routeModeLabel}，可能在当前回合中加入新的任务——此前工作若仍有价值，结合本条任务一并继续` : `，投递方式为${routeModeLabel}`}。原 note 与其讨论串是唯一的任务来源，也是“可以做某事”的唯一授权依据。`
+      : '- 触发方式：本会话由插件轮询 GitLab Todo 自动触发，不是任何人当面委派你做事；原 note 与其讨论串是唯一的任务来源，也是“可以做某事”的唯一授权依据。',
     '- 危险操作护栏（默认只读 + 写操作白名单）：本会话对 GitLab 与仓库的写操作只允许四类——① 在原 note 所在讨论串回复，或在该目标对象下发表说明处理结果的评论；② 标记本条 Todo 完成（第 6 条命令），以及本次处理已实际覆盖的同对象遗留 Todo；③ 在目标仓库新建/更新自己的分支、提交与 MR；④ 第 5 条或附加规则明确豁免的（本会话或前序会话创建的）MR 合并。其余一切写操作——触发或重试 CI/CD 流水线与部署任务（retry、play、rebuild、deploy 类，如 rebuild_dev）、合并/关闭/approve 他人的 MR、强推、删除分支/标签、修改仓库或项目设置、改动 issue/MR 的指派/里程碑/标签等——没有授权一律不做。',
     '- 授权判定：授权必须是相关人员（原 note 作者、目标对象指派人、目标仓库成员）在原 note 或其讨论串中的明确祈使句或明确同意，并与要执行的操作逐字对应；疑问、玩笑、猜测、旁观者转述、模糊表态都不算。拿不准就视为没有授权。',
     '- 看到流水线红、部署失败等异常时只读取与记录，在回复中说明现状并等明确要求，绝不主动触发、重试或“顺手修复”。',
@@ -592,7 +657,7 @@ function buildEnvironmentLines(todo, context) {
     }
     lines.push('如果本次处理已经覆盖或解决了其中的事项，在回复中一并说明，并逐条执行 glab api -X POST todos/<该 Todo ID>/mark_as_done；没有覆盖的不要标记。');
   }
-  return { lines, carriedMrs, selfRef };
+  return { lines, carriedMrs, selfRef, route };
 }
 
 export function buildTodoPrompt(todo, context = {}) {
@@ -640,12 +705,17 @@ export function buildTodoPrompt(todo, context = {}) {
   ].join('\n');
   const closureInstruction = [
     '8. 结案报告（必须）：本回合最后一条消息的最后一行，按下面的格式输出单行文本。插件据此决定归档、续办还是转人工：',
-    `   ${CLOSURE_MARKER} {"status":"<done|waiting|needs-human>","summary":"<一句话结论>","resumeAfterMinutes":<waiting 时建议多少分钟后续办，其余填 0>,"openMrs":["<本 Todo 各轮会话创建且尚未合并的 MR 链接>"]}`,
-    '   done 只在 Todo 已标记完成且已回复原 note 时使用（第 0 条判定为“仅被提及”的除外，此时不回复，并在 JSON 中加 "noAction":true）；summary 内不要用双引号（需要引用时用「」或单引号），也不要换行；openMrs 没有就写 []；除这一行外不要再输出其他同名标记。',
+    `   ${CLOSURE_MARKER} {"todoId":"${todo.id}","status":"<done|waiting|needs-human>","summary":"<一句话结论>","resumeAfterMinutes":<waiting 时建议多少分钟后续办，其余填 0>,"openMrs":["<本 Todo 各轮会话创建且尚未合并的 MR 链接>"]}`,
+    '   todoId 必须原样填写本任务的 Todo ID，便于同一回合处理多条路由任务时逐条结算；done 只在 Todo 已标记完成且已回复原 note 时使用（第 0 条判定为“仅被提及”的除外，此时不回复，并在 JSON 中加 "noAction":true）；summary 内不要用双引号（需要引用时用「」或单引号），也不要换行；openMrs 没有就写 []；除这一行外不要再输出其他同名标记。',
+    ...(environment.route ? [
+      '   如果同一回合还处理了其他路由 Todo，最后一条消息末尾可以并列多行 [TODO-CLOSURE]：每条任务各一行、各写自己的 todoId；你只负责本任务这一行，不要改写或代替其他任务的报告。',
+    ] : []),
   ].join('\n');
   return [
     '[GITLAB TODO WATCHER]',
-    '这是插件根据轮询结果自动创建的 Session。请处理下面这一个 GitLab Todo，而不只是复述或总结。',
+    environment.route
+      ? '这是插件把一条 GitLab Todo 路由到当前会话的追加任务。请处理下面这一个 GitLab Todo，而不只是复述或总结。'
+      : '这是插件根据轮询结果自动创建的 Session。请处理下面这一个 GitLab Todo，而不只是复述或总结。',
     '',
     ...environment.lines,
     '',
@@ -704,7 +774,12 @@ export function normalizeState(value) {
     if (typeof settings.customRules !== 'string' || !settings.customRules.trim()) {
       settings.customRules = LEGACY_WORKFLOW_RULES;
     }
-    value = { ...value, version: STATE_VERSION, settings };
+    value = { ...value, version: 4, settings };
+  }
+  if (value.version === 4) {
+    // v4 → v5：会话路由。新设置（routeScope/autoRoute/busyRouteMode/maxQueuePerSession）
+    // 与 handled/pending 的路由字段均带默认值，无需改写存量数据。
+    value = { ...value, version: STATE_VERSION };
   }
   if (value.version !== STATE_VERSION) {
     throw new Error(`插件状态版本不受支持，期望 version=${STATE_VERSION}。`);
@@ -752,6 +827,7 @@ export function normalizeState(value) {
           .map((entry) => ({
             sessionId: entry.sessionId,
             sessionTitle: text(entry.sessionTitle).slice(0, 200),
+            routed: entry.routed === true,
             round: Number.isSafeInteger(entry.round) && entry.round >= 1 ? entry.round : 1,
             endedAt: timestamp(entry.endedAt),
             status: text(entry.status).slice(0, 40),
@@ -759,6 +835,10 @@ export function normalizeState(value) {
           })),
         item,
         sessionTitle: text(record.sessionTitle),
+        // 会话路由：routed=true 表示该 Todo 被投递到已存在的会话（非插件新开）。
+        routed: record.routed === true,
+        routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
+        requestId: text(record.requestId).slice(0, 200),
         executionStatus: ['running', 'completed', 'failed'].includes(record.executionStatus) ? record.executionStatus : null,
         automatic: record.automatic !== false,
         completedAt: timestamp(record.completedAt),
@@ -777,11 +857,32 @@ export function normalizeState(value) {
     for (const [id, record] of Object.entries(value.pending)) {
       if (!isRecord(record) || typeof record.sessionId !== 'string' || !record.sessionId || !isRecord(record.item)) continue;
       try {
+        const item = normalizeTodo(record.item);
+        const createdAt = timestamp(record.createdAt) ?? Date.now();
         pending[id] = {
         sessionId: record.sessionId,
-        createdAt: timestamp(record.createdAt) ?? Date.now(),
+        createdAt,
         automatic: record.automatic !== false,
-        item: normalizeTodo(record.item),
+        routed: record.routed === true,
+        routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
+        requestId: text(record.requestId).slice(0, 200),
+        sessionTitle: text(record.sessionTitle).slice(0, 200),
+        round: Number.isSafeInteger(record.round) && record.round >= 1 ? record.round : 1,
+        firstAcceptedAt: timestamp(record.firstAcceptedAt) ?? createdAt,
+        history: (Array.isArray(record.history) ? record.history : [])
+          .filter((entry) => isRecord(entry) && typeof entry.sessionId === 'string' && entry.sessionId)
+          .slice(-10)
+          .map((entry) => ({
+            sessionId: entry.sessionId,
+            sessionTitle: text(entry.sessionTitle).slice(0, 200),
+            routed: entry.routed === true,
+            round: Number.isSafeInteger(entry.round) && entry.round >= 1 ? entry.round : 1,
+            endedAt: timestamp(entry.endedAt),
+            status: text(entry.status).slice(0, 40),
+            note: text(entry.note).slice(0, 500),
+          })),
+        openMrs: normalizeMrUrls(record.openMrs, item.url),
+        item,
         };
       } catch {}
     }
@@ -932,6 +1033,8 @@ export function sessionProjection(state, max = 50) {
       url: record.url,
       project: record.project,
       automatic: record.automatic !== false,
+      routed: record.routed === true,
+      routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
       executionStatus: record.executionStatus ?? 'accepted',
       acceptedAt: record.acceptedAt,
       completedAt: record.completedAt ?? null,
@@ -954,6 +1057,8 @@ export function sessionProjection(state, max = 50) {
       url: record.item.url,
       project: record.item.project,
       automatic: record.automatic !== false,
+      routed: record.routed === true,
+      routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
       executionStatus: 'starting',
       acceptedAt: record.createdAt,
       completedAt: null,
@@ -1011,6 +1116,8 @@ export function publicState(state, running = false, currentUserId = null) {
       executionError: state.handled[todo.id]?.executionError ?? '',
       skipReason: state.handled[todo.id]?.skipReason ?? '',
       sessionId: state.handled[todo.id]?.sessionId ?? state.pending[todo.id]?.sessionId ?? null,
+      routed: state.handled[todo.id]?.routed === true || state.pending[todo.id]?.routed === true,
+      routeMode: state.handled[todo.id]?.routeMode ?? state.pending[todo.id]?.routeMode ?? '',
       round: state.handled[todo.id]?.round ?? 1,
       closure: state.handled[todo.id]?.closure ?? '',
       closureNote: state.handled[todo.id]?.closureNote ?? '',

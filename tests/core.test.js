@@ -9,6 +9,7 @@ import {
   buildTodoPrompt,
   buildWorkspaceOverview,
   discussionsApiPath,
+  findRouteTarget,
   parseClosureReport,
   parseJudgeReply,
   classifyTodo,
@@ -505,7 +506,7 @@ test('state normalization migrates v1 and v2 script states to v3', () => {
       lastNewCount: 0,
     };
     const state = normalizeState(legacy);
-    assert.equal(state.version, 4);
+    assert.equal(state.version, 5);
     assert.equal('shell' in state.settings, false);
     assert.equal('script' in state.settings, false);
     assert.equal(state.settings.enabled, true);
@@ -519,14 +520,14 @@ test('v3 states are prefilled with the legacy workflow rules; fresh installs kee
   const v3 = { ...initialState(), version: 3 };
   delete v3.settings.customRules;
   const migrated = normalizeState(JSON.parse(JSON.stringify(v3)));
-  assert.equal(migrated.version, 4);
+  assert.equal(migrated.version, 5);
   assert.equal(migrated.settings.customRules, LEGACY_WORKFLOW_RULES);
   assert.match(migrated.settings.customRules, /JEV-GATE\.md/);
   // 已自行配置过 customRules 的 v3 状态不会被覆盖。
   const customized = normalizeState(JSON.parse(JSON.stringify({ ...v3, settings: { ...v3.settings, customRules: '我的规则' } })));
   assert.equal(customized.settings.customRules, '我的规则');
   // 全新安装（initialState 即 v4）：customRules 为空，会话提示词保持通用。
-  assert.equal(initialState().version, 4);
+  assert.equal(initialState().version, 5);
   assert.equal(initialState().settings.customRules, '');
 });
 
@@ -603,7 +604,17 @@ function runtimeWithPrompt(prompt, options = {}) {
         }
         if (calls.failList) throw new Error('roster unavailable');
         return {
-          items: [...sessions.entries()].map(([sessionId, session]) => ({ sessionId, running: session.running })),
+          items: [...sessions.entries()].map(([sessionId, session]) => ({
+            sessionId,
+            running: session.running,
+            title: session.title,
+            cwd: session.cwd,
+            updatedAt: session.updatedAt,
+            blank: session.blank,
+            parentSessionId: session.parentSessionId,
+            isSubagent: session.isSubagent,
+            archived: session.archived,
+          })),
         };
       }
       const request = args.request;
@@ -625,6 +636,14 @@ function runtimeWithPrompt(prompt, options = {}) {
       if (method === 'prompt') {
         calls.prompt += 1;
         const session = sessions.get(request.sessionId);
+        // 真实 Host 会把 prompt requestId 持久化为 user/message.source.rpcId；
+        // 插件据此在多 Todo 共用会话时定位各自回合。
+        session.events.push({
+          type: 'user/message',
+          seq: session.events.length + 1,
+          time: Date.now(),
+          data: { source: { kind: 'user', rpcId: request.requestId }, message: { role: 'user', content: request.content } },
+        });
         session.running = true;
         try {
           const result = await prompt(request, call.signal);
@@ -673,6 +692,8 @@ function runtimeWithPrompt(prompt, options = {}) {
   };
   const runtime = new GitlabTodoRuntime(ctx);
   runtime.state = initialState();
+  // 旧用例验证“一新 Todo 一新会话”的基线行为；路由专项用例自行开启。
+  runtime.state.settings.autoRoute = false;
   runtime.gitlabUserId = '106';
   runtime.gitlabUsername = 'me';
   runtime.persistQuietly = async () => {};
@@ -1222,7 +1243,7 @@ test('prompt carries the unattended single-turn environment and the closure repo
   assert.match(prompt, /默认约 15 分钟/);
   assert.match(prompt, /waiting（可自动续办）/);
   assert.match(prompt, /needs-human（需人接手）/);
-  assert.match(prompt, /\[TODO-CLOSURE\] \{"status":"<done\|waiting\|needs-human>"/);
+  assert.match(prompt, /\[TODO-CLOSURE\] \{"todoId":"direct","status":"<done\|waiting\|needs-human>"/);
   // 首轮没有续办背景；格式模板本身不是合法报告。
   assert.doesNotMatch(prompt, /续办背景/);
   assert.equal(parseClosureReport(prompt), null);
@@ -1666,7 +1687,7 @@ test('startup upgrades script-era state without creating script files', async ()
     assert.equal('scriptPath' in state.storage, false);
     assert.equal(state.todos[0].id, 'direct');
     const stored = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
-    assert.equal(stored.version, 4);
+    assert.equal(stored.version, 5);
     assert.equal('script' in stored.settings, false);
     assert.equal('shell' in stored.settings, false);
     await assert.rejects(readFile(join(directory, 'gitlab-todos.py'), 'utf8'), /ENOENT/);
@@ -1674,4 +1695,368 @@ test('startup upgrades script-era state without creating script files', async ()
     await runtime.stop();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('route settings default safely and validate scope, busy mode and queue cap', () => {
+  const defaults = defaultSettings();
+  assert.equal(defaults.routeScope, 'plugin');
+  assert.equal(defaults.autoRoute, true);
+  assert.equal(defaults.busyRouteMode, 'queue');
+  assert.equal(defaults.maxQueuePerSession, 3);
+  const next = validateSettings({ routeScope: 'any', autoRoute: false, busyRouteMode: 'steer', maxQueuePerSession: 5 });
+  assert.equal(next.routeScope, 'any');
+  assert.equal(next.autoRoute, false);
+  assert.equal(next.busyRouteMode, 'steer');
+  assert.equal(next.maxQueuePerSession, 5);
+  assert.throws(() => validateSettings({ routeScope: 'external' }), /路由范围/);
+  assert.throws(() => validateSettings({ busyRouteMode: 'interrupt' }), /忙碌会话投递方式/);
+  assert.throws(() => validateSettings({ maxQueuePerSession: 0 }), /单会话排队上限/);
+  const v4 = initialState();
+  v4.version = 4;
+  delete v4.settings.routeScope;
+  delete v4.settings.autoRoute;
+  delete v4.settings.busyRouteMode;
+  delete v4.settings.maxQueuePerSession;
+  const migrated = normalizeState(v4);
+  assert.equal(migrated.version, 5);
+  assert.equal(migrated.settings.routeScope, 'plugin');
+  assert.equal(migrated.settings.autoRoute, true);
+});
+
+test('findRouteTarget picks the newest live session for the same target only', () => {
+  const now = Date.now();
+  const [todo] = normalizeTodos([directNoteTodo]);
+  const handled = {
+    old: { id: 'old', sessionId: 'session-old', url: todo.url, acceptedAt: now - 2000, archived: false },
+    archived: { id: 'archived', sessionId: 'session-archived', url: todo.url, acceptedAt: now - 100, archived: true },
+    other: { id: 'other', sessionId: 'session-other', url: 'https://gitlab.local/group/project/-/issues/99#note_1', acceptedAt: now - 50, archived: false },
+    expired: { id: 'expired', sessionId: 'session-expired', url: todo.url, acceptedAt: now - 8 * 24 * 60 * 60 * 1000, archived: false },
+  };
+  assert.equal(findRouteTarget(handled, todo, { now })?.sessionId, 'session-old');
+  assert.equal(findRouteTarget(handled, todo, { now, loadOf: () => 3, maxQueue: 3 }), null);
+  assert.equal(findRouteTarget({ other: handled.other }, todo, { now }), null);
+  const withBusy = {
+    ...handled,
+    busy: { id: 'busy', sessionId: 'session-busy', url: todo.url, acceptedAt: now - 1000, archived: false },
+  };
+  assert.equal(findRouteTarget(withBusy, todo, {
+    now,
+    loadOf: (id) => id === 'session-busy' ? 3 : 0,
+  })?.sessionId, 'session-old');
+});
+
+test('automatic same-target routing reuses the session without renaming or overriding its model', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  runtime.state.settings.autoRoute = true;
+  runtime.state.settings.sessionModel = { provider: 'deepseek', model: 'fixed-model' };
+  const [first, second] = normalizeTodos([
+    directNoteTodo,
+    { ...directNoteTodo, id: 'second', target_url: 'https://gitlab.local/group/project/-/issues/7#note_11' },
+  ]);
+  await runtime.dispatch(first, false, { trackSlot: true });
+  const result = await runtime.dispatch(second, false, { trackSlot: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.routed, true);
+  assert.equal(result.routeMode, 'queue');
+  assert.equal(calls.create, 1);
+  assert.equal(calls.prompt, 2);
+  assert.equal(calls.renames.length, 1);
+  assert.equal(calls.modelSelections.length, 1);
+  const prompts = calls.invocations.filter((call) => call.method === 'prompt').map((call) => call.args.request);
+  assert.equal(prompts[1].sessionId, 'session-1');
+  assert.equal(prompts[1].mode, 'queue');
+  assert.match(prompts[1].content[0].text, /路由到当前会话的追加任务/);
+  assert.match(prompts[1].content[0].text, /无人值守的单回合任务/);
+  assert.equal(runtime.state.handled.second.routed, true);
+  assert.equal(runtime.state.handled.second.sessionTitle, runtime.state.handled.direct.sessionTitle);
+  // 同一自动会话只占一个槽，多条路由任务不重复计数。
+  assert.equal(runtime.occupiedSlots(), 1);
+  // 首条已结算后，仍在执行的自动路由任务继续持有这个会话的唯一槽位。
+  runtime.state.handled.direct.executionStatus = 'completed';
+  runtime.untrackTodo('session-1', 'direct');
+  assert.equal(runtime.occupiedSlots(), 1);
+  runtime.untrackTodo('session-1', 'second');
+  assert.equal(runtime.occupiedSlots(), 0);
+  await runtime.stop();
+});
+
+test('manual route honors any-session scope, steer mode and never auto-archives the target', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  calls.sessions.set('external', { running: true, events: [] });
+  runtime.state.settings.routeScope = 'any';
+  runtime.state.settings.busyRouteMode = 'steer';
+  runtime.state.settings.sessionModel = { provider: 'deepseek', model: 'must-not-override' };
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.todos = [todo];
+  const result = await runtime.routeById(todo.id, 'external');
+  assert.equal(result.ok, true);
+  assert.equal(result.routed, true);
+  assert.equal(result.routeMode, 'steer');
+  assert.equal(calls.create, 0);
+  assert.equal(calls.modelSelections.length, 0);
+  const prompt = calls.invocations.find((call) => call.method === 'prompt').args.request;
+  assert.equal(prompt.sessionId, 'external');
+  assert.equal(prompt.mode, 'steer');
+  assert.match(prompt.content[0].text, /插入引导/);
+  const record = runtime.state.handled[todo.id];
+  assert.equal(record.routed, true);
+  record.executionStatus = 'completed';
+  await runtime.archiveRecord(record);
+  assert.deepEqual(calls.archives, []);
+  await runtime.stop();
+});
+
+test('plugin-only route scope rejects a foreign session without prompting it', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  calls.sessions.set('external', { running: false, events: [] });
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.todos = [todo];
+  const result = await runtime.routeById(todo.id, 'external');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /仅允许插件创建过的会话/);
+  assert.equal(calls.prompt, 0);
+  assert.equal(calls.create, 0);
+  await runtime.stop();
+});
+
+test('rpcId and todoId isolate reports when steer messages share one turn end', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  runtime.state.settings.autoRoute = true;
+  runtime.state.settings.busyRouteMode = 'steer';
+  const [first, second] = normalizeTodos([
+    directNoteTodo,
+    { ...directNoteTodo, id: 'second', target_url: 'https://gitlab.local/group/project/-/issues/7#note_11' },
+  ]);
+  await runtime.dispatch(first, false, { trackSlot: true });
+  await runtime.dispatch(second, false, { trackSlot: true });
+  const prompts = calls.invocations.filter((call) => call.method === 'prompt').map((call) => call.args.request);
+  assert.equal(prompts[1].mode, 'steer');
+  assert.match(prompts[1].content[0].text, /"todoId":"second"/);
+  const now = Date.now();
+  const session = calls.sessions.get('session-1');
+  session.running = false;
+  session.events = [
+    { type: 'user/message', seq: 1, time: now - 50, data: { source: { kind: 'user', rpcId: prompts[0].requestId } } },
+    // Host 的 steer 是当前 turn 的 nextStep：两条消息可以共用同一个 turn/end。
+    { type: 'user/message', seq: 2, time: now - 40, data: { source: { kind: 'user', rpcId: prompts[1].requestId } } },
+    { type: 'assistant/message', seq: 3, time: now - 20, data: { message: { content: [{ type: 'text', text: [
+      '第一条完成\n[TODO-CLOSURE] {"todoId":"direct","status":"done","summary":"第一条报告","resumeAfterMinutes":0,"openMrs":[]}',
+      '第二条完成\n[TODO-CLOSURE] {"todoId":"second","status":"done","summary":"第二条报告","resumeAfterMinutes":0,"openMrs":[]}',
+    ].join('\n') }] } } },
+    { type: 'turn/end', seq: 4, time: now - 10, data: { reason: { kind: 'completed' } } },
+  ];
+  runtime.fetchTodos = async () => { throw new Error('skip closure verification in this test'); };
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.handled.direct.executionStatus, 'completed');
+  assert.equal(runtime.state.handled.second.executionStatus, 'completed');
+  assert.equal(runtime.state.handled.direct.reportSummary, '第一条报告');
+  assert.equal(runtime.state.handled.second.reportSummary, '第二条报告');
+  assert.equal(runtime.trackedSessions.size, 0);
+  await runtime.stop();
+});
+
+test('legacy closure reports cannot cross the next plugin message in a shared turn', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  runtime.state.settings.autoRoute = true;
+  const [first, second] = normalizeTodos([
+    directNoteTodo,
+    { ...directNoteTodo, id: 'second', target_url: 'https://gitlab.local/group/project/-/issues/7#note_11' },
+  ]);
+  await runtime.dispatch(first, false, { trackSlot: true });
+  await runtime.dispatch(second, false, { trackSlot: true });
+  const prompts = calls.invocations.filter((call) => call.method === 'prompt').map((call) => call.args.request);
+  const now = Date.now();
+  const session = calls.sessions.get('session-1');
+  session.running = false;
+  session.events = [
+    { type: 'user/message', seq: 1, time: now - 50, data: { source: { kind: 'user', rpcId: prompts[0].requestId } } },
+    { type: 'assistant/message', seq: 2, time: now - 45, data: { message: { content: [{ type: 'text', text: '[TODO-CLOSURE] {"status":"done","summary":"旧第一条"}' }] } } },
+    { type: 'user/message', seq: 3, time: now - 40, data: { source: { kind: 'user', rpcId: prompts[1].requestId } } },
+    { type: 'assistant/message', seq: 4, time: now - 20, data: { message: { content: [{ type: 'text', text: '[TODO-CLOSURE] {"status":"done","summary":"旧第二条"}' }] } } },
+    { type: 'turn/end', seq: 5, time: now - 10, data: { reason: { kind: 'completed' } } },
+  ];
+  runtime.fetchTodos = async () => { throw new Error('skip closure verification in this test'); };
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.handled.direct.reportSummary, '旧第一条');
+  assert.equal(runtime.state.handled.second.reportSummary, '旧第二条');
+  await runtime.stop();
+});
+
+test('closed shared-session record retries archive after the other routed todo settles', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  runtime.trackSession('shared', 'second', Date.now(), false, 'request-second');
+  runtime.state.handled.first = {
+    id: 'first', sessionId: 'shared', executionStatus: 'completed', acceptedAt: Date.now(), archived: false,
+    closure: 'closed',
+  };
+  await runtime.assessClosures([], Date.now());
+  assert.deepEqual(calls.archives, []);
+  runtime.untrackTodo('shared', 'second');
+  // 不再手工调用 archiveRecord：下一轮闭环核对必须自己补偿归档。
+  await runtime.assessClosures([], Date.now());
+  assert.deepEqual(calls.archives, ['shared']);
+  await runtime.stop();
+});
+
+test('reconcile does not adopt completed records merely because their shared session is running', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  calls.sessions.set('shared', { running: true, events: [] });
+  runtime.state.handled.done = {
+    id: 'done', sessionId: 'shared', executionStatus: 'completed', automatic: true,
+    acceptedAt: Date.now() - 1000, closure: 'closed', archived: false,
+  };
+  await runtime.reconcileSessions();
+  assert.equal(runtime.trackedSessions.has('shared'), false);
+  assert.equal(runtime.occupiedSlots(), 0);
+  assert.equal(runtime.countSessionLoad('shared'), 0);
+  await runtime.stop();
+});
+
+test('an accepted pending message is materialized and settled after restart', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  const [todo] = normalizeTodos([directNoteTodo]);
+  const now = Date.now();
+  runtime.state.handled[todo.id] = {
+    id: todo.id, sessionId: 'old-session', executionStatus: 'completed', automatic: true,
+    acceptedAt: now - 1000, firstAcceptedAt: now - 1000, completedAt: now - 500,
+    round: 1, history: [], openMrs: ['https://gitlab.local/group/project/-/merge_requests/12'],
+    requestId: 'old-request', sessionTitle: 'Old session', url: todo.url, title: todo.title, project: todo.project,
+  };
+  runtime.state.pending[todo.id] = {
+    sessionId: 'pending-session', createdAt: now - 100, automatic: true, routed: true,
+    routeMode: 'queue', requestId: 'request-pending', sessionTitle: 'Recovered session', item: todo,
+  };
+  calls.sessions.set('pending-session', {
+    running: false,
+    events: [
+      { type: 'user/message', seq: 1, time: now - 50, data: { source: { kind: 'user', rpcId: 'request-pending' } } },
+      { type: 'assistant/message', seq: 2, time: now - 30, data: { message: { content: [{ type: 'text', text: '[TODO-CLOSURE] {"todoId":"direct","status":"done","summary":"恢复结算","openMrs":["https://gitlab.local/group/project/-/merge_requests/12"]}' }] } } },
+      { type: 'turn/end', seq: 3, time: now - 20, data: { reason: { kind: 'completed' } } },
+    ],
+  });
+  runtime.fetchTodos = async () => [];
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.pending[todo.id], undefined);
+  assert.equal(runtime.state.handled[todo.id].executionStatus, 'completed');
+  assert.equal(runtime.state.handled[todo.id].reportSummary, '恢复结算');
+  assert.equal(runtime.state.handled[todo.id].closure, 'closed');
+  assert.equal(runtime.state.handled[todo.id].round, 2);
+  assert.equal(runtime.state.handled[todo.id].history[0].sessionId, 'old-session');
+  assert.deepEqual(runtime.state.handled[todo.id].openMrs, ['https://gitlab.local/group/project/-/merge_requests/12']);
+  assert.equal(runtime.trackedSessions.size, 0);
+  await runtime.stop();
+});
+
+test('pending force-route recovery supersedes a previous handled record on the same session', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  const [todo] = normalizeTodos([directNoteTodo]);
+  const now = Date.now();
+  runtime.state.handled[todo.id] = {
+    id: todo.id, sessionId: 'shared', executionStatus: 'completed', automatic: false,
+    acceptedAt: now - 1000, firstAcceptedAt: now - 1000, completedAt: now - 500,
+    round: 1, history: [], requestId: 'old-request', sessionTitle: 'Shared', url: todo.url, title: todo.title, project: todo.project,
+  };
+  runtime.state.pending[todo.id] = {
+    sessionId: 'shared', createdAt: now - 100, automatic: false, routed: true,
+    routeMode: 'steer', requestId: 'new-request', sessionTitle: 'Shared', item: todo,
+  };
+  calls.sessions.set('shared', {
+    running: false,
+    events: [
+      { type: 'user/message', seq: 1, time: now - 50, data: { source: { kind: 'user', rpcId: 'new-request' } } },
+      { type: 'assistant/message', seq: 2, time: now - 30, data: { message: { content: [{ type: 'text', text: '[TODO-CLOSURE] {"todoId":"direct","status":"done","summary":"同会话重跑恢复"}' }] } } },
+      { type: 'turn/end', seq: 3, time: now - 20, data: { reason: { kind: 'completed' } } },
+    ],
+  });
+  runtime.fetchTodos = async () => [];
+  await runtime.reconcileSessions();
+  const record = runtime.state.handled[todo.id];
+  assert.equal(runtime.state.pending[todo.id], undefined);
+  assert.equal(record.requestId, 'new-request');
+  assert.equal(record.round, 2);
+  assert.equal(record.reportSummary, '同会话重跑恢复');
+  assert.equal(record.executionStatus, 'completed');
+  await runtime.stop();
+});
+
+test('legacy running records without requestId never read reports beyond their own turn end', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  const now = Date.now();
+  runtime.state.handled.old = {
+    id: 'old', sessionId: 'shared', executionStatus: 'running', automatic: true,
+    acceptedAt: now - 100, requestId: '', url: directNoteTodo.target_url, title: 'Old', project: 'group/project',
+  };
+  runtime.state.handled.second = {
+    id: 'second', sessionId: 'shared', executionStatus: 'running', automatic: true, routed: true,
+    acceptedAt: now - 50, requestId: 'new-request', url: directNoteTodo.target_url, title: 'New', project: 'group/project',
+  };
+  calls.sessions.set('shared', {
+    running: false,
+    events: [
+      { type: 'assistant/message', seq: 1, time: now - 90, data: { message: { content: [{ type: 'text', text: '[TODO-CLOSURE] {"status":"done","summary":"旧记录报告"}' }] } } },
+      { type: 'turn/end', seq: 2, time: now - 80, data: { reason: { kind: 'completed' } } },
+      { type: 'user/message', seq: 3, time: now - 50, data: { source: { kind: 'user', rpcId: 'new-request' } } },
+      { type: 'assistant/message', seq: 4, time: now - 30, data: { message: { content: [{ type: 'text', text: '[TODO-CLOSURE] {"todoId":"second","status":"done","summary":"新记录报告"}' }] } } },
+      { type: 'turn/end', seq: 5, time: now - 20, data: { reason: { kind: 'completed' } } },
+    ],
+  });
+  runtime.fetchTodos = async () => { throw new Error('skip closure verification in this test'); };
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.handled.old.reportSummary, '旧记录报告');
+  assert.equal(runtime.state.handled.second.reportSummary, '新记录报告');
+  await runtime.stop();
+});
+
+test('route retry reuses the pending requestId for host-side idempotency', async () => {
+  let attempts = 0;
+  const { runtime, calls } = runtimeWithPrompt(async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('response lost');
+    return { accepted: true };
+  }, { autoComplete: false });
+  calls.sessions.set('external', { running: false, events: [] });
+  runtime.state.settings.routeScope = 'any';
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.todos = [todo];
+  const first = await runtime.routeById(todo.id, 'external');
+  assert.equal(first.ok, false);
+  const pendingRequestId = runtime.state.pending[todo.id].requestId;
+  const second = await runtime.routeById(todo.id, 'external');
+  assert.equal(second.ok, true);
+  const prompts = calls.invocations.filter((call) => call.method === 'prompt').map((call) => call.args.request);
+  assert.equal(prompts.length, 2);
+  assert.equal(prompts[0].requestId, pendingRequestId);
+  assert.equal(prompts[1].requestId, pendingRequestId);
+  assert.equal(runtime.state.handled[todo.id].requestId, pendingRequestId);
+  assert.equal(runtime.state.pending[todo.id], undefined);
+  await runtime.stop();
+});
+
+test('route target listing filters archived and child sessions and manual queue cap fails closed', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  const [todo] = normalizeTodos([{ ...directNoteTodo, id: 'new-todo' }]);
+  runtime.state.todos = [todo];
+  runtime.state.settings.routeScope = 'any';
+  calls.sessions.set('plugin-session', { running: false, events: [] });
+  calls.sessions.set('external', { running: true, events: [] });
+  calls.sessions.set('archived', { running: false, events: [] });
+  calls.sessions.set('blank', { running: false, events: [], blank: true });
+  calls.sessions.set('child', { running: false, events: [], parentSessionId: 'parent' });
+  runtime.ctx.workspaceRegistry.archivedSessionIds = new Set(['archived']);
+  runtime.state.handled.previous = {
+    id: 'previous', sessionId: 'plugin-session', url: todo.url, acceptedAt: Date.now(), archived: false,
+    executionStatus: 'completed', automatic: true, routed: false,
+  };
+  const listing = await runtime.routeTargets(todo.id);
+  assert.deepEqual(listing.items.map((item) => item.sessionId), ['plugin-session', 'external']);
+  assert.equal(listing.items.find((item) => item.sessionId === 'plugin-session').sameTarget, true);
+  assert.equal(listing.items.find((item) => item.sessionId === 'external').running, true);
+
+  runtime.state.settings.maxQueuePerSession = 1;
+  runtime.state.handled.previous.executionStatus = 'running';
+  const result = await runtime.routeById(todo.id, 'plugin-session');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /达到单会话上限/);
+  assert.equal(calls.prompt, 0);
+  await runtime.stop();
 });
