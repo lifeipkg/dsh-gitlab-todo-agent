@@ -18,8 +18,10 @@
 
 安装方式二选一：
 
-- **npm 安装**（包名 `dsh-gitlab-todo-agent`）：通过 DSH 插件管理安装本包后重启 DSH。
+- **npm 安装**（包名 `@lifeipkg/dsh-gitlab-todo-agent`，scope 需 `access: public` 已在 `publishConfig` 配好）：通过 DSH 插件管理安装本包后重启 DSH。
 - **从源码安装**：克隆本仓库，把 `package.json` 所在目录作为 bundle 放入 DSH 插件目录（形如 `~/.dsh-plugins/gitlabtodo/bundle/`），重启 DSH。
+
+**从旧版本升级**：`package.json` 的 `name`、`cordis.patch.yml` 的 `name`、`client.js` 的模块 `id` 三处必须完全一致，DSH 按这个名字 import 包。早期版本（≤2.12.x）用的是从未发布过的 `@local/dsh-gitlab-todo-agent` 旧名，装有旧版条目的机器启用时会报 `Cannot find package '@local/dsh-gitlab-todo-agent'`。处理：先在插件管理里卸载/移除旧条目（必要时删除 `~/.dsh-plugins/` 下的旧目录，并清理 profile 里 `cordis.patch.yml` 的旧 insert 条目），再安装本包 ≥2.16.0。
 
 首次配置清单（装好后逐项确认再启用）：
 
@@ -168,4 +170,4 @@ npm run check
 
 ## 发布
 
-MIT License。发 npm（`npm publish`，公开包）或直接分发仓库均可；使用者的 GitLab 身份、模型选择与工作区都由各自环境决定，插件不携带任何部署方凭据。
+MIT License。发布到 npm（`npm publish`，scoped 包需公开访问，`publishConfig.access` 已配置）或直接分发仓库均可；使用者的 GitLab 身份、模型选择与工作区都由各自环境决定，插件不携带任何部署方凭据。发布前可先 `npm run pack:check` 核对打包内容。

@@ -1,9 +1,13 @@
 {
-  "name": "dsh-gitlab-todo-agent",
-  "version": "2.15.0",
+  "name": "@lifeipkg/dsh-gitlab-todo-agent",
+  "version": "2.16.0",
   "description": "DSH bundle: poll GitLab todos via glab and dispatch comment mentions to DSH sessions with closed-loop verification.",
   "type": "module",
   "license": "MIT",
+  "author": {
+    "name": "lifeipkg",
+    "url": "https://github.com/lifeipkg"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lifeipkg/dsh-gitlab-todo-agent.git"
@@ -12,25 +16,17 @@
   "bugs": {
     "url": "https://github.com/lifeipkg/dsh-gitlab-todo-agent/issues"
   },
-  "keywords": [
-    "dsh",
-    "dsh-bundle",
-    "gitlab",
-    "todo",
-    "agent",
-    "glab"
-  ],
-  "engines": {
-    "node": ">=22.15.0"
-  },
+  "main": "./index.js",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
     "./core": "./core.js",
     "./host": "./dsh-host.js",
+    "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
+  "icon": "./icon.svg",
   "files": [
     "index.js",
     "core.js",
@@ -44,9 +40,38 @@
   ],
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "check": "node --check index.js && node --check core.js && node --check client.js"
+    "check": "node --check index.js && node --check core.js && node --check client.js",
+    "pack:check": "npm pack --dry-run --json"
   },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1 <5.0.0",
+    "@deepseek-ai/dsh-client-locale": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-client-ui-layout": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-client-ui-sidebar": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-client-ui-workspace": ">=0.2.0-rc.1 <0.3.0-0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.0-rc.1 <0.3.0-0"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "gitlab",
+    "todo",
+    "agent",
+    "glab",
+    "cordis"
+  ],
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
