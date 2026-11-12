@@ -324,14 +324,14 @@ export function targetKey(url) {
 }
 
 /**
- * 自动路由目标：同一目标对象（同 MR/Issue/WorkItem）上最近的插件会话。
- * 匹配条件：记录带 sessionId、未归档、距接受未超过 ROUTE_MAX_AGE_MS、
- * 且该会话当前挂载的未结算消息数（loadOf）未达上限。
- * 只在插件自己的记录里找——插件只知道自己会话的负载与归属。
+ * 自动路由候选：同一目标对象（同 MR/Issue/WorkItem）上的插件会话，按新到旧排序，
+ * 且逐个通过负载检查（最新满员时继续找较早可用会话）。
+ * 只在插件自己的记录里找——插件只知道自己会话的负载与归属；
+ * 存在性/归档等宿主侧校验由调用方逐个尝试，一个候选失败不排除其余。
  */
-export function findRouteTarget(handled, todo, { loadOf = () => 0, maxQueue = 3, now = Date.now() } = {}) {
+export function findRouteTargets(handled, todo, { loadOf = () => 0, maxQueue = 3, now = Date.now() } = {}) {
   const key = targetKey(todo?.url ?? '');
-  if (!key) return null;
+  if (!key) return [];
   const limit = Number.isSafeInteger(maxQueue) && maxQueue >= 1 ? maxQueue : 3;
   const candidates = [];
   for (const record of Object.values(handled ?? {})) {
@@ -342,11 +342,14 @@ export function findRouteTarget(handled, todo, { loadOf = () => 0, maxQueue = 3,
     candidates.push(record);
   }
   candidates.sort((a, b) => (b.acceptedAt ?? 0) - (a.acceptedAt ?? 0));
-  for (const record of candidates) {
-    // 最新会话满员时继续找同目标的较早可用会话，而不是立即放弃路由。
-    if (loadOf(record.sessionId) < limit) return { sessionId: record.sessionId, record };
-  }
-  return null;
+  return candidates
+    .filter((record) => loadOf(record.sessionId) < limit)
+    .map((record) => ({ sessionId: record.sessionId, record }));
+}
+
+/** 兼容单候选语义：取最新的一个可用候选。 */
+export function findRouteTarget(handled, todo, options) {
+  return findRouteTargets(handled, todo, options)[0] ?? null;
 }
 
 /**
@@ -819,6 +822,7 @@ export function normalizeState(value) {
         reportStatus: REPORT_STATUSES.includes(record.reportStatus) ? record.reportStatus : '',
         reportSummary: text(record.reportSummary).slice(0, 300),
         reportNoAction: record.reportNoAction === true,
+        pendingUnconfirmed: record.pendingUnconfirmed === true,
         resumeAfterMinutes: Number.isFinite(minutes) && minutes > 0 ? minutes : null,
         openMrs: normalizeMrUrls(record.openMrs, url),
         history: (Array.isArray(record.history) ? record.history : [])
@@ -828,6 +832,8 @@ export function normalizeState(value) {
             sessionId: entry.sessionId,
             sessionTitle: text(entry.sessionTitle).slice(0, 200),
             routed: entry.routed === true,
+            archived: entry.archived === true,
+            archiveError: text(entry.archiveError).slice(0, 300),
             round: Number.isSafeInteger(entry.round) && entry.round >= 1 ? entry.round : 1,
             endedAt: timestamp(entry.endedAt),
             status: text(entry.status).slice(0, 40),
@@ -863,6 +869,7 @@ export function normalizeState(value) {
         sessionId: record.sessionId,
         createdAt,
         automatic: record.automatic !== false,
+        followUp: record.followUp === true,
         routed: record.routed === true,
         routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
         requestId: text(record.requestId).slice(0, 200),
@@ -876,6 +883,8 @@ export function normalizeState(value) {
             sessionId: entry.sessionId,
             sessionTitle: text(entry.sessionTitle).slice(0, 200),
             routed: entry.routed === true,
+            archived: entry.archived === true,
+            archiveError: text(entry.archiveError).slice(0, 300),
             round: Number.isSafeInteger(entry.round) && entry.round >= 1 ? entry.round : 1,
             endedAt: timestamp(entry.endedAt),
             status: text(entry.status).slice(0, 40),

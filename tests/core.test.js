@@ -607,7 +607,9 @@ function runtimeWithPrompt(prompt, options = {}) {
           items: [...sessions.entries()].map(([sessionId, session]) => ({
             sessionId,
             running: session.running,
-            title: session.title,
+            title: undefined,
+            projections: { values: { title: session.title } },
+            origin: session.origin,
             cwd: session.cwd,
             updatedAt: session.updatedAt,
             blank: session.blank,
@@ -2007,7 +2009,7 @@ test('legacy running records without requestId never read reports beyond their o
   await runtime.stop();
 });
 
-test('route retry reuses the pending requestId for host-side idempotency', async () => {
+test('route retry reuses the pending requestId and rejects changing its target', async () => {
   let attempts = 0;
   const { runtime, calls } = runtimeWithPrompt(async () => {
     attempts += 1;
@@ -2015,12 +2017,21 @@ test('route retry reuses the pending requestId for host-side idempotency', async
     return { accepted: true };
   }, { autoComplete: false });
   calls.sessions.set('external', { running: false, events: [] });
+  calls.sessions.set('other-target', { running: false, events: [] });
   runtime.state.settings.routeScope = 'any';
   const [todo] = normalizeTodos([directNoteTodo]);
   runtime.state.todos = [todo];
   const first = await runtime.routeById(todo.id, 'external');
   assert.equal(first.ok, false);
   const pendingRequestId = runtime.state.pending[todo.id].requestId;
+
+  const changedTarget = await runtime.routeById(todo.id, 'other-target');
+  assert.equal(changedTarget.ok, false);
+  assert.match(changedTarget.error, /为避免重复执行，不能改投/);
+  assert.equal(calls.prompt, 1);
+  assert.equal(runtime.state.pending[todo.id].sessionId, 'external');
+  assert.equal(runtime.state.pending[todo.id].requestId, pendingRequestId);
+
   const second = await runtime.routeById(todo.id, 'external');
   assert.equal(second.ok, true);
   const prompts = calls.invocations.filter((call) => call.method === 'prompt').map((call) => call.args.request);
@@ -2032,16 +2043,43 @@ test('route retry reuses the pending requestId for host-side idempotency', async
   await runtime.stop();
 });
 
+test('automatic routing falls back to the next candidate when the newest fails host checks', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  runtime.state.settings.autoRoute = true;
+  const url = 'https://gitlab.local/group/project/-/issues/7#note_12';
+  const [todo] = normalizeTodos([{ ...directNoteTodo, id: 'fresh', target_url: url }]);
+  const now = Date.now();
+  runtime.state.handled.older = {
+    id: 'older', sessionId: 'session-1', url, acceptedAt: now - 2000, archived: false,
+    executionStatus: 'completed', automatic: true,
+  };
+  runtime.state.handled.newer = {
+    id: 'newer', sessionId: 'session-2', url, acceptedAt: now - 100, archived: false,
+    executionStatus: 'completed', automatic: true,
+  };
+  calls.sessions.set('session-1', { running: false, events: [] });
+  calls.sessions.set('session-2', { running: false, events: [] });
+  // 最新候选被插件外归档：resolveRouteTarget 的宿主侧校验会拒绝它。
+  runtime.ctx.workspaceRegistry.archivedSessionIds = new Set(['session-2']);
+  const result = await runtime.dispatch(todo, false, { trackSlot: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.routed, true);
+  assert.equal(result.sessionId, 'session-1');
+  assert.equal(calls.create, 0);
+  assert.equal(calls.prompt, 1);
+  await runtime.stop();
+});
+
 test('route target listing filters archived and child sessions and manual queue cap fails closed', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   const [todo] = normalizeTodos([{ ...directNoteTodo, id: 'new-todo' }]);
   runtime.state.todos = [todo];
   runtime.state.settings.routeScope = 'any';
   calls.sessions.set('plugin-session', { running: false, events: [] });
-  calls.sessions.set('external', { running: true, events: [] });
+  calls.sessions.set('external', { running: true, events: [], title: '外部架构会话' });
   calls.sessions.set('archived', { running: false, events: [] });
   calls.sessions.set('blank', { running: false, events: [], blank: true });
-  calls.sessions.set('child', { running: false, events: [], parentSessionId: 'parent' });
+  calls.sessions.set('child', { running: false, events: [], origin: 'subagent' });
   runtime.ctx.workspaceRegistry.archivedSessionIds = new Set(['archived']);
   runtime.state.handled.previous = {
     id: 'previous', sessionId: 'plugin-session', url: todo.url, acceptedAt: Date.now(), archived: false,
@@ -2051,6 +2089,7 @@ test('route target listing filters archived and child sessions and manual queue 
   assert.deepEqual(listing.items.map((item) => item.sessionId), ['plugin-session', 'external']);
   assert.equal(listing.items.find((item) => item.sessionId === 'plugin-session').sameTarget, true);
   assert.equal(listing.items.find((item) => item.sessionId === 'external').running, true);
+  assert.equal(listing.items.find((item) => item.sessionId === 'external').title, '外部架构会话');
 
   runtime.state.settings.maxQueuePerSession = 1;
   runtime.state.handled.previous.executionStatus = 'running';
@@ -2058,5 +2097,176 @@ test('route target listing filters archived and child sessions and manual queue 
   assert.equal(result.ok, false);
   assert.match(result.error, /达到单会话上限/);
   assert.equal(calls.prompt, 0);
+  await runtime.stop();
+});
+
+test('poll skips repeated precheck but automatically retries pending with the same requestId', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  const [todo] = normalizeTodos([directNoteTodo]);
+  calls.sessions.set('session-pending', { running: false, events: [] });
+  runtime.state.pending[todo.id] = {
+    sessionId: 'session-pending', createdAt: Date.now(), automatic: true, routed: false,
+    routeMode: '', requestId: 'pending-request', item: todo,
+  };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.state.settings.precheckEnabled = true;
+  runtime.fetchTodos = async () => [todo];
+  let judged = 0;
+  let marked = 0;
+  runtime.judgeNeedsProcessing = async () => { judged += 1; return { needsProcessing: false, reason: '不应再次裁决' }; };
+  runtime.markTodoDone = async () => { marked += 1; };
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(judged, 0);
+  assert.equal(marked, 0);
+  assert.equal(calls.prompt, 1);
+  const prompt = calls.invocations.find((call) => call.method === 'prompt').args.request;
+  assert.equal(prompt.sessionId, 'session-pending');
+  assert.equal(prompt.requestId, 'pending-request');
+  assert.equal(runtime.state.handled[todo.id].requestId, 'pending-request');
+  assert.equal(runtime.state.pending[todo.id], undefined);
+  assert.equal(runtime.state.lastNewCount, 0);
+  await runtime.stop();
+});
+
+test('idle timeout materializes an accepted pending message instead of retrying forever', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.pending[todo.id] = {
+    sessionId: 'pending-session', createdAt: Date.now() - 1000, automatic: true, routed: true,
+    routeMode: 'queue', requestId: 'accepted-request', sessionTitle: 'Pending', item: todo,
+  };
+  calls.sessions.set('pending-session', {
+    running: false,
+    events: [{ type: 'user/message', seq: 1, time: Date.now(), data: { source: { kind: 'user', rpcId: 'accepted-request' } } }],
+  });
+  runtime.fetchTodos = async () => { throw new Error('skip closure verification in this test'); };
+  for (let poll = 0; poll < 40; poll += 1) await runtime.reconcileSessions();
+  assert.equal(runtime.state.pending[todo.id], undefined);
+  assert.equal(runtime.state.handled[todo.id].requestId, 'accepted-request');
+  assert.equal(runtime.state.handled[todo.id].executionStatus, 'failed');
+  assert.match(runtime.state.handled[todo.id].executionError, /没有回合结束记录/);
+  assert.equal(runtime.trackedSessions.size, 0);
+  await runtime.stop();
+});
+
+test('idle timeout supersedes the previous same-session handled round', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.handled[todo.id] = {
+    id: todo.id, sessionId: 'shared', executionStatus: 'completed', automatic: false,
+    acceptedAt: Date.now() - 1000, round: 1, history: [], requestId: 'old-request',
+    sessionTitle: 'Shared', url: todo.url, title: todo.title, project: todo.project,
+  };
+  runtime.state.pending[todo.id] = {
+    sessionId: 'shared', createdAt: Date.now() - 500, automatic: false, routed: true,
+    routeMode: 'steer', requestId: 'new-request', sessionTitle: 'Shared', item: todo,
+  };
+  calls.sessions.set('shared', {
+    running: false,
+    events: [{ type: 'user/message', seq: 1, time: Date.now(), data: { source: { kind: 'user', rpcId: 'new-request' } } }],
+  });
+  runtime.fetchTodos = async () => { throw new Error('skip closure verification in this test'); };
+  for (let poll = 0; poll < 40; poll += 1) await runtime.reconcileSessions();
+  const record = runtime.state.handled[todo.id];
+  assert.equal(runtime.state.pending[todo.id], undefined);
+  assert.equal(record.requestId, 'new-request');
+  assert.equal(record.round, 2);
+  assert.equal(record.executionStatus, 'failed');
+  assert.equal(runtime.trackedSessions.size, 0);
+  await runtime.stop();
+});
+
+test('externally completed initial pending stops retrying but requires human verification', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.pending[todo.id] = {
+    sessionId: 'unconfirmed', createdAt: Date.now(), automatic: true, routed: false,
+    requestId: 'unconfirmed-request', item: todo,
+  };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.fetchTodos = async () => [];
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.prompt, 0);
+  assert.equal(runtime.state.pending[todo.id], undefined);
+  assert.equal(runtime.state.handled[todo.id].closure, 'needs-human');
+  assert.match(runtime.state.handled[todo.id].closureNote, /人工核对原会话与讨论串/);
+  assert.match(runtime.state.handled[todo.id].executionError, /尚未确认/);
+  await runtime.stop();
+});
+
+test('pending follow-up retry survives normalization and respects nextAttemptAt backoff', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.todos = [];
+  runtime.state.handled[todo.id] = {
+    id: todo.id, sessionId: 'old-session', acceptedAt: Date.now() - 1000,
+    executionStatus: 'failed', automatic: true, closure: 'follow-up',
+    nextAttemptAt: Date.now() + 60000, url: todo.url, title: todo.title,
+  };
+  runtime.state.pending[todo.id] = {
+    sessionId: 'follow-up-session', createdAt: Date.now(), automatic: true, followUp: true,
+    requestId: 'follow-up-request', item: todo,
+  };
+  runtime.state = normalizeState({ ...runtime.state, version: 5 });
+  assert.equal(runtime.state.pending[todo.id].followUp, true);
+  assert.equal(runtime.enqueuePendingRetries(), 0);
+  assert.equal(calls.prompt, 0);
+  runtime.state.handled[todo.id].nextAttemptAt = Date.now() - 1;
+  assert.equal(runtime.enqueuePendingRetries(), 1);
+  assert.equal(runtime.dispatchQueue[0].pendingRetry, true);
+  assert.equal(runtime.dispatchQueue[0].todo.id, todo.id);
+  await runtime.stop();
+});
+
+test('legacy pending without requestId never retries and becomes needs-human without losing tracking', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.pending[todo.id] = {
+    sessionId: 'legacy', createdAt: Date.now() - 1000, automatic: true,
+    requestId: '', item: todo,
+  };
+  calls.sessions.set('legacy', { running: true, events: [] });
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.fetchTodos = async () => [todo];
+  await runtime.reconcileSessions();
+  assert.equal(runtime.isTodoTracked('legacy', todo.id), true);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.prompt, 0);
+  const blocked = await runtime.dispatch(todo);
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.error, /旧版本留下的 pending/);
+  assert.equal(runtime.isTodoTracked('legacy', todo.id), true);
+
+  calls.sessions.get('legacy').running = false;
+  runtime.fetchTodos = async () => { throw new Error('skip closure verification in this test'); };
+  for (let poll = 0; poll < 40; poll += 1) await runtime.reconcileSessions();
+  assert.equal(calls.prompt, 0);
+  assert.equal(runtime.state.pending[todo.id], undefined);
+  assert.equal(runtime.state.handled[todo.id].closure, 'needs-human');
+  assert.match(runtime.state.handled[todo.id].closureNote, /停止自动重试/);
+  await runtime.stop();
+});
+
+test('history-only plugin-created sessions keep archive controls', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.state.handled.current = {
+    id: 'current', sessionId: 'external-current', routed: true,
+    history: [{ sessionId: 'plugin-old', routed: false, archived: false }],
+  };
+  const result = await runtime.setSessionArchived('plugin-old', true);
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.archives, ['plugin-old']);
+  assert.equal(runtime.state.handled.current.history[0].archived, true);
+  assert.equal(runtime.archivedSessionIds().has('plugin-old'), true);
+  const restored = await runtime.setSessionArchived('plugin-old', false);
+  assert.equal(restored.ok, true);
+  assert.equal(runtime.state.handled.current.history[0].archived, false);
+  assert.equal(runtime.archivedSessionIds().has('plugin-old'), false);
   await runtime.stop();
 });

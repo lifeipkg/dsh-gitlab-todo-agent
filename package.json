@@ -1,6 +1,6 @@
 {
   "name": "@lifeipkg/dsh-gitlab-todo-agent",
-  "version": "2.17.0",
+  "version": "2.17.1",
   "description": "DSH bundle: poll GitLab todos via glab, route mentions to new or existing DSH sessions, and verify closure.",
   "type": "module",
   "license": "MIT",

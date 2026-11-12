@@ -105,7 +105,9 @@ function inspectRequestsFromEvents(events, requests) {
     const turnEnd = sorted.find((event) => event?.type === 'turn/end' && event.seq > fromSeq
       && (request.requestId || startedAt <= 0 || event.time >= startedAt));
     if (!turnEnd) {
-      results.set(request.key, { outcome: 'pending', idle: true });
+      // user/message 已落档就证明 Host 接受了 prompt，即使回合尚未结束；
+      // idle 超时后调用方仍需据此 materialize pending，而不是重复投递。
+      results.set(request.key, { outcome: 'pending', idle: true, messageAccepted: Boolean(request.requestId && fromSeq > 0) });
       continue;
     }
     const scoped = request.requestId

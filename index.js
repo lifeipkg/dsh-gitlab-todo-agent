@@ -13,7 +13,7 @@ import {
   buildWorkspaceOverview,
   classifyTodo,
   discussionsApiPath,
-  findRouteTarget,
+  findRouteTargets,
   initialState,
   normalizeMrUrls,
   normalizeState,
@@ -75,6 +75,12 @@ async function mapLimit(items, limit, worker) {
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** session/list 的人类可读标题在投影里，不在 item 顶层。 */
+function sessionSummaryTitle(summary) {
+  const title = summary?.projections?.values?.title;
+  return typeof title === 'string' ? title.trim() : '';
 }
 
 function jsonResponse(status, value) {
@@ -457,6 +463,7 @@ export class GitlabTodoRuntime {
             sessionId: previous.sessionId,
             sessionTitle: previous.sessionTitle ?? '',
             routed: previous.routed === true,
+            archived: previous.archived === true,
             round: previous.round ?? 1,
             endedAt: previous.completedAt ?? null,
             status: previous.reportStatus || previous.executionStatus || '',
@@ -595,12 +602,40 @@ export class GitlabTodoRuntime {
           }
           const pendingRecord = this.state.pending[todoId];
           let handled = this.state.handled[todoId];
+          if (pendingRecord && handled && !handled.sessionId && handled.outcome !== 'session-accepted') {
+            // 兼容旧版本竞争：预检/规则已给出无会话结论时不被 pending 恢复覆盖。
+            // 新版本的轮询候选已排除 pending，不会再次产生这种竞争。
+            delete this.state.pending[todoId];
+            changed = true;
+            this.untrackTodo(sessionId, todoId);
+            continue;
+          }
           const pendingSupersedesHandled = pendingRecord?.sessionId === sessionId && (!handled
             || handled.sessionId !== sessionId
             || (pendingRecord.requestId && handled.requestId !== pendingRecord.requestId));
+          let materialized = false;
           if (pendingSupersedesHandled
             && (inspection.messageAccepted === true || inspection.outcome === 'cancelled')) {
             handled = this.materializePendingRecord(todoId, pendingRecord);
+            materialized = true;
+          }
+          if (pendingSupersedesHandled && !materialized) {
+            if (!pendingRecord.requestId) {
+              // v4 及更早 pending 没有幂等标识：无法确认旧消息是否入队时，
+              // 转人工而不是生成新 requestId 重发（可能双执行）。
+              handled = this.materializePendingRecord(todoId, pendingRecord);
+              handled.executionStatus = 'failed';
+              handled.completedAt = Date.now();
+              handled.executionError = '旧版 pending 缺少 requestId，无法确认原消息是否已被 Host 接受';
+              handled.closure = 'needs-human';
+              handled.closureNote = '已停止自动重试以避免重复执行；请人工核对原会话后决定是否重新处理';
+              handled.pendingUnconfirmed = true;
+              handled.nextAttemptAt = null;
+              changed = true;
+            }
+            // pending 尚未证实被接受时，绝不能把本次 inspection 错算到上一轮 handled。
+            this.untrackTodo(sessionId, todoId);
+            continue;
           }
           if (handled?.sessionId === sessionId) {
             if (this.state.pending[todoId]?.sessionId === sessionId) delete this.state.pending[todoId];
@@ -652,13 +687,42 @@ export class GitlabTodoRuntime {
   }
 
   /**
+   * 初始 pending 的 Todo 已被外部完成：不能重试，也不能让 pending 永远 starting。
+   * 未跟踪不等于未接受（响应可能丢失），因此只转“需人工核对”，不直接判定闭环。
+   */
+  cleanupExternallyDonePending(todos) {
+    const pendingIds = new Set(todos.map((todo) => todo.id));
+    let changed = false;
+    for (const [todoId, pending] of Object.entries(this.state.pending)) {
+      if (pending.followUp === true || pendingIds.has(todoId)) continue;
+      if (this.dispatches.has(todoId) || this.isTodoTracked(pending.sessionId, todoId)) continue;
+      const existing = this.state.handled[todoId];
+      if (existing && !existing.sessionId && existing.outcome !== 'session-accepted') {
+        delete this.state.pending[todoId];
+        changed = true;
+        continue;
+      }
+      const record = this.materializePendingRecord(todoId, pending);
+      record.executionStatus = 'failed';
+      record.completedAt = Date.now();
+      record.executionError = 'Todo 已在插件外标记完成，但 pending 消息是否已被 Host 接受尚未确认';
+      record.closure = 'needs-human';
+      record.closureNote = '已停止自动重试以避免重复执行；请人工核对原会话与讨论串后决定是否需要补救';
+      record.pendingUnconfirmed = true;
+      record.nextAttemptAt = null;
+      changed = true;
+    }
+    return changed;
+  }
+
+  /**
    * 闭环裁决。todos 必须是 fetchStartedAt 时刻之后取得的待办列表：
    * - verifying：回合在取数之前就已结束的记录才裁决（取数早于回合结束的列表可能还带着已标记的 Todo）。
    * - follow-up / needs-human：Todo 已从待办列表消失（被续办会话、关联会话或人标记完成）→ 闭环。
    */
   async assessClosures(todos, fetchStartedAt) {
     const pendingIds = new Set(todos.map((todo) => todo.id));
-    let changed = false;
+    let changed = this.cleanupExternallyDonePending(todos);
     for (const record of Object.values(this.state.handled)) {
       if (!record?.sessionId || !record.closure) continue;
       if (this.isTodoTracked(record.sessionId, record.id) || this.dispatches.has(record.id)) continue;
@@ -675,7 +739,7 @@ export class GitlabTodoRuntime {
         if ((record.completedAt ?? 0) > fetchStartedAt) continue;
         await this.concludeRecord(record, todoPending);
         changed = true;
-      } else if (!todoPending && record.replied !== false) {
+      } else if (!todoPending && record.replied !== false && record.pendingUnconfirmed !== true) {
         record.closure = 'closed';
         record.closureNote = 'Todo 已不在待办列表（已被标记完成）';
         record.nextAttemptAt = null;
@@ -833,6 +897,27 @@ export class GitlabTodoRuntime {
     this.ensureSessionTimer();
   }
 
+  /** 自动 pending 跳过预检直接重试；复用原会话/requestId，手动 pending 不在后台自动重试。 */
+  enqueuePendingRetries() {
+    const queued = new Set(this.dispatchQueue.map((entry) => entry.todo.id));
+    let count = 0;
+    for (const [todoId, pending] of Object.entries(this.state.pending)) {
+      if (pending?.automatic === false || !pending?.requestId || queued.has(todoId) || this.dispatches.has(todoId)) continue;
+      const handled = this.state.handled[todoId];
+      if (pending.followUp === true && Number.isFinite(handled?.nextAttemptAt) && handled.nextAttemptAt > Date.now()) continue;
+      if (handled && !handled.sessionId && handled.outcome !== 'session-accepted') continue;
+      const followUp = pending.followUp === true;
+      const todo = this.state.todos.find((item) => item.id === todoId) ?? (followUp ? pending.item : null);
+      // 非续办 Todo 已被外部标记完成时不再重复执行，留给闭环核对清理。
+      if (!todo) continue;
+      this.dispatchQueue.push({ todo, followUp, pendingRetry: true });
+      queued.add(todoId);
+      count += 1;
+    }
+    if (count > 0) this.ensureSessionTimer();
+    return count;
+  }
+
   pump() {
     if (this.pumpPromise) return this.pumpPromise;
     const operation = this.executePump().finally(() => {
@@ -849,7 +934,12 @@ export class GitlabTodoRuntime {
         await this.waitForSlotSignal();
         continue;
       }
-      const { todo, followUp } = this.dispatchQueue.shift();
+      const { todo, followUp, pendingRetry } = this.dispatchQueue.shift();
+      if (pendingRetry) {
+        if (!this.state.pending[todo.id]) continue;
+        await this.dispatch(todo, Boolean(this.state.handled[todo.id]), { trackSlot: true, followUp });
+        continue;
+      }
       if (followUp) {
         // 排队期间可能已被别的会话或人闭环；只有仍处于待续办的才真正开续办会话。
         if (this.state.handled[todo.id]?.closure !== 'follow-up') continue;
@@ -882,11 +972,13 @@ export class GitlabTodoRuntime {
       // 闭环核对不依赖自动处理开关：它只更新记录状态和归档，不会开新会话。
       await this.assessClosures(todos, fetchStartedAt);
       const candidates = selectPendingTodos(todos, this.state.handled, todos.length)
-        .filter((todo) => !this.dispatches.has(todo.id));
+        .filter((todo) => !this.dispatches.has(todo.id) && !this.state.pending[todo.id]);
       this.state.lastNewCount = candidates.length;
       if (this.state.settings.enabled && this.state.settings.autoProcess) {
         // 0) 到期的续办先入队：先把已经开了头的事收尾，再开新的。
         if (this.state.settings.followUpEnabled !== false) this.enqueueFollowUps();
+        // 0.1) pending 是可能已被 Host 接受的消息：不参与下面的二次预检，但必须自动重试。
+        this.enqueuePendingRetries();
         // 1) 规则跳过：流水线通知、自己 @ 自己——零模型调用，程序内直接标记完成。
         if (this.state.settings.ruleSkipEnabled !== false) {
           const noise = candidates
@@ -1177,6 +1269,14 @@ export class GitlabTodoRuntime {
     } catch {}
     for (const record of Object.values(this.state.handled)) {
       if (record?.sessionId && record.archived === true) ids.add(record.sessionId);
+      for (const entry of record?.history ?? []) {
+        if (entry?.sessionId && entry.archived === true) ids.add(entry.sessionId);
+      }
+    }
+    for (const record of Object.values(this.state.pending)) {
+      for (const entry of record?.history ?? []) {
+        if (entry?.sessionId && entry.archived === true) ids.add(entry.sessionId);
+      }
     }
     return ids;
   }
@@ -1201,6 +1301,7 @@ export class GitlabTodoRuntime {
       .filter((summary) => summary?.sessionId
         && summary.blank !== true
         && summary.isSubagent !== true
+        && summary.origin !== 'subagent'
         && !summary.parentSessionId
         && summary.archived !== true
         && !archived.has(String(summary.sessionId))
@@ -1211,7 +1312,7 @@ export class GitlabTodoRuntime {
         const load = this.countSessionLoad(sessionId);
         return {
           sessionId,
-          title: String(summary.title || record?.sessionTitle || '未命名会话'),
+          title: sessionSummaryTitle(summary) || String(record?.sessionTitle || '未命名会话'),
           running: summary.running === true,
           updatedAt: Number.isFinite(summary.updatedAt) ? summary.updatedAt : null,
           cwd: typeof summary.cwd === 'string' ? summary.cwd : '',
@@ -1240,7 +1341,7 @@ export class GitlabTodoRuntime {
     const value = await this.host.listSessions();
     const summary = Array.isArray(value?.items) ? value.items.find((item) => String(item?.sessionId) === sessionId) : null;
     if (!summary) return fail(`目标会话 ${sessionId} 已不存在，未投递。`);
-    if (summary.blank === true || summary.isSubagent === true || summary.parentSessionId) {
+    if (summary.blank === true || summary.isSubagent === true || summary.origin === 'subagent' || summary.parentSessionId) {
       return fail('空白会话和子代理会话不能作为路由目标。');
     }
     if (summary.archived === true || this.archivedSessionIds().has(sessionId)) {
@@ -1256,7 +1357,7 @@ export class GitlabTodoRuntime {
     return {
       sessionId,
       mode: running ? this.state.settings.busyRouteMode : 'queue',
-      title: String(summary.title || target?.record?.sessionTitle || sessionId),
+      title: sessionSummaryTitle(summary) || String(target?.record?.sessionTitle || sessionId),
     };
   }
 
@@ -1287,20 +1388,34 @@ export class GitlabTodoRuntime {
   async setSessionArchived(sessionId, archived) {
     if (typeof sessionId !== 'string' || !sessionId) return { ok: false, error: '缺少 sessionId。' };
     if (typeof archived !== 'boolean') return { ok: false, error: 'archived 必须是布尔值。' };
-    const record = Object.values(this.state.handled).find((item) => item?.sessionId === sessionId && item.routed !== true);
+    let record = null;
+    let historyEntry = null;
+    for (const item of Object.values(this.state.handled)) {
+      if (item?.sessionId === sessionId && item.routed !== true) {
+        record = item;
+        break;
+      }
+      const entry = item?.history?.find((candidate) => candidate.sessionId === sessionId && candidate.routed !== true);
+      if (entry) {
+        record = item;
+        historyEntry = entry;
+        break;
+      }
+    }
     if (!record) return { ok: false, error: '该会话不是插件创建的会话。' };
+    const archiveState = historyEntry ?? record;
     if (archived && this.trackedSessions.has(sessionId)) {
       return { ok: false, error: '会话仍在执行，结算后再变更归档状态。' };
     }
     try {
       if (archived) await this.host.archiveSession(sessionId);
       else await this.host.unarchiveSession(sessionId);
-      record.archived = archived;
-      if (archived) record.archiveError = '';
+      archiveState.archived = archived;
+      if (archived) archiveState.archiveError = '';
       await this.persistQuietly('会话归档状态');
       return { ok: true };
     } catch (error) {
-      if (archived) record.archiveError = errorMessage(error);
+      if (archived) archiveState.archiveError = errorMessage(error);
       await this.persistQuietly('会话归档状态');
       throw error;
     }
@@ -1310,8 +1425,8 @@ export class GitlabTodoRuntime {
     const trackSlot = Boolean(options.trackSlot);
     const followUp = Boolean(options.followUp);
     const pending = this.state.pending[todo.id];
-    // 续办创建会话后若提示词发送失败，下次续办复用那个 pending 会话与 requestId，不再多建空会话/重复消息。
-    let sessionId = options.route ? null : force && !followUp ? null : pending?.sessionId;
+    // pending 代表可能已被 Host 接受的消息；无论是否 force，都只能复用原会话与 requestId。
+    let sessionId = options.route ? null : (pending?.sessionId ?? null);
     let route = null;
     // 同一 Todo 已有过会话再开新会话（自动续办或手动重新处理）：延续链路，轮次 +1。
     const previous = this.state.handled[todo.id];
@@ -1323,6 +1438,7 @@ export class GitlabTodoRuntime {
           sessionId: previous.sessionId,
           sessionTitle: previous.sessionTitle ?? '',
           routed: previous.routed === true,
+          archived: previous.archived === true,
           round: previous.round ?? 1,
           endedAt: previous.completedAt ?? null,
           status: previous.reportStatus || previous.executionStatus || '',
@@ -1353,21 +1469,35 @@ export class GitlabTodoRuntime {
         await this.persistQuietly('MR 直接完成');
         return { ok: true, sessionId: null, duplicate: false, skipped: true };
       }
-      if (options.route) {
-        route = await this.resolveRouteTarget(todo, options.route, true);
-        sessionId = route.sessionId;
-      } else if (!force && !followUp && pending?.routed === true) {
+      if (pending && !pending.requestId) {
+        throw new Error('该 Todo 有旧版本留下的 pending 消息，缺少可用于幂等重试的 requestId。为避免重复执行，本次未重新投递；请先让插件完成原会话核对，无法确认时会转为需人工。');
+      }
+      if (options.route && pending && pending.sessionId !== options.route.sessionId) {
+        throw new Error(`该 Todo 已有一条待确认消息在会话 ${pending.sessionId}（requestId: ${pending.requestId || '旧版无标识'}）。为避免重复执行，不能改投会话 ${options.route.sessionId}；请先选择原会话重试或等待其结算。`);
+      }
+      if (pending?.routed === true) {
         // 上次路由提示词可能已送达但响应丢失：沿用目标与 requestId，让 Host 幂等去重。
         route = { sessionId: pending.sessionId, mode: pending.routeMode || 'queue', title: pending.sessionTitle ?? '' };
         sessionId = pending.sessionId;
+      } else if (options.route) {
+        if (pending) {
+          // 同一会话的 pending 新会话也按原路径重试，不能改记成 routed 或换 requestId。
+          sessionId = pending.sessionId;
+        } else {
+          route = await this.resolveRouteTarget(todo, options.route, true);
+          sessionId = route.sessionId;
+        }
       } else if (trackSlot && !force && !followUp && !pending && this.state.settings.autoRoute) {
-        const candidate = findRouteTarget(this.state.handled, todo, {
+        // 候选按新到旧逐个过宿主校验（存在性/外部归档/负载）：最新的失败不排除次新可用者。
+        for (const candidate of findRouteTargets(this.state.handled, todo, {
           loadOf: (id) => this.countSessionLoad(id),
           maxQueue: this.state.settings.maxQueuePerSession,
-        });
-        if (candidate) {
+        })) {
           route = await this.resolveRouteTarget(todo, candidate, false);
-          if (route) sessionId = route.sessionId;
+          if (route) {
+            sessionId = route.sessionId;
+            break;
+          }
         }
       }
       if (route) routedTitle = route.title || sessionTitle;
@@ -1390,6 +1520,7 @@ export class GitlabTodoRuntime {
           sessionId,
           createdAt: promptStartedAt,
           automatic: trackSlot,
+          followUp,
           routed: true,
           routeMode: route.mode,
           requestId,
@@ -1415,6 +1546,7 @@ export class GitlabTodoRuntime {
           sessionId,
           createdAt: promptStartedAt,
           automatic: trackSlot,
+          followUp,
           routed: false,
           requestId,
           round,
@@ -1508,7 +1640,7 @@ export class GitlabTodoRuntime {
         this.releaseReservation();
         reserved = false;
       }
-      if (sessionId) this.untrackTodo(sessionId, todo.id);
+      if (sessionId && !(!pending?.requestId && pending?.sessionId === sessionId)) this.untrackTodo(sessionId, todo.id);
       // 续办会话没开起来：记录保持待续办，隔一段时间再试，不在每轮轮询里连续重试。
       if (followUp && previous?.closure === 'follow-up') previous.nextAttemptAt = Date.now() + FOLLOW_UP_RETRY_MS;
       this.state.lastDispatchError = `Todo ${todo.id} 创建或驱动 Session 失败：${errorMessage(error)}`;
