@@ -4,12 +4,18 @@ import { join } from 'node:path';
 import test from 'node:test';
 import {
   assessClosure,
+  buildBatchJudgePrompt,
+  buildDigest,
+  buildInbox,
   buildJudgePrompt,
   buildSessionTitle,
   buildTodoPrompt,
   buildWorkspaceOverview,
   discussionsApiPath,
   findRouteTarget,
+  mrApiPath,
+  mrWatchState,
+  parseBatchJudgeReply,
   parseClosureReport,
   parseJudgeReply,
   classifyTodo,
@@ -506,7 +512,7 @@ test('state normalization migrates v1 and v2 script states to v3', () => {
       lastNewCount: 0,
     };
     const state = normalizeState(legacy);
-    assert.equal(state.version, 5);
+    assert.equal(state.version, 6);
     assert.equal('shell' in state.settings, false);
     assert.equal('script' in state.settings, false);
     assert.equal(state.settings.enabled, true);
@@ -520,14 +526,14 @@ test('v3 states are prefilled with the legacy workflow rules; fresh installs kee
   const v3 = { ...initialState(), version: 3 };
   delete v3.settings.customRules;
   const migrated = normalizeState(JSON.parse(JSON.stringify(v3)));
-  assert.equal(migrated.version, 5);
+  assert.equal(migrated.version, 6);
   assert.equal(migrated.settings.customRules, LEGACY_WORKFLOW_RULES);
   assert.match(migrated.settings.customRules, /JEV-GATE\.md/);
   // 已自行配置过 customRules 的 v3 状态不会被覆盖。
   const customized = normalizeState(JSON.parse(JSON.stringify({ ...v3, settings: { ...v3.settings, customRules: '我的规则' } })));
   assert.equal(customized.settings.customRules, '我的规则');
   // 全新安装（initialState 即 v4）：customRules 为空，会话提示词保持通用。
-  assert.equal(initialState().version, 5);
+  assert.equal(initialState().version, 6);
   assert.equal(initialState().settings.customRules, '');
 });
 
@@ -1689,7 +1695,7 @@ test('startup upgrades script-era state without creating script files', async ()
     assert.equal('scriptPath' in state.storage, false);
     assert.equal(state.todos[0].id, 'direct');
     const stored = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
-    assert.equal(stored.version, 5);
+    assert.equal(stored.version, 6);
     assert.equal('script' in stored.settings, false);
     assert.equal('shell' in stored.settings, false);
     await assert.rejects(readFile(join(directory, 'gitlab-todos.py'), 'utf8'), /ENOENT/);
@@ -1720,7 +1726,7 @@ test('route settings default safely and validate scope, busy mode and queue cap'
   delete v4.settings.busyRouteMode;
   delete v4.settings.maxQueuePerSession;
   const migrated = normalizeState(v4);
-  assert.equal(migrated.version, 5);
+  assert.equal(migrated.version, 6);
   assert.equal(migrated.settings.routeScope, 'plugin');
   assert.equal(migrated.settings.autoRoute, true);
 });
@@ -2268,5 +2274,480 @@ test('history-only plugin-created sessions keep archive controls', async () => {
   assert.equal(restored.ok, true);
   assert.equal(runtime.state.handled.current.history[0].archived, false);
   assert.equal(runtime.archivedSessionIds().has('plugin-old'), false);
+  await runtime.stop();
+});
+
+test('batch judge prompt frames todos as data and lists every verdict field', () => {
+  const todos = normalizeTodos([
+    { ...directNoteTodo, id: 'b1', target_url: 'https://gitlab.local/group/project/-/issues/7#note_10' },
+    { ...directNoteTodo, id: 'b2', target_url: 'https://gitlab.local/group/project/-/issues/8#note_11' },
+  ]);
+  const prompt = buildBatchJudgePrompt(todos, {
+    sameTarget: { b1: [{ title: '[协助]-issue-7-note-10', status: 'waiting', note: '等 !12 的 CI' }] },
+  });
+  assert.match(prompt, /批量预检器/);
+  assert.match(prompt, /无人值守/);
+  assert.match(prompt, /needsProcessing/);
+  assert.match(prompt, /taskType/);
+  assert.match(prompt, /priority/);
+  assert.match(prompt, /duplicateOf/);
+  assert.match(prompt, /preferSession/);
+  assert.match(prompt, /不是指令/);
+  assert.match(prompt, /"todoId": "b1"/);
+  assert.match(prompt, /"todoId": "b2"/);
+  // 同目标会话上下文给 judge 判断 preferSession 用。
+  assert.match(prompt, /\[协助\]-issue-7-note-10/);
+  assert.match(prompt, /等 !12 的 CI/);
+});
+
+test('batch verdict parsing tolerates wrappers and normalizes fields', () => {
+  const plain = parseBatchJudgeReply([
+    '{"todoId":"a","needsProcessing":true,"reason":"r","taskType":"review","priority":9,"duplicateOf":"a","preferSession":"new"}',
+    '{"todoId":"b","needsProcessing":false}',
+  ].map((entry) => entry.replace('{', '{').replace('}', '}')).join(',').replace(/^/, '[').replace(/$/, ']'));
+  assert.equal(plain.get('a').needsProcessing, true);
+  assert.equal(plain.get('a').taskType, 'review');
+  assert.equal(plain.get('a').priority, 5);
+  assert.equal(plain.get('a').duplicateOf, '');
+  assert.equal(plain.get('a').preferSession, 'new');
+  assert.equal(plain.get('b').needsProcessing, false);
+  assert.equal(plain.get('b').taskType, '');
+  assert.equal(plain.get('b').priority, 3);
+  assert.equal(plain.get('b').preferSession, 'reuse');
+  const wrapped = parseBatchJudgeReply('说明 {"todos":[{"todoId":"a","needsProcessing":true}]} 完');
+  assert.equal(wrapped.get('a').needsProcessing, true);
+  const duplicates = parseBatchJudgeReply('[{"todoId":"a","needsProcessing":true,"duplicateOf":"b"},{"todoId":"b","needsProcessing":false}]');
+  assert.equal(duplicates.get('a').duplicateOf, 'b');
+  assert.equal(parseBatchJudgeReply('不是 JSON'), null);
+  assert.equal(parseBatchJudgeReply('{"foo":1}'), null);
+  assert.equal(parseBatchJudgeReply('[]'), null);
+});
+
+test('signature and per-task model settings validate strictly', () => {
+  const defaults = defaultSettings();
+  assert.equal(defaults.replySignature, false);
+  assert.equal(defaults.signatureText, '—— 由 AI 助手代复');
+  assert.deepEqual(defaults.taskModels, { question: null, review: null, change: null });
+  const next = validateSettings({
+    replySignature: true,
+    signatureText: ' —— AI 代复 —— ',
+    taskModels: { question: { provider: ' p ', model: ' m ' }, review: null },
+  });
+  assert.equal(next.replySignature, true);
+  assert.equal(next.signatureText, '—— AI 代复 ——');
+  assert.deepEqual(next.taskModels.question, { provider: 'p', model: 'm' });
+  assert.equal(next.taskModels.review, null);
+  assert.equal(next.taskModels.change, null);
+  assert.throws(() => validateSettings({ taskModels: 'x' }), /taskModels/);
+  assert.throws(() => validateSettings({ taskModels: { review: { provider: 'x' } } }), /taskModels\.review/);
+  assert.throws(() => validateSettings({ signatureText: 42 }), /署名文本/);
+  assert.throws(() => validateSettings({ signatureText: 'x'.repeat(101) }), /署名文本/);
+  assert.throws(() => validateSettings({ replySignature: 'yes' }), /replySignature/);
+});
+
+test('v5 states migrate to v6 and new record fields survive round-trips', () => {
+  const base = initialState();
+  base.version = 5;
+  delete base.settings.replySignature;
+  delete base.settings.signatureText;
+  delete base.settings.taskModels;
+  const mrUrl = 'https://gitlab.local/g/p/-/merge_requests/3';
+  base.handled.x = {
+    id: 'x', sessionId: 's1', acceptedAt: 10, url: 'https://gitlab.local/g/p/-/issues/1',
+    taskType: 'review',
+    lastReply: { id: '99', body: '已处理，见 MR', url: 'https://gitlab.local/g/p/-/issues/1#note_99', createdAt: 20 },
+    watch: { mrs: [mrUrl], lastStates: { [mrUrl]: 'running' } },
+    acknowledgedAt: 30,
+  };
+  const migrated = normalizeState(JSON.parse(JSON.stringify(base)));
+  assert.equal(migrated.version, 6);
+  assert.equal(migrated.settings.replySignature, false);
+  assert.equal(migrated.settings.signatureText, '—— 由 AI 助手代复');
+  assert.deepEqual(migrated.settings.taskModels, { question: null, review: null, change: null });
+  assert.equal(migrated.handled.x.taskType, 'review');
+  assert.equal(migrated.handled.x.lastReply.body, '已处理，见 MR');
+  assert.equal(migrated.handled.x.watch.mrs[0], mrUrl);
+  assert.equal(migrated.handled.x.watch.lastStates[mrUrl], 'running');
+  assert.equal(migrated.handled.x.acknowledgedAt, 30);
+  // 坏字段归位：taskType 白名单外归 ''，空 watch / 空回复归 null。
+  const dirty = normalizeState(JSON.parse(JSON.stringify({
+    ...migrated,
+    handled: { ...migrated.handled, y: { ...migrated.handled.x, id: 'y', taskType: 'bogus', watch: { mrs: [] }, lastReply: { body: '' } } },
+  })));
+  assert.equal(dirty.handled.y.taskType, '');
+  assert.equal(dirty.handled.y.watch, null);
+  assert.equal(dirty.handled.y.lastReply, null);
+});
+
+test('digest summarizes the last day and the inbox lists unacknowledged needs-human only', () => {
+  const base = initialState();
+  const now = Date.now();
+  base.handled.recent1 = {
+    id: 'recent1', sessionId: 's1', acceptedAt: now - 1000, completedAt: now - 500, closure: 'closed',
+    closureNote: '已闭环', title: 'T1', url: 'https://gitlab.local/a',
+    lastReply: { id: 'n1', body: '回复正文', url: 'https://gitlab.local/a#note_n1', createdAt: now - 600 },
+  };
+  base.handled.old = {
+    id: 'old', sessionId: 's2', acceptedAt: now - 48 * 3600e3, completedAt: now - 47 * 3600e3,
+    closure: 'closed', title: 'T2', url: '',
+  };
+  base.handled.human1 = {
+    id: 'human1', sessionId: 's3', acceptedAt: now - 2000, completedAt: now - 1000,
+    closure: 'needs-human', closureNote: '需要授权', title: 'T3', url: '',
+  };
+  base.handled.human2 = {
+    id: 'human2', sessionId: 's4', acceptedAt: now - 3000, completedAt: now - 2500,
+    closure: 'needs-human', closureNote: '等确认', title: 'T4', url: '', acknowledgedAt: now - 100,
+  };
+  base.handled.fu = { id: 'fu', sessionId: 's5', acceptedAt: now - 1500, completedAt: now - 1400, closure: 'follow-up', title: 'T5', url: '' };
+  // 仍在跑的记录（completedAt 缺失）不进晨报结算数。
+  base.handled.running = { id: 'running', sessionId: 's6', acceptedAt: now - 800, closure: '', title: 'T6', url: '' };
+  const digest = buildDigest(base, now);
+  assert.equal(digest.counts.total, 4);
+  assert.equal(digest.counts.closed, 1);
+  assert.equal(digest.counts.needsHuman, 2);
+  assert.equal(digest.counts.followUp, 1);
+  assert.equal(digest.items[0].todoId, 'recent1');
+  assert.equal(digest.items[0].replyExcerpt, '回复正文');
+  assert.equal(digest.items[0].replyUrl, 'https://gitlab.local/a#note_n1');
+  assert.equal(digest.open.needsHuman, 1);
+  assert.equal(digest.open.followUp, 1);
+  assert.equal(digest.items.some((entry) => entry.todoId === 'running'), false);
+  const inbox = buildInbox(base);
+  assert.deepEqual(inbox.map((item) => item.todoId), ['human1']);
+  assert.equal(inbox[0].closureNote, '需要授权');
+  // publicState 带出 digest，闭环统计排除已确认的需人工记录。
+  const view = publicState(base, false, null);
+  assert.equal(view.digest.counts.total, 4);
+  assert.equal(view.closure.needsHuman, 1);
+});
+
+test('MR watch state classifies pipelines and terminal outcomes', () => {
+  assert.equal(mrApiPath('https://gitlab.local/g/p/-/merge_requests/12'), 'projects/g%2Fp/merge_requests/12');
+  assert.equal(mrApiPath('https://gitlab.local/g/p/sub/deep/-/merge_requests/1'), 'projects/g%2Fp%2Fsub%2Fdeep/merge_requests/1');
+  assert.equal(mrApiPath('https://gitlab.local/g/p/-/issues/12'), '');
+  assert.equal(mrApiPath('不是 URL'), '');
+  assert.equal(mrWatchState({ state: 'merged' }), 'merged');
+  assert.equal(mrWatchState({ state: 'closed' }), 'closed');
+  assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'running' } }), 'running');
+  assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'pending' } }), 'running');
+  assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'success' } }), 'pipeline:success');
+  assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'failed' } }), 'pipeline:failed');
+  assert.equal(mrWatchState({ state: 'opened' }), 'none');
+  assert.equal(mrWatchState(null), 'unknown');
+});
+
+test('signature line appears in the reply rules only when configured', () => {
+  const todo = normalizeTodos([directNoteTodo])[0];
+  assert.equal(buildTodoPrompt(todo).includes('单独另起一行原样加上署名'), false);
+  const signed = buildTodoPrompt(todo, { signature: '—— 由 AI 助手代复' });
+  assert.match(signed, /单独另起一行原样加上署名「—— 由 AI 助手代复」/);
+  assert.match(signed, /AI 助手代发/);
+});
+
+test('batch precheck dispatches by priority and folds duplicates into the primary', async () => {
+  const reply = JSON.stringify([
+    { todoId: 'dup', needsProcessing: true, reason: '重复', duplicateOf: 'main' },
+    { todoId: 'main', needsProcessing: true, reason: '主条目', taskType: 'question', priority: 2 },
+    { todoId: 'urgent', needsProcessing: true, reason: '紧急', taskType: 'change', priority: 1 },
+  ]);
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.ctx.llm = {
+    async prepareCall(route) {
+      return { config: route, stream: async function* stream() { yield { text: reply }; } };
+    },
+    stream() {
+      throw new Error('should go through prepareCall');
+    },
+  };
+  const marked = [];
+  runtime.markTodoDone = async (todo) => { marked.push(todo.id); };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.state.settings.maxSessionsPerPoll = 3;
+  runtime.fetchTodos = async () => normalizeTodos([
+    // dup 与 main 在同一 Issue 上（重复折叠只作用于同目标对象）。
+    { ...directNoteTodo, id: 'dup', target_url: 'https://gitlab.local/group/project/-/issues/8#note_21' },
+    { ...directNoteTodo, id: 'main', target_url: 'https://gitlab.local/group/project/-/issues/8#note_20' },
+    { ...directNoteTodo, id: 'urgent', target_url: 'https://gitlab.local/group/project/-/issues/9#note_30' },
+  ]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.deepEqual(marked, ['dup']);
+  assert.equal(runtime.state.handled.dup.outcome, 'precheck-skipped');
+  assert.match(runtime.state.handled.dup.skipReason, /随主条目合并处理/);
+  assert.equal(calls.create, 2);
+  // priority 1（urgent）先派发，priority 2（main）随后。
+  assert.deepEqual(calls.renames.map((request) => request.title), ['[协助]-issue-9-note-30', '[协助]-issue-8-note-20']);
+  assert.equal(runtime.state.handled.urgent.taskType, 'change');
+  assert.equal(runtime.state.handled.main.taskType, 'question');
+  assert.equal(runtime.judgeVerdicts.size, 0);
+  await runtime.stop();
+});
+
+test('mutual duplicate references never fold both sides of a pair', async () => {
+  const reply = JSON.stringify([
+    { todoId: 'a', needsProcessing: true, duplicateOf: 'b' },
+    { todoId: 'b', needsProcessing: true, duplicateOf: 'a' },
+  ]);
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.ctx.llm = {
+    async prepareCall(route) {
+      return { config: route, stream: async function* stream() { yield { text: reply }; } };
+    },
+    stream() { throw new Error('should go through prepareCall'); },
+  };
+  const marked = [];
+  runtime.markTodoDone = async (todo) => { marked.push(todo.id); };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.state.settings.maxSessionsPerPoll = 2;
+  runtime.fetchTodos = async () => normalizeTodos([
+    { ...directNoteTodo, id: 'a' },
+    { ...directNoteTodo, id: 'b', target_url: 'https://gitlab.local/group/project/-/issues/7#note_2' },
+  ]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  // 互相指向属于判定矛盾：不折叠任何一边，两条都正常开会话，交给会话自行处理。
+  assert.deepEqual(marked, []);
+  assert.equal(calls.create, 2);
+  await runtime.stop();
+});
+
+test('cross-target duplicates are not folded so every thread keeps its reply', async () => {
+  const reply = JSON.stringify([
+    { todoId: 'again', needsProcessing: true, duplicateOf: 'main', reason: '同一问题又问了一遍' },
+    { todoId: 'main', needsProcessing: true, reason: '主条目' },
+  ]);
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.ctx.llm = {
+    async prepareCall(route) {
+      return { config: route, stream: async function* stream() { yield { text: reply }; } };
+    },
+    stream() { throw new Error('should go through prepareCall'); },
+  };
+  const marked = [];
+  runtime.markTodoDone = async (todo) => { marked.push(todo.id); };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.state.settings.maxSessionsPerPoll = 2;
+  runtime.fetchTodos = async () => normalizeTodos([
+    // 不同 Issue 上的同一问题：不折叠，两个讨论串各自得到回复。
+    { ...directNoteTodo, id: 'again', target_url: 'https://gitlab.local/group/project/-/issues/9#note_5' },
+    { ...directNoteTodo, id: 'main', target_url: 'https://gitlab.local/group/project/-/issues/8#note_20' },
+  ]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.deepEqual(marked, []);
+  assert.equal(calls.create, 2);
+  await runtime.stop();
+});
+
+test('missing batch verdicts fall back conservatively to dispatch', async () => {
+  const reply = JSON.stringify([{ todoId: 'known', needsProcessing: true, reason: '有判定' }]);
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.ctx.llm = {
+    async prepareCall(route) {
+      return { config: route, stream: async function* stream() { yield { text: reply }; } };
+    },
+    stream() { throw new Error('should go through prepareCall'); },
+  };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.state.settings.maxSessionsPerPoll = 2;
+  runtime.fetchTodos = async () => normalizeTodos([
+    { ...directNoteTodo, id: 'known' },
+    { ...directNoteTodo, id: 'unknown', target_url: 'https://gitlab.local/group/project/-/issues/8#note_20' },
+  ]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  // 缺失判定的 unknown 保守视为需要处理，同样开会话。
+  assert.equal(calls.create, 2);
+  assert.equal(runtime.state.handled.unknown.outcome, 'session-accepted');
+  await runtime.stop();
+});
+
+test('task type routes model selection per class', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.state.settings.sessionModel = { provider: 'deepseek', model: 'deepseek-chat' };
+  runtime.state.settings.taskModels = { question: null, review: { provider: 'x', model: 'review-model' }, change: null };
+  runtime.judgeVerdicts.set('direct', { needsProcessing: true, taskType: 'review', preferSession: 'reuse' });
+  const [reviewTodo] = normalizeTodos([directNoteTodo]);
+  await runtime.dispatch(reviewTodo, false, { trackSlot: true });
+  assert.deepEqual(calls.modelSelections, [{ sessionId: 'session-1', provider: 'x', model: 'review-model' }]);
+  assert.equal(runtime.state.handled.direct.taskType, 'review');
+  calls.modelSelections.length = 0;
+  runtime.judgeVerdicts.set('plain', { needsProcessing: true, taskType: 'question', preferSession: 'reuse' });
+  const [plainTodo] = normalizeTodos([{ ...directNoteTodo, id: 'plain', target_url: 'https://gitlab.local/group/project/-/issues/8#note_11' }]);
+  await runtime.dispatch(plainTodo, false, { trackSlot: true });
+  // 未命中类型映射（question 为 null）退回会话模型。
+  assert.deepEqual(calls.modelSelections, [{ sessionId: 'session-2', provider: 'deepseek', model: 'deepseek-chat' }]);
+  await runtime.stop();
+});
+
+test('preferSession new skips same-target routing and opens a fresh session', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
+  runtime.state.settings.autoRoute = true;
+  const [first, later] = normalizeTodos([
+    directNoteTodo,
+    { ...directNoteTodo, id: 'later', target_url: 'https://gitlab.local/group/project/-/issues/7#note_99' },
+  ]);
+  await runtime.dispatch(first, false, { trackSlot: true });
+  assert.equal(calls.create, 1);
+  // 同目标默认复用（既有行为基线）：判定 preferSession=reuse 仍路由。
+  runtime.judgeVerdicts.set('reuse-todo', { needsProcessing: true, taskType: '', preferSession: 'reuse' });
+  const [reuseTodo] = normalizeTodos([{ ...directNoteTodo, id: 'reuse-todo', target_url: 'https://gitlab.local/group/project/-/issues/7#note_77' }]);
+  const reuseResult = await runtime.dispatch(reuseTodo, false, { trackSlot: true });
+  assert.equal(reuseResult.routed, true);
+  // 判定 preferSession=new：虽同目标也不复用，改开新会话。
+  runtime.judgeVerdicts.set('later', { needsProcessing: true, taskType: '', preferSession: 'new' });
+  const freshResult = await runtime.dispatch(later, false, { trackSlot: true });
+  assert.equal(freshResult.ok, true);
+  assert.equal(freshResult.routed, false);
+  assert.equal(calls.create, 2);
+  assert.equal(runtime.state.handled.later.sessionId, 'session-2');
+  await runtime.stop();
+});
+
+test('waiting records watch MR pipelines and trigger the follow-up early on transitions', async () => {
+  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const mrUrl = 'https://gitlab.local/group/project/-/merge_requests/5';
+  runtime.state.handled.w = {
+    id: 'w', sessionId: 's', closure: 'follow-up', nextAttemptAt: Date.now() + 3600_000,
+    url: 'https://gitlab.local/group/project/-/issues/7',
+    watch: { mrs: [mrUrl], lastStates: { [mrUrl]: 'running' } },
+  };
+  let detail = { state: 'opened', head_pipeline: { status: 'running' } };
+  const requests = [];
+  runtime.runGlab = async (args) => {
+    requests.push(args);
+    return JSON.stringify(detail);
+  };
+  const steady = await runtime.refreshWatches();
+  assert.equal(steady.triggered, false);
+  assert.equal(runtime.state.handled.w.watch.lastStates[mrUrl], 'running');
+  assert.deepEqual(requests.at(-1).slice(0, 5), ['api', '-X', 'GET', 'projects/group%2Fproject/merge_requests/5']);
+  detail = { state: 'opened', head_pipeline: { status: 'success' } };
+  const fired = await runtime.refreshWatches();
+  assert.equal(fired.triggered, true);
+  assert.equal(runtime.state.handled.w.watch, null);
+  assert.ok(runtime.state.handled.w.nextAttemptAt <= Date.now());
+  // 无流水线的 MR 不触发（定时续办兜底）。
+  runtime.state.handled.w2 = {
+    id: 'w2', sessionId: 's2', closure: 'follow-up', nextAttemptAt: Date.now() + 3600_000,
+    url: 'https://gitlab.local/group/project/-/issues/8',
+    watch: { mrs: [mrUrl], lastStates: {} },
+  };
+  detail = { state: 'opened' };
+  const quiet = await runtime.refreshWatches();
+  assert.equal(quiet.triggered, false);
+  assert.equal(runtime.state.handled.w2.nextAttemptAt > Date.now(), true);
+  // MR 合并直接触发。
+  detail = { state: 'merged' };
+  const merged = await runtime.refreshWatches();
+  assert.equal(merged.triggered, true);
+  assert.equal(runtime.state.handled.w2.watch, null);
+  // 同一轮内同一 MR 只请求一次（按 API 路径去重）；glab 失败跳过本轮且不更新 lastStates。
+  runtime.state.handled.w3 = {
+    id: 'w3', sessionId: 's3', closure: 'follow-up', nextAttemptAt: Date.now() + 3600_000,
+    url: 'https://gitlab.local/group/project/-/issues/9',
+    watch: { mrs: [mrUrl], lastStates: {} },
+  };
+  requests.length = 0;
+  detail = { state: 'opened', head_pipeline: { status: 'running' } };
+  const deduped = await runtime.refreshWatches();
+  assert.equal(deduped.triggered, false);
+  assert.equal(requests.length, 1);
+  assert.equal(runtime.state.handled.w3.watch.lastStates[mrUrl], 'running');
+  runtime.runGlab = async () => { throw new Error('glab down'); };
+  runtime.state.handled.w4 = {
+    id: 'w4', sessionId: 's4', closure: 'follow-up', nextAttemptAt: Date.now() + 3600_000,
+    url: 'https://gitlab.local/group/project/-/issues/10',
+    watch: { mrs: [mrUrl], lastStates: {} },
+  };
+  const failed = await runtime.refreshWatches();
+  assert.equal(failed.triggered, false);
+  assert.equal(runtime.state.handled.w4.watch.lastStates[mrUrl], undefined);
+  assert.equal(runtime.state.handled.w4.nextAttemptAt > Date.now(), true);
+  await runtime.stop();
+});
+
+test('thread reply check captures the latest our-note of the round', async () => {
+  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const [item] = normalizeTodos([directNoteTodo]);
+  const since = 1000;
+  const notes = [
+    { id: 10, system: false, author: { id: '52' }, body: '问题', created_at: '2026-01-01T00:00:00Z' },
+    { id: 11, system: true, author: { id: '106' }, body: '系统 note', created_at: new Date(since + 3000).toISOString() },
+    { id: 12, system: false, author: { id: '106' }, body: '上一轮的旧回复', created_at: new Date(since - 1000).toISOString() },
+    { id: 13, system: false, author: { id: '106' }, body: '本轮回复', created_at: new Date(since + 5000).toISOString() },
+  ];
+  runtime.runGlab = async () => JSON.stringify([{ notes }]);
+  const result = await runtime.checkThreadReply(item, since);
+  assert.equal(result.replied, true);
+  assert.equal(result.reply.id, '13');
+  assert.equal(result.reply.body, '本轮回复');
+  assert.equal(result.reply.url, 'https://gitlab.local/group/project/-/issues/7#note_13');
+  assert.ok(result.reply.createdAt > since);
+  // 只有旧回复时 replied 仍为 true（事实优先），但本轮快照为 null。
+  const stale = await runtime.checkThreadReply(item, Date.now());
+  assert.equal(stale.replied, true);
+  assert.equal(stale.reply, null);
+  // created_at 解析失败的 note 保守视为本轮产物，优先捕获。
+  notes.push({ id: 14, system: false, author: { id: '106' }, body: '无时间戳回复', created_at: 'garbage' });
+  const undated = await runtime.checkThreadReply(item, since);
+  assert.equal(undated.reply.id, '14');
+  await runtime.stop();
+});
+
+test('acknowledging a needs-human record closes it and archives the session', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const [item] = normalizeTodos([directNoteTodo]);
+  runtime.state.handled[item.id] = {
+    id: item.id, sessionId: 'session-1', closure: 'needs-human', closureNote: '需要授权',
+    acceptedAt: Date.now() - 5000, completedAt: Date.now() - 1000, automatic: true,
+    executionStatus: 'completed', item, title: item.title, url: item.url, project: item.project,
+    round: 1, history: [], openMrs: [],
+    watch: { mrs: ['https://gitlab.local/group/project/-/merge_requests/9'], lastStates: {} },
+  };
+  const marked = [];
+  runtime.markTodoDone = async (todo) => { marked.push(todo.id); };
+  const result = await runtime.acknowledgeNeedsHuman(item.id);
+  assert.equal(result.ok, true);
+  assert.deepEqual(marked, [item.id]);
+  assert.equal(runtime.state.handled[item.id].closure, 'closed');
+  assert.ok(runtime.state.handled[item.id].acknowledgedAt > 0);
+  assert.equal(runtime.state.handled[item.id].watch, null);
+  assert.deepEqual(calls.archives, ['session-1']);
+  const denied = await runtime.acknowledgeNeedsHuman(item.id);
+  assert.equal(denied.ok, false);
+  await runtime.stop();
+});
+
+test('manual dispatch ignores leftover batch verdicts', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.state.settings.sessionModel = { provider: 'deepseek', model: 'deepseek-chat' };
+  runtime.state.settings.taskModels = { question: null, review: { provider: 'x', model: 'review-model' }, change: null };
+  // 预检留下的判定（pump 等待并发槽时用户点了手动“开 Session 处理”）。
+  runtime.judgeVerdicts.set('direct', { needsProcessing: true, taskType: 'review', preferSession: 'reuse' });
+  const [todo] = normalizeTodos([directNoteTodo]);
+  runtime.state.todos = [todo];
+  const result = await runtime.dispatchById(todo.id);
+  assert.equal(result.ok, true);
+  // 手动派发不吃任务类型映射，仍用会话模型；判定被丢弃不再残留。
+  assert.deepEqual(calls.modelSelections, [{ sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-chat' }]);
+  assert.equal(runtime.judgeVerdicts.has(todo.id), false);
+  await runtime.stop();
+});
+
+test('reply signature setting flows into dispatched prompts', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.state.settings.replySignature = true;
+  runtime.state.settings.signatureText = '';
+  const [todo] = normalizeTodos([directNoteTodo]);
+  const result = await runtime.dispatch(todo);
+  assert.equal(result.ok, true);
+  const promptCall = calls.invocations.find((call) => call.method === 'prompt');
+  assert.match(promptCall.args.request.content[0].text, /署名「—— 由 AI 助手代复」/);
   await runtime.stop();
 });

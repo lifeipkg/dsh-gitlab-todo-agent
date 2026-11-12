@@ -7,18 +7,24 @@ import { fileURLToPath } from 'node:url';
 import { DshHostClient } from './dsh-host.js';
 import {
   assessClosure,
+  buildBatchJudgePrompt,
+  buildInbox,
   buildJudgePrompt,
   buildSessionTitle,
   buildTodoPrompt,
   buildWorkspaceOverview,
   classifyTodo,
+  DEFAULT_SIGNATURE_TEXT,
   discussionsApiPath,
   findRouteTargets,
   initialState,
+  mrApiPath,
+  mrWatchState,
   normalizeMrUrls,
   normalizeState,
   normalizeTodos,
   normalizeWorkspacePath,
+  parseBatchJudgeReply,
   parseJudgeReply,
   publicState,
   selectPendingTodos,
@@ -118,6 +124,8 @@ export class GitlabTodoRuntime {
     this.sessionTimer = null;
     this.dispatchQueue = [];
     this.pumpPromise = null;
+    // 本轮批量预检的判定（todoId → verdict）：派发时消费（taskType 选模型、preferSession 决定路由）。
+    this.judgeVerdicts = new Map();
   }
 
   storageDirectory() {
@@ -322,6 +330,140 @@ export class GitlabTodoRuntime {
     }
   }
 
+  /** 批量预检的同目标会话上下文：给 judge 判断 preferSession（reuse/new）用。 */
+  batchSameTargetContext(todos) {
+    const context = {};
+    for (const todo of todos) {
+      const key = targetKey(todo?.url ?? '');
+      if (!key) continue;
+      const candidates = Object.values(this.state.handled)
+        .filter((record) => record?.sessionId && record.archived !== true && targetKey(record.url) === key)
+        .sort((a, b) => (b.acceptedAt ?? 0) - (a.acceptedAt ?? 0))
+        .slice(0, 2)
+        .map((record) => ({
+          title: record.sessionTitle || record.title,
+          status: record.reportStatus || record.closure,
+          note: record.closureNote || record.reportSummary,
+        }));
+      if (candidates.length > 0) context[todo.id] = candidates;
+    }
+    return context;
+  }
+
+  /**
+   * 批量预检：一次判定本批全部提及（含优先级/重复/类型/路由倾向）。
+   * 任何失败（无 llm、解析不出）返回 null，调用方退回逐条预检。
+   */
+  async judgeBatchVerdicts(todos) {
+    const llm = this.llmRuntime();
+    if (!llm) return null;
+    const route = await this.judgeModel();
+    if (!route) return null;
+    const timeoutMs = Number.isFinite(this.config.judgeBatchTimeoutMs)
+      ? Math.max(1000, this.config.judgeBatchTimeoutMs)
+      : 60000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    timer.unref?.();
+    try {
+      const messages = [{
+        role: 'user',
+        content: buildBatchJudgePrompt(todos, { sameTarget: this.batchSameTargetContext(todos) }),
+      }];
+      let stream;
+      if (typeof llm.prepareCall === 'function') {
+        const prepared = await llm.prepareCall(route, controller.signal);
+        stream = prepared.stream({ ...prepared.config, messages, signal: controller.signal });
+      } else {
+        stream = llm.stream({ ...route, messages, signal: controller.signal });
+      }
+      let text = '';
+      for await (const chunk of stream) {
+        const piece = chunk?.text ?? chunk?.delta?.text ?? chunk?.content ?? '';
+        if (typeof piece === 'string') text += piece;
+        if (text.length > 60000) break;
+      }
+      return parseBatchJudgeReply(text);
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 预检入口：先批量，失败退回逐条；判定不需要处理或同批重复的直接标记完成。
+   * 返回仍需开会话的 Todo，按 judge 优先级（1 最先）稳定排序；
+   * 判定存入 judgeVerdicts，派发时消费（taskType 选模型、preferSession 决定是否路由复用）。
+   */
+  async precheckMentions(mentions) {
+    let verdicts = await this.judgeBatchVerdicts(mentions);
+    if (!verdicts) {
+      const fallback = await mapLimit(mentions, PRECHECK_CONCURRENCY,
+        async (todo) => [todo.id, await this.judgeNeedsProcessing(todo)]);
+      verdicts = new Map(fallback);
+    }
+    for (const todo of mentions) {
+      if (!verdicts.has(todo.id)) {
+        verdicts.set(todo.id, {
+          needsProcessing: true, reason: '', taskType: '', priority: 3, duplicateOf: '', preferSession: 'reuse',
+        });
+      }
+    }
+    // 重复折叠的判定条件：duplicateOf 指向本批另一条“需要处理”的 Todo，且两者在同一个
+    // 目标对象上（去掉 note 锚点后同源）——跨讨论串的重复提问不折叠，否则另一线程将无人回应。
+    const foldableInto = (todo, verdict) => {
+      const target = verdict.duplicateOf && verdict.duplicateOf !== todo.id
+        ? mentions.find((item) => item.id === verdict.duplicateOf)
+        : null;
+      if (!target) return null;
+      if (verdicts.get(verdict.duplicateOf)?.needsProcessing !== true) return null;
+      if (targetKey(target.url) !== targetKey(todo.url) || !targetKey(todo.url)) return null;
+      return target;
+    };
+    // 被别的重复项指向的主条目集合：主条目自身不再折叠（避免 a→b、b→a 互相指向时双双标完成）。
+    const referencedPrimaries = new Set();
+    for (const todo of mentions) {
+      const target = foldableInto(todo, verdicts.get(todo.id));
+      if (target) referencedPrimaries.add(target.id);
+    }
+    const ready = [];
+    for (const todo of mentions) {
+      const verdict = verdicts.get(todo.id);
+      const target = foldableInto(todo, verdict);
+      const duplicate = Boolean(target) && !referencedPrimaries.has(todo.id);
+      if (!verdict.needsProcessing || duplicate) {
+        const reason = duplicate
+          ? `与 Todo ${verdict.duplicateOf} 是同一请求，随主条目合并处理`
+          : verdict.reason;
+        try {
+          await this.markTodoDone(todo);
+          this.state.handled[todo.id] = {
+            id: todo.id,
+            sessionId: null,
+            outcome: 'precheck-skipped',
+            automatic: true,
+            acceptedAt: Date.now(),
+            skipReason: reason,
+            title: todo.title,
+            url: todo.url,
+            project: todo.project,
+          };
+        } catch (error) {
+          this.ctx.logger?.warn?.(`[gitlab-todo-agent] 预检跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
+        }
+        this.judgeVerdicts.delete(todo.id);
+        continue;
+      }
+      this.judgeVerdicts.set(todo.id, verdict);
+      ready.push(todo);
+    }
+    return ready
+      .map((todo) => ({ todo, priority: Number(verdicts.get(todo.id)?.priority) || 3 }))
+      .sort((a, b) => a.priority - b.priority)
+      .map((entry) => entry.todo);
+  }
+
   concurrencyLimit() {
     const value = Number(this.state?.settings?.maxConcurrentSessions);
     return Number.isSafeInteger(value) && value >= 1 ? Math.min(value, 10) : 2;
@@ -478,6 +620,7 @@ export class GitlabTodoRuntime {
       automatic: pending.automatic !== false,
       routed: pending.routed === true,
       routeMode: pending.routeMode ?? '',
+      taskType: pending.taskType || previous?.taskType || '',
       requestId: pending.requestId ?? '',
       sessionTitle: pending.sessionTitle || buildSessionTitle(item, round),
       archived: false,
@@ -743,6 +886,7 @@ export class GitlabTodoRuntime {
         record.closure = 'closed';
         record.closureNote = 'Todo 已不在待办列表（已被标记完成）';
         record.nextAttemptAt = null;
+        record.watch = null;
         await this.archiveRecord(record);
         changed = true;
       }
@@ -756,7 +900,11 @@ export class GitlabTodoRuntime {
     const item = record.item ?? this.state.todos.find((todo) => todo.id === record.id) ?? null;
     // 会话判定为“仅被提及”且 Todo 已标记完成：本就不该回复，不核对讨论串。
     const mentionOnly = record.reportNoAction === true && !todoPending;
-    const replied = item?.noteId && !mentionOnly ? await this.checkReplied(item) : null;
+    // since 留 120 秒余量：本机时钟快于 GitLab 时，本轮回复的 created_at 可能早于派发时间。
+    const replyInfo = item?.noteId && !mentionOnly
+      ? await this.checkThreadReply(item, (record.acceptedAt ?? 0) - 120_000)
+      : null;
+    const replied = replyInfo ? replyInfo.replied : null;
     const round = record.round ?? 1;
     let followUpBlocked = '';
     if (record.automatic === false) followUpBlocked = '手动派发的会话不自动续办';
@@ -777,10 +925,18 @@ export class GitlabTodoRuntime {
       baseDelayMinutes: settings.followUpDelayMinutes,
     });
     record.replied = replied;
+    // 本轮有新的我方回复时更新快照（面板回复预览/收件箱展示）；本轮没回复保留旧值。
+    if (replyInfo?.reply) record.lastReply = replyInfo.reply;
     if (mentionOnly && verdict.closure === 'closed') verdict.note = `仅被提及，无需处理：${record.reportSummary || '会话判定无行动要求'}`.slice(0, 500);
     record.closure = verdict.closure;
     record.closureNote = verdict.note;
     record.nextAttemptAt = verdict.closure === 'follow-up' ? Date.now() + verdict.delayMinutes * 60000 : null;
+    // 事件驱动续办：waiting 且挂着未合并 MR 时建立监视器（MR 状态翻转提前续办，定时器兜底）。
+    record.watch = null;
+    if (verdict.closure === 'follow-up' && record.reportStatus === 'waiting'
+      && Array.isArray(record.openMrs) && record.openMrs.length > 0) {
+      record.watch = { mrs: record.openMrs.slice(0, 3), lastStates: {} };
+    }
     // 需人工接手的会话保留不归档，方便人直接打开接着做；闭环或已排续办的才归档。
     if (verdict.closure !== 'needs-human') await this.archiveRecord(record);
   }
@@ -807,9 +963,22 @@ export class GitlabTodoRuntime {
    * 核对原 note 所在讨论串里、原 note 之后是否有我方账号的回复。
    * true/false 为确定结论；null 为无法判断（目标类型不支持、接口失败、没找到讨论串），按未知处理。
    */
-  async checkReplied(item) {
+  /**
+   * 核对原 note 所在讨论串里、原 note 之后是否有我方账号的回复，并取回本轮最新一条我方回复。
+   * replied true/false 为确定结论；返回 null 为无法判断（目标类型不支持、接口失败、没找到讨论串）。
+   * reply 只取 created_at 不早于 since（本轮派发时间）的最新一条；本轮没有新回复时为 null，
+   * 由调用方保留记录上已有的快照。
+   */
+  async checkThreadReply(item, since = 0) {
     const api = discussionsApiPath(item?.url);
     if (!api || !item?.noteId || !this.gitlabUserId) return null;
+    const baseUrl = String(item.url ?? '').split('#')[0];
+    const capture = (note) => ({
+      id: String(note.id ?? ''),
+      body: String(note.body ?? '').trim().slice(0, 2000),
+      url: baseUrl ? `${baseUrl}#note_${note.id}` : '',
+      createdAt: Date.parse(note.created_at ?? '') || null,
+    });
     try {
       for (let page = 1; page <= MAX_DISCUSSION_PAGES; page += 1) {
         const stdout = await this.runGlab(['api', '-X', 'GET', api, '-F', 'per_page=100', '-F', `page=${page}`]);
@@ -819,9 +988,17 @@ export class GitlabTodoRuntime {
           const notes = Array.isArray(discussion?.notes) ? discussion.notes : [];
           const index = notes.findIndex((note) => String(note?.id) === item.noteId);
           if (index < 0) continue;
-          return notes.slice(index + 1).some((note) => note
+          const ours = notes.slice(index + 1).filter((note) => note
             && note.system !== true
             && String(note.author?.id ?? '') === this.gitlabUserId);
+          if (ours.length === 0) return { replied: false, reply: null };
+          // 时间解析失败的 note 视为本轮产物（保守捕获，宁可多取不可漏取）。
+          const fresh = ours.filter((note) => {
+            const at = Date.parse(note.created_at ?? '');
+            return !Number.isFinite(since) || !Number.isFinite(at) || at >= since;
+          });
+          const chosen = fresh.length > 0 ? fresh[fresh.length - 1] : null;
+          return { replied: true, reply: chosen ? capture(chosen) : null };
         }
         if (discussions.length < 100) break;
       }
@@ -865,6 +1042,55 @@ export class GitlabTodoRuntime {
       }));
   }
 
+  /**
+   * 事件驱动续办：逐条核对“待续办 + waiting + openMrs”记录监视的 MR。
+   * 状态从 running/未知翻转为流水线结果、合并或关闭时，把续办提前到本轮（nextAttemptAt=now），
+   * 并清掉监视器（一次事件只触发一次；下一轮会话若仍 waiting 会重建）。
+   * 定时续办不受影响，始终作为兜底。API 失败的 MR 跳过本轮。
+   */
+  async refreshWatches() {
+    if (this.stopping) return { changed: false, triggered: false };
+    let changed = false;
+    let triggered = false;
+    // 同一轮内按 API 路径去重：同一 MR 被多条记录监视时只请求一次。
+    const detailCache = new Map();
+    for (const record of Object.values(this.state.handled)) {
+      if (record?.closure !== 'follow-up' || !Array.isArray(record.watch?.mrs) || record.watch.mrs.length === 0) continue;
+      if (this.dispatches.has(record.id) || this.isTodoTracked(record.sessionId, record.id)) continue;
+      let fired = false;
+      for (const mrUrl of [...record.watch.mrs]) {
+        const api = mrApiPath(mrUrl);
+        if (!api) continue;
+        let detail = detailCache.get(api);
+        if (detail === undefined) {
+          try {
+            detail = JSON.parse(await this.runGlab(['api', '-X', 'GET', api]));
+          } catch {
+            detail = null;
+          }
+          detailCache.set(api, detail);
+        }
+        if (detail == null) continue;
+        const state = mrWatchState(detail);
+        const previous = record.watch.lastStates[mrUrl] ?? '';
+        if (previous === state) continue;
+        record.watch.lastStates[mrUrl] = state;
+        changed = true;
+        if (state === 'merged' || state === 'closed' || state.startsWith('pipeline:')) {
+          fired = true;
+          break;
+        }
+      }
+      if (fired) {
+        record.nextAttemptAt = Date.now();
+        record.watch = null;
+        triggered = true;
+        this.ctx.logger?.info?.(`[gitlab-todo-agent] Todo ${record.id} 等待的 MR 状态翻转，提前触发续办。`);
+      }
+    }
+    return { changed, triggered };
+  }
+
   /** 把到期的续办排进派发队列；同一对象上有别的会话在跑时顺延到下一轮。 */
   enqueueFollowUps() {
     const now = Date.now();
@@ -878,6 +1104,7 @@ export class GitlabTodoRuntime {
         record.closure = 'needs-human';
         record.closureNote = `${record.closureNote}；缺少 Todo 数据，无法续办`.replace(/^；/, '');
         record.nextAttemptAt = null;
+        record.watch = null;
         continue;
       }
       if (this.targetBusy(item)) continue;
@@ -975,7 +1202,14 @@ export class GitlabTodoRuntime {
         .filter((todo) => !this.dispatches.has(todo.id) && !this.state.pending[todo.id]);
       this.state.lastNewCount = candidates.length;
       if (this.state.settings.enabled && this.state.settings.autoProcess) {
-        // 0) 到期的续办先入队：先把已经开了头的事收尾，再开新的。
+        // 上轮残留的预检判定：Todo 已由其他路径出结果时清掉，避免派发时误用。
+        for (const todoId of [...this.judgeVerdicts.keys()]) {
+          const handled = this.state.handled[todoId];
+          if (handled && (!handled.sessionId || handled.outcome !== 'session-accepted')) this.judgeVerdicts.delete(todoId);
+        }
+        // 0) 事件驱动续办：waiting 记录监视的 MR 状态翻转即把续办提前到本轮；定时器仍作兜底。
+        if (this.state.settings.followUpEnabled !== false) await this.refreshWatches();
+        // 0.1) 到期的续办先入队：先把已经开了头的事收尾，再开新的。
         if (this.state.settings.followUpEnabled !== false) this.enqueueFollowUps();
         // 0.1) pending 是可能已被 Host 接受的消息：不参与下面的二次预检，但必须自动重试。
         this.enqueuePendingRetries();
@@ -1003,37 +1237,13 @@ export class GitlabTodoRuntime {
             }
           }
         }
-        // 2) LLM 快速预检：在轮询阶段并行完成（不占用会话并发槽，也不阻塞队列），
-        //    只有判定需要处理的 Todo 才进入派发队列，槽位空闲时会话可立即创建。
+        // 2) LLM 批量预检：一次判定本批全部提及（优先级/重复/类型/路由倾向），
+        //    批量解析失败自动退回逐条预检；只有判定需要处理的 Todo 进入派发队列。
         let mentions = candidates
           .filter((todo) => !this.state.handled[todo.id] && classifyTodo(todo, this.gitlabUserId) === 'direct-mention')
           .slice(0, this.state.settings.maxSessionsPerPoll);
         if (this.state.settings.precheckEnabled && mentions.length > 0) {
-          const ready = [];
-          await mapLimit(mentions, PRECHECK_CONCURRENCY, async (todo) => {
-            const verdict = await this.judgeNeedsProcessing(todo);
-            if (!verdict.needsProcessing) {
-              try {
-                await this.markTodoDone(todo);
-                this.state.handled[todo.id] = {
-                  id: todo.id,
-                  sessionId: null,
-                  outcome: 'precheck-skipped',
-                  automatic: true,
-                  acceptedAt: Date.now(),
-                  skipReason: verdict.reason,
-                  title: todo.title,
-                  url: todo.url,
-                  project: todo.project,
-                };
-              } catch (error) {
-                this.ctx.logger?.warn?.(`[gitlab-todo-agent] 预检跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
-              }
-              return;
-            }
-            ready.push(todo);
-          });
-          mentions = ready;
+          mentions = await this.precheckMentions(mentions);
         }
         this.enqueueDispatch(mentions);
         void this.pump();
@@ -1421,16 +1631,60 @@ export class GitlabTodoRuntime {
     }
   }
 
+  /**
+   * 收件箱“我已处理”：人工确认一条 needs-human 记录——尽力把 Todo 标记完成、
+   * 记录确认时间（收件箱据此移出）、闭环并按设置归档会话。
+   * 标记完成失败不阻塞确认，原因写进结论。
+   */
+  async acknowledgeNeedsHuman(todoId) {
+    const record = this.state.handled[String(todoId ?? '')];
+    if (!record?.sessionId || record.closure !== 'needs-human') {
+      return { ok: false, error: '该 Todo 不在需人工收件箱中。' };
+    }
+    const item = record.item ?? this.state.todos.find((todo) => todo.id === record.id) ?? null;
+    let note = '人工确认已处理';
+    if (item) {
+      try {
+        await this.markTodoDone(item);
+      } catch (error) {
+        note = `人工确认已处理（标记完成失败：${errorMessage(error).slice(0, 200)}）`;
+      }
+    }
+    record.acknowledgedAt = Date.now();
+    record.closure = 'closed';
+    record.closureNote = note;
+    record.nextAttemptAt = null;
+    record.watch = null;
+    record.pendingUnconfirmed = false;
+    await this.archiveRecord(record);
+    // 回合异常结束的会话不会被自动归档：把这一情况写进结论，提示去“最近会话”手动处理。
+    if (record.archived !== true && record.executionStatus !== 'completed') {
+      record.closureNote = `${note}（会话回合异常未归档，可在最近会话手动归档）`.slice(0, 500);
+    }
+    await this.persistQuietly('人工确认');
+    this.wakeWaiters();
+    return { ok: true };
+  }
+
   async executeDispatch(todo, force, options = {}) {
     const trackSlot = Boolean(options.trackSlot);
     const followUp = Boolean(options.followUp);
     const pending = this.state.pending[todo.id];
+    // 批量预检判定：仅“首次自动派发”形态（trackSlot 且非重试/续办/手动/路由）消费；
+    // 其余形态直接丢弃，避免手动会话被换成任务类型模型。派发即消费，不重复使用旧判定。
+    const verdictEligible = trackSlot && !force && !followUp && !pending && !options.route;
+    const judge = verdictEligible ? (this.judgeVerdicts.get(todo.id) ?? null) : null;
+    this.judgeVerdicts.delete(todo.id);
     // pending 代表可能已被 Host 接受的消息；无论是否 force，都只能复用原会话与 requestId。
     let sessionId = options.route ? null : (pending?.sessionId ?? null);
     let route = null;
     // 同一 Todo 已有过会话再开新会话（自动续办或手动重新处理）：延续链路，轮次 +1。
     const previous = this.state.handled[todo.id];
     const continuing = Boolean(force && previous?.sessionId);
+    // 任务类型：预检判定优先；续办沿用上一轮分类；未分类（''）跟随会话模型。
+    const taskType = judge?.taskType && judge.taskType !== 'other'
+      ? judge.taskType
+      : (continuing ? (previous?.taskType ?? '') : '');
     const round = continuing ? (previous.round ?? 1) + 1 : 1;
     const firstAcceptedAt = continuing ? (previous.firstAcceptedAt ?? previous.acceptedAt) : Date.now();
     const history = continuing
@@ -1487,7 +1741,8 @@ export class GitlabTodoRuntime {
           route = await this.resolveRouteTarget(todo, options.route, true);
           sessionId = route.sessionId;
         }
-      } else if (trackSlot && !force && !followUp && !pending && this.state.settings.autoRoute) {
+      } else if (trackSlot && !force && !followUp && !pending && this.state.settings.autoRoute && judge?.preferSession !== 'new') {
+        // 预检判定“虽同对象但主题无关”（preferSession=new）时不复用旧会话；
         // 候选按新到旧逐个过宿主校验（存在性/外部归档/负载）：最新的失败不排除次新可用者。
         for (const candidate of findRouteTargets(this.state.handled, todo, {
           loadOf: (id) => this.countSessionLoad(id),
@@ -1523,6 +1778,7 @@ export class GitlabTodoRuntime {
           followUp,
           routed: true,
           routeMode: route.mode,
+          taskType,
           requestId,
           round,
           firstAcceptedAt,
@@ -1548,6 +1804,7 @@ export class GitlabTodoRuntime {
           automatic: trackSlot,
           followUp,
           routed: false,
+          taskType,
           requestId,
           round,
           firstAcceptedAt,
@@ -1562,11 +1819,16 @@ export class GitlabTodoRuntime {
         this.releaseReservation();
         reserved = false;
       }
-      if (!route && this.state.settings.sessionModel) {
-        await this.host.selectModel({
-          sessionId,
-          ...this.state.settings.sessionModel,
-        });
+      if (!route) {
+        // 按任务类型选模型：预检分类命中且配置了映射时优先，否则用会话模型；路由会话不改模型。
+        const typeModel = taskType ? (this.state.settings.taskModels?.[taskType] ?? null) : null;
+        const modelSelection = typeModel ?? this.state.settings.sessionModel;
+        if (modelSelection) {
+          await this.host.selectModel({
+            sessionId,
+            ...modelSelection,
+          });
+        }
       }
       const settings = this.state.settings;
       const followUpsAllowed = settings.followUpEnabled !== false ? settings.maxFollowUps : 0;
@@ -1589,6 +1851,9 @@ export class GitlabTodoRuntime {
             autoFollowUp,
             followUpDelayMinutes: settings.followUpDelayMinutes,
             customRules: settings.customRules,
+            signature: settings.replySignature
+              ? (settings.signatureText || DEFAULT_SIGNATURE_TEXT)
+              : '',
             waitBudgetMinutes: WAIT_BUDGET_MINUTES,
             history,
             carriedMrs,
@@ -1615,6 +1880,7 @@ export class GitlabTodoRuntime {
         url: todo.url,
         project: todo.project,
         round,
+        taskType,
         firstAcceptedAt,
         history,
         // 链路上累计的未合并 MR：没有新结案报告时沿用上一轮的记录。
@@ -1686,6 +1952,14 @@ export class GitlabTodoRuntime {
       if (body.action === 'sessions') {
         // “最近会话”分页：首页默认 30 条，limit 上限 100，offset 由客户端翻页推进。
         return jsonResponse(200, { ok: true, ...sessionPage(this.state, body.offset, body.limit) });
+      }
+      if (body.action === 'inbox') {
+        // 需人工收件箱：未确认的 needs-human 记录全集（面板轮询刷新）。
+        return jsonResponse(200, { ok: true, items: buildInbox(this.state) });
+      }
+      if (body.action === 'acknowledge' && (typeof body.todoId === 'string' || typeof body.todoId === 'number')) {
+        const result = await this.acknowledgeNeedsHuman(String(body.todoId));
+        return jsonResponse(200, { ok: true, result, state: this.snapshot() });
       }
       if (body.action === 'setSessionArchived' && typeof body.sessionId === 'string') {
         const result = await this.setSessionArchived(body.sessionId, body.archived === true);
