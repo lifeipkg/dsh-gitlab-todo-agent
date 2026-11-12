@@ -176,6 +176,13 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   assert.match(prompt, /discussions\/<discussion-id>\/notes/);
   assert.match(prompt, /不可信/);
   assert.match(prompt, /只有实际完成/);
+  // 危险操作护栏：自动触发、未经他人明确要求或同意不执行危险写操作（rebuild_dev 事件后加入）。
+  assert.match(prompt, /由插件轮询 GitLab Todo 自动触发/);
+  assert.match(prompt, /唯一的任务来源/);
+  assert.match(prompt, /危险操作护栏/);
+  assert.match(prompt, /rebuild_dev/);
+  assert.match(prompt, /绝不主动触发、重试或“顺手修复”/);
+  assert.match(prompt, /只做原 note（及讨论串中随后明确要求）的事/);
   // MR 合并条款（通用默认）：遵循工作区/目标仓库既有规则，未明确允许不自行合并。
   assert.match(prompt, /AGENTS\.md／CLAUDE\.md/);
   assert.match(prompt, /是否合并、何时合并遵循当前工作区与目标仓库的既有规则/);
