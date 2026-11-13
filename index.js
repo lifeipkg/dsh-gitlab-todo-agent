@@ -17,6 +17,7 @@ import {
   DEFAULT_SIGNATURE_TEXT,
   discussionsApiPath,
   findRouteTargets,
+  handledPage,
   initialState,
   mrApiPath,
   mrWatchState,
@@ -2257,6 +2258,10 @@ export class GitlabTodoRuntime {
       if (body.action === 'inbox') {
         // 需人工收件箱：未确认的 needs-human 记录全集（面板轮询刷新）。
         return jsonResponse(200, { ok: true, items: buildInbox(this.state) });
+      }
+      if (body.action === 'handled') {
+        // “已处理”分页：不过滤跳过项，让规则/预检判定在面板上可见。默认 50 条/页。
+        return jsonResponse(200, { ok: true, ...handledPage(this.state, body.offset, body.limit) });
       }
       if (body.action === 'acknowledge' && (typeof body.todoId === 'string' || typeof body.todoId === 'number')) {
         const result = await this.acknowledgeNeedsHuman(String(body.todoId));

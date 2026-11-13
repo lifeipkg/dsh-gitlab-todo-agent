@@ -53,7 +53,7 @@
 1. 确保 `glab` 已登录且能访问目标 GitLab。
 2. 打开左侧 **GitLab Todo** 页面。插件默认停用，不会安装后立即创建 Session。
 3. 在 **设置** 中配置轮询间隔、每轮上限与自动处理并发数（默认 2）；也可直接用页头的模型下拉选择新会话模型。确认后再启用自动轮询。
-4. 状态栏下方通过 **Todo 列表 / 最近会话 / 工作区** Tab 切换：Todo 列表可区域滚动，带有 **评论中 @ 我** 标签的事项会进入自动处理范围；**最近会话** 按接受时间倒序展示插件创建的全部会话，分页加载（首页 30 条，**加载更多** 追加，打开该 Tab 期间每 10 秒静默刷新已加载范围），每行带执行状态、闭环标签与自动/手动来源，可点 **归档 / 取消归档** 快捷切换（仍执行中的会话不可归档），点击标题回源 GitLab，点击 **打开 Session** 进入对应会话。
+4. 状态栏下方通过 **收件箱 / Todo 列表 / 已处理 / 最近会话 / 工作区** Tab 切换：Todo 列表可区域滚动，带有 **评论中 @ 我** 标签的事项会进入自动处理范围；**已处理** 按活动时刻倒序展示全部处理记录（规则跳过、预检跳过、会话派发与投递中的 pending 都在列，不做任何过滤），默认每页 50 条可加载更多，跳过项直接显示判定理由与被折叠去向——预检结果在此透明可查；**最近会话** 按接受时间倒序展示插件创建的全部会话，分页加载（首页 30 条，**加载更多** 追加，打开该 Tab 期间每 10 秒静默刷新已加载范围），每行带执行状态、闭环标签与自动/手动来源，可点 **归档 / 取消归档** 快捷切换（仍执行中的会话不可归档），点击标题回源 GitLab，点击 **打开 Session** 进入对应会话。
 5. Session 内的 Agent 只有在实际完成后，才会按提示调用 `POST /todos/:id/mark_as_done`。
 
 ## 内置轮询与识别规则
@@ -214,6 +214,7 @@ npm run check
 MIT License。发布到 npm（`npm publish`，scoped 包需公开访问，`publishConfig.access` 已配置）或直接分发仓库均可；使用者的 GitLab 身份、模型选择与工作区都由各自环境决定，插件不携带任何部署方凭据。发布前可先 `npm run pack:check` 核对打包内容。
 - v2.21（状态版本不变）：删除按任务类型选模型（`taskModels` 设置与预检判定的 `taskType` 字段）；所有会话统一用会话模型，预检/手动/路由行为一致；旧状态中的 `taskModels` 与记录字段 `taskType` 在读取时自动丢弃。
 - v2.22（状态版本不变）：设置面板新增`高级选项`折叠区，把 maxQueuePerSession、续办等待分钟数、glab 工作目录、会话附加规则、autoRoute、waitProbeEnabled、followUpReuseSession 收入其中；`busyRouteMode` 与 `routeScope` 仍在主区。
+- v2.26（状态版本不变）：新增 **已处理** Tab——分页展示全部处理记录（规则跳过、预检跳过、会话派发、投递中 pending），默认每页 50 条、打开期间每 10 秒刷新；跳过项显示判定理由、合并去向（mergedInto）与原文摘录，预检黑盒结果从此可查。新增 bridge action `handled` 与 `handledPage`/`handledProjection` 投影。
 - v2.23（状态版本不变）：`handled` 历史按保留策略自动清理（closed/已确认 needs-human 90 天、预检跳过 30 天、已结算硬上限 500），`state.json` 不再无限增长；`checkThreadActivity` 拉讨论串改为按 `updated_at` 降序，通常一页命中。
 - v2.24（状态版本不变）：诊断增强——预检/批量预检流式返回了分片但无正文时，把首个分片的 JSON 预览写进插件日志，便于定位 devin/swe-2 等 agentic 模型的流分片形态。
 - v2.25（状态版本不变）：修复预检/批量预检在 DeepSeek Messages 协议路由下`message.content`为字符串导致`content.some is not a function`的错误——把 `messages[].content` 改为 block 数组 `[{type:'text',text:'...'}]`。

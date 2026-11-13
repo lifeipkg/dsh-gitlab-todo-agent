@@ -1407,6 +1407,101 @@ export function sessionPage(state, offset = 0, limit = 30) {
   };
 }
 
+/**
+ * “已处理”分页投影：handled 里所有 Todo 记录 + pending 中已投递未结算的记录，
+ * 不过滤规则跳过/预检跳过项（这正是面板需要可见的黑盒）。按活动时刻倒序：
+ * 已结算的用 completedAt，未结算的用 acceptedAt；并列时按 todoId 倒序保证稳定。
+ * handled 的投影字段覆盖跳过原因、折叠去向、会话与闭环信息，供面板完整展示。
+ */
+export function handledProjection(state) {
+  const handled = Object.values(state?.handled ?? {})
+    .map((record) => ({
+      todoId: record.id,
+      title: record.title,
+      url: record.url,
+      project: record.project,
+      outcome: record.outcome ?? '',
+      skipReason: record.skipReason ?? '',
+      mergedInto: record.mergedInto ?? null,
+      author: record.author ?? '',
+      excerpt: record.excerpt ?? '',
+      sessionId: record.sessionId ?? null,
+      sessionTitle: record.sessionTitle ?? '',
+      automatic: record.automatic !== false,
+      routed: record.routed === true,
+      routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
+      reused: record.reused === true,
+      executionStatus: record.executionStatus ?? '',
+      executionError: record.executionError ?? '',
+      closure: record.closure ?? '',
+      closureNote: record.closureNote ?? '',
+      reportStatus: record.reportStatus ?? '',
+      reportSummary: record.reportSummary ?? '',
+      round: record.round ?? 1,
+      acceptedAt: record.acceptedAt ?? null,
+      completedAt: record.completedAt ?? null,
+      acknowledgedAt: record.acknowledgedAt ?? null,
+      nextAttemptAt: record.nextAttemptAt ?? null,
+      archived: record.archived === true,
+      pendingUnconfirmed: record.pendingUnconfirmed === true,
+      lastReply: record.lastReply ? { ...record.lastReply } : null,
+      activityAt: Number.isFinite(record.completedAt) ? record.completedAt : (record.acceptedAt ?? 0),
+      pending: false,
+    }));
+  const pending = Object.values(state?.pending ?? {})
+    .filter((record) => Boolean(record?.sessionId) && isRecord(record?.item))
+    .map((record) => ({
+      todoId: record.item.id,
+      title: record.item.title,
+      url: record.item.url,
+      project: record.item.project,
+      outcome: '',
+      skipReason: '',
+      mergedInto: null,
+      author: '',
+      excerpt: '',
+      sessionId: record.sessionId,
+      sessionTitle: record.sessionTitle ?? '',
+      automatic: record.automatic !== false,
+      routed: record.routed === true,
+      routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
+      reused: record.reused === true,
+      executionStatus: 'starting',
+      executionError: '',
+      closure: '',
+      closureNote: '',
+      reportStatus: '',
+      reportSummary: '',
+      round: record.round ?? 1,
+      acceptedAt: record.createdAt ?? null,
+      completedAt: null,
+      acknowledgedAt: null,
+      nextAttemptAt: null,
+      archived: false,
+      pendingUnconfirmed: false,
+      lastReply: null,
+      activityAt: record.createdAt ?? 0,
+      pending: true,
+    }));
+  return [...handled, ...pending]
+    .sort((a, b) => (b.activityAt - a.activityAt) || String(b.todoId).localeCompare(String(a.todoId)));
+}
+
+/**
+ * “已处理”分页：默认 50 条/页，上限 200；total 为投影总数（含 pending）。
+ */
+export function handledPage(state, offset = 0, limit = 50) {
+  const safeOffset = Number.isSafeInteger(offset) && offset >= 0 ? Math.min(offset, 1000000) : 0;
+  const safeLimit = Number.isSafeInteger(limit) && limit >= 1 ? Math.min(limit, 200) : 50;
+  const items = handledProjection(state);
+  return {
+    items: items.slice(safeOffset, safeOffset + safeLimit),
+    total: items.length,
+    offset: safeOffset,
+    limit: safeLimit,
+  };
+}
+
 /** 闭环统计：给面板显示“待续办 / 需人工”。已人工确认的需人工记录不再计数。 */
 export function closureCounts(state) {
   const counts = { followUp: 0, needsHuman: 0, verifying: 0 };
