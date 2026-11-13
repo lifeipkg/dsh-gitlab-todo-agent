@@ -13,6 +13,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   sessionCwd: '',
   sessionModel: null,
   judgeModel: null,
+  // 预检引擎：auto（Jev 优先，不可用时自动回退 LLM）、jev（仅 Jev，失败跳过本轮）、llm（仅聊天模型批量判定）。
+  precheckEngine: 'auto',
+  // Jev 分类器配置：null 用内置 TypeSafe 预设；可指定 provider/model/baseUrl/apiKeyEnv 接自建或 OpenRouter 兼容端。
+  precheckClassifier: null,
   followUpEnabled: true,
   // 续办省 token：纯等待轮由插件用 glab 直接探测（不开会话）；补救类续办优先复用上一轮会话。
   waitProbeEnabled: true,
@@ -41,6 +45,178 @@ export const HANDLED_SKIPPED_RETENTION_DAYS = 30;
 export const HANDLED_SETTLED_MAX = 500;
 /** busyRouteMode 与 routeMode 的合法取值：queue 排队下一回合，steer 在当前回合下一步插入引导。 */
 export const ROUTE_MODES = ['queue', 'steer'];
+
+/** 预检引擎合法取值：auto 自动（Jev 优先回退 LLM）、jev 仅 Jev（不可用则跳过本轮）、llm 仅聊天模型。 */
+export const PRECHECK_ENGINES = ['auto', 'llm', 'jev'];
+
+/**
+ * System One / Jev 分类器的服务预设。provider → { modelId, baseUrl, apiKeyEnv, accountIdEnv?, headers? }。
+ * 只定义“默认在哪、怎么取凭证”，调用面是统一的 /systemone；用户可用 precheckClassifier 覆盖。
+ */
+export const SYSTEMONE_PRESETS = {
+  typesafe: { modelId: 'jev-latest', baseUrl: 'https://api.typesafe.ai/v1/', apiKeyEnv: 'TYPESAFE_API_KEY' },
+  openrouter: { modelId: 'typesafe/jev-latest', baseUrl: 'https://openrouter.ai/api/v1/', apiKeyEnv: 'OPENROUTER_API_KEY' },
+  // opencode/vercel/llama.cpp/openai-decisions 等也可经 precheckClassifier.baseUrl+apiKeyEnv 接入。
+};
+
+/**
+ * System One 判定题面：把聊天提示词的三项判定映射成带概率的结构化提问。
+ * - needs：布尔问，输出 P(yes)；低于/高于阈值之外带置信带，供升级逻辑判断。
+ * - skipReason：选一项理由，枚举固定文案（System One 不产出自由文本）。
+ * - priority：5 档评分，归一化到 1..5。
+ * - preferSession：有同目标候选会话才问 reuse/new。
+ */
+export function buildJevQuestions(todo, { sameTargetSessions = [] } = {}) {
+  const questions = {
+    needs: { type: 'noul', instructions: '这条“其他用户在评论中直接 @ 我”的 GitLab Todo，是否需要我实际处理（回答问题、执行任务、审查代码、查找资料）？纯感谢/附和/与我无关的通报/测试性提及/“仅被提及”都不算。存在任何向我提出的具体问题或行动请求即算需要处理。' },
+    skipReason: {
+      type: 'choice',
+      instructions: '本条 Todo 最接近哪一类“不需要处理”的情形？',
+      criteria: {
+        thanks: '纯感谢、客套、打招呼、附和（+1、表情、无实质请求）',
+        mentionOnly: '仅被提及/知会/抄送/引用我此前发言，评论没有要我做的事或答的问题',
+        statusEcho: '只通报或复读既定进度/状态，我方的回应只会是复述已确认内容',
+        chitchat: '与本工作无关的闲聊',
+        notify: '不需要我回应的通报、公告',
+        test: '测试性提及',
+        other: '其他无需处理',
+      },
+    },
+    priority: {
+      type: 'score',
+      instructions: '本条 Todo 需要处理时的紧急程度（1 最优先：阻塞他人/生产问题；5 最不急）。',
+      criteria: ['最优先', '高', '中', '低', '最低'],
+    },
+  };
+  if (sameTargetSessions.length > 0) {
+    questions.preferSession = {
+      type: 'choice',
+      instructions: '同目标对象上已有会话时，这条请求该并入已有会话续做，还是另开新会话？主题相关并入续做，主题无关开新会话；拿不准选并入。',
+      criteria: {
+        reuse: '并入该目标的已有会话续做',
+        new: '另开新会话',
+      },
+    };
+  }
+  return questions;
+}
+
+/** System One 请求里交给模型的 state：结构化、限长，Todo 数据一律视为待判定数据。 */
+export function buildJevState(todo, { sameTargetSessions = [], batchPeers = [] } = {}) {
+  const entry = {
+    todoId: todo.id,
+    action: todo.action,
+    author: todo.author,
+    project: todo.project,
+    targetType: todo.targetType,
+    title: todo.title,
+    body: text(todo.body).slice(0, 2000),
+    url: todo.url,
+  };
+  if (sameTargetSessions.length > 0) {
+    entry.sameTargetSessions = sameTargetSessions.slice(0, 2).map((session) => ({
+      sessionTitle: text(session?.title).slice(0, 120),
+      lastStatus: text(session?.status).slice(0, 40),
+      lastNote: text(session?.note).slice(0, 160),
+    }));
+  }
+  if (batchPeers.length > 0) {
+    entry.sameBatchPeers = batchPeers.slice(0, 20).map((peer) => ({
+      todoId: peer.id, author: peer.author, title: peer.title,
+    }));
+  }
+  return entry;
+}
+
+/** Jev 跳过理由枚举 → 展示给用户的固定中文理由。 */
+export const JEV_SKIP_REASONS = {
+  thanks: '纯感谢/客套/附和，无需处理',
+  mentionOnly: '仅被提及/知会，无我方行动请求',
+  statusEcho: '仅通报或复读状态，无需我方再处理',
+  chitchat: '无关闲聊',
+  notify: '无需回应的通报',
+  test: '测试性提及',
+  other: '无需处理',
+};
+
+/** 低置信带：needs 概率落入此区间视为不确定，交给 LLM 复核。 */
+export const JEV_UNCERTAIN_LOW = 0.35;
+export const JEV_UNCERTAIN_HIGH = 0.65;
+
+function jevConfidence(answer) {
+  const confidence = Number(answer?.confidence);
+  return Number.isFinite(confidence) && confidence >= 0 && confidence <= 1 ? confidence : 1;
+}
+
+/**
+ * 把一次 System One 应答映射回与聊天判定同构的 verdict。
+ * answers：{ needs:{noul,confidence}, skipReason:{choice,confidence}, priority:{score,confidence}, preferSession?{choice,confidence} }。
+ * 返回 {needsProcessing, reason, priority, preferSession, jev:{needsP,confidence}}；无法读取 needs 概率返回 null。
+ */
+export function verdictFromJevAnswers(answers = {}) {
+  const needsP = Number(answers.needs?.noul);
+  if (!Number.isFinite(needsP)) return null;
+  const needsProcessing = needsP >= 0.5;
+  let reason = '';
+  if (!needsProcessing) {
+    const key = String(answers.skipReason?.choice ?? 'other');
+    reason = JEV_SKIP_REASONS[key] ?? JEV_SKIP_REASONS.other;
+  }
+  const score = Number(answers.priority?.score);
+  const confidence = jevConfidence(answers.needs);
+  return {
+    needsProcessing,
+    reason: reason.slice(0, 200),
+    priority: Number.isFinite(score) ? Math.max(1, Math.min(Math.round(score) + 1, 5)) : 3,
+    preferSession: answers.preferSession?.choice === 'new' ? 'new' : 'reuse',
+    jev: { needsP, confidence, uncertain: needsP >= JEV_UNCERTAIN_LOW && needsP <= JEV_UNCERTAIN_HIGH },
+  };
+}
+
+/** 批内同目标去重候选对：同一 targetKey 且不同 todoId 的条目两两成对，供成对 match 判定。 */
+export function buildJevDuplicatePairs(todos) {
+  const groups = new Map();
+  for (const todo of todos ?? []) {
+    const key = targetKey(todo?.url ?? '');
+    if (!key) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(todo);
+  }
+  const pairs = [];
+  for (const group of groups.values()) {
+    for (let i = 0; i + 1 < group.length; i += 1) {
+      for (let j = i + 1; j < group.length; j += 1) {
+        pairs.push([group[i], group[j]]);
+      }
+    }
+  }
+  return pairs;
+}
+
+/** 成对判定同目标两条 Todo 是否实质同一请求：返回 {duplicate:boolean, confidence} 或 null。 */
+export function verdictFromJevMatch(answers = {}) {
+  const sameP = Number(answers.same?.noul);
+  if (!Number.isFinite(sameP)) return null;
+  return { duplicate: sameP >= 0.5, confidence: jevConfidence(answers.same), sameP };
+}
+
+/** 成对 match 的 System One 提问。 */
+export function buildJevMatchQuestions(a, b) {
+  return {
+    same: {
+      type: 'noul',
+      instructions: '这两条指向同一目标的 GitLab Todo，是否实质上是同一个请求/同一事项的重复？',
+    },
+  };
+}
+
+/** 成对 match 的 state：并排两条待判定 Todo。 */
+export function buildJevMatchState(a, b) {
+  return {
+    a: { todoId: a.id, author: a.author, title: a.title, body: text(a.body).slice(0, 1200), url: a.url },
+    b: { todoId: b.id, author: b.author, title: b.title, body: text(b.body).slice(0, 1200), url: b.url },
+  };
+}
 
 /** 闭环状态：'' 为尚未结算或旧版本记录；verifying 为回合已结束、等待核对 GitLab 事实。 */
 export const CLOSURE_STATES = ['verifying', 'closed', 'follow-up', 'needs-human'];
@@ -187,6 +363,38 @@ export function validateSettings(input, current = defaultSettings()) {
         model: value.model.trim(),
       };
     }
+  }
+  if ('precheckEngine' in input) {
+    if (!PRECHECK_ENGINES.includes(input.precheckEngine)) {
+      throw new Error(`预检引擎必须是 ${PRECHECK_ENGINES.join('/')}。`);
+    }
+    next.precheckEngine = input.precheckEngine;
+  }
+  if ('precheckClassifier' in input) {
+    const value = input.precheckClassifier;
+    if (value !== null) {
+      if (!isRecord(value)) throw new Error('预检分类器必须是 null 或对象。');
+      for (const key of ['provider', 'model', 'baseUrl', 'apiKeyEnv', 'apiKey', 'accountId', 'timeoutMs']) {
+        const field = value[key];
+        if (field === undefined) continue;
+        if (key === 'timeoutMs') {
+          if (!Number.isSafeInteger(field) || field < 1000 || field > 120000) {
+            throw new Error('预检分类器 timeoutMs 必须是 1000 到 120000 之间的整数毫秒。');
+          }
+        } else if (typeof field !== 'string' || field.length > 500) {
+          throw new Error(`预检分类器 ${key} 必须是不超过 500 字符的字符串。`);
+        }
+      }
+    }
+    next.precheckClassifier = value === null ? null : {
+      ...(typeof value.provider === 'string' && value.provider.trim() ? { provider: value.provider.trim() } : {}),
+      ...(typeof value.model === 'string' && value.model.trim() ? { model: value.model.trim() } : {}),
+      ...(typeof value.baseUrl === 'string' && value.baseUrl.trim() ? { baseUrl: value.baseUrl.trim() } : {}),
+      ...(typeof value.apiKeyEnv === 'string' && value.apiKeyEnv.trim() ? { apiKeyEnv: value.apiKeyEnv.trim() } : {}),
+      ...(typeof value.apiKey === 'string' && value.apiKey.trim() ? { apiKey: value.apiKey.trim() } : {}),
+      ...(typeof value.accountId === 'string' && value.accountId.trim() ? { accountId: value.accountId.trim() } : {}),
+      ...(Number.isSafeInteger(value.timeoutMs) ? { timeoutMs: value.timeoutMs } : {}),
+    };
   }
   return next;
 }
@@ -1581,6 +1789,14 @@ export function publicState(state, running = false, currentUserId = null) {
     settings: {
       ...state.settings,
       sessionModel: state.settings.sessionModel ? { ...state.settings.sessionModel } : null,
+      // 分类器 API key 不出主机边界：面板只见是否已配置与尾号，不回传明文。
+      precheckClassifier: state.settings.precheckClassifier
+        ? {
+            ...state.settings.precheckClassifier,
+            apiKey: undefined,
+            apiKeySet: Boolean(state.settings.precheckClassifier.apiKey),
+          }
+        : null,
     },
     todos: state.todos.map((todo) => ({
       ...todo,

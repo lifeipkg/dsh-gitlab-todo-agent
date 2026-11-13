@@ -6,6 +6,24 @@ export function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** 有界并发顺序保持的 map：用于轮询阶段并行跑预检判定。 */
+export async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let index = 0;
+  const runners = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    () => (async () => {
+      while (index < items.length) {
+        const current = index;
+        index += 1;
+        results[current] = await worker(items[current], current);
+      }
+    })(),
+  );
+  await Promise.all(runners);
+  return results;
+}
+
 export function jsonResponse(status, value) {
   return new Response(JSON.stringify(value), {
     status,

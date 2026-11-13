@@ -18,6 +18,7 @@ import { BRIDGE_PATH, MAX_REQUEST_BYTES } from './host/constants.js';
 import { attachRuntimeMethods, errorMessage, jsonResponse } from './host/util.js';
 import { gitlabMethods } from './host/gitlab.js';
 import { precheckMethods } from './host/precheck.js';
+import { precheckJevMethods } from './host/precheck-jev.js';
 import { slotsMethods } from './host/slots.js';
 import { closuresMethods } from './host/closures.js';
 import { followupsMethods } from './host/followups.js';
@@ -31,7 +32,8 @@ const LEGACY_STATE_FILE = join(PACKAGE_DIR, '.runtime', 'state.json');
  * 运行时骨架：状态生命周期（加载/迁移/持久化）、轮询与对账定时器、bridge 入口。
  * 业务方法按域拆分在 host/*.js，启动时 attachRuntimeMethods 挂到本类原型：
  *   host/gitlab.js    glab 子进程、当前用户、Todo 分页、标记完成
- *   host/precheck.js  LLM 预检（单条 + 批量 + 失败降级）
+ *   host/precheck.js  预检调度（LLM 单条 + 批量 + 失败降级 + 引擎选择）
+ *   host/precheck-jev.js  Jev/System One 分类器预检（宿主 classify → jev CLI → HTTP 三层通道）
  *   host/slots.js     并发槽、会话跟踪、对账结算（reconcile）
  *   host/closures.js  闭环裁决（verifySettled / assessClosures / 归档 / 回复核对）
  *   host/followups.js 续办生命周期（MR 监视、等待探测、到期入队、pending 重试）
@@ -202,7 +204,16 @@ export class GitlabTodoRuntime {
   }
 
   async updateSettings(patch) {
-    const next = validateSettings(patch, this.state.settings);
+    // 分类器 apiKey 不回传面板：补丁里缺该字段时保留已存密钥，显式传 '' 才清除。
+    const merged = { ...(patch ?? {}) };
+    if (merged.precheckClassifier && typeof merged.precheckClassifier === 'object') {
+      const stored = this.state.settings.precheckClassifier;
+      const touched = Object.prototype.hasOwnProperty.call(merged.precheckClassifier, 'apiKey');
+      if (!touched && stored?.apiKey) {
+        merged.precheckClassifier = { ...merged.precheckClassifier, apiKey: stored.apiKey };
+      }
+    }
+    const next = validateSettings(merged, this.state.settings);
     this.state.settings = next;
     await this.persistQuietly('设置');
     this.resetTimer();
@@ -289,6 +300,7 @@ export class GitlabTodoRuntime {
 attachRuntimeMethods(GitlabTodoRuntime, [
   gitlabMethods,
   precheckMethods,
+  precheckJevMethods,
   slotsMethods,
   closuresMethods,
   followupsMethods,

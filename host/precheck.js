@@ -6,25 +6,7 @@ import {
   targetKey,
 } from '../core.js';
 import { PRECHECK_CONCURRENCY, PRECHECK_MAX_SKIPS } from './constants.js';
-import { errorMessage } from './util.js';
-
-/** 有界并发顺序保持的 map：用于轮询阶段并行跑 LLM 预检。 */
-async function mapLimit(items, limit, worker) {
-  const results = new Array(items.length);
-  let index = 0;
-  const runners = Array.from(
-    { length: Math.max(1, Math.min(limit, items.length)) },
-    () => (async () => {
-      while (index < items.length) {
-        const current = index;
-        index += 1;
-        results[current] = await worker(items[current], current);
-      }
-    })(),
-  );
-  await Promise.all(runners);
-  return results;
-}
+import { errorMessage, mapLimit } from './util.js';
 
 /** 兼容多种 llm 流分片形态，取出文本增量。 */
 function chunkText(chunk) {
@@ -219,7 +201,7 @@ export const precheckMethods = {
   },
 
   /**
-   * 预检入口：先批量，失败退回逐条；判定不需要处理或同批重复的直接标记完成。
+   * 预检入口：先按 precheckEngine 取判定；判定不需要处理或同批重复的直接标记完成。
    * 预检本身失败的 Todo 本轮跳过（不标记、不开会话），留待下一轮重试；连续失败
    * 记录在 precheckFailures 并周期性告警，可随时手动派发。
    * 返回仍需开会话的 Todo，按 judge 优先级（1 最先）稳定排序；
@@ -227,12 +209,57 @@ export const precheckMethods = {
    */
   async precheckMentions(mentions) {
     this.lastJudgeError = '';
-    let verdicts = await this.judgeBatchVerdicts(mentions);
-    if (!verdicts) {
-      const fallback = await mapLimit(mentions, PRECHECK_CONCURRENCY,
-        async (todo) => [todo.id, await this.judgeNeedsProcessing(todo)]);
-      verdicts = new Map(fallback.filter(([, verdict]) => verdict !== null));
+    const engine = this.state.settings.precheckEngine ?? 'auto';
+    let verdicts = new Map();
+    let engineUsed = 'llm';
+    if (engine !== 'llm' && typeof this.precheckJevVerdicts === 'function') {
+      let jev = null;
+      try {
+        jev = await this.precheckJevVerdicts(mentions);
+      } catch (error) {
+        this.ctx.logger?.warn?.(`[gitlab-todo-agent] Jev 预检整体失败：${errorMessage(error)}`);
+        this.lastJudgeError = `Jev 预检整体失败：${errorMessage(error)}`.slice(0, 300);
+      }
+      if (jev) {
+        engineUsed = 'jev';
+        verdicts = jev.verdicts;
+        // 低置信（P 落在不确定带）的条目交给 LLM 复核：Jev 担快刀，LLM 担边缘。
+        if (jev.uncertain.size > 0) {
+          const rechecked = await mapLimit(mentions.filter((todo) => jev.uncertain.has(todo.id)),
+            PRECHECK_CONCURRENCY, async (todo) => [todo.id, await this.judgeNeedsProcessing(todo)]);
+          for (const [todoId, llmVerdict] of rechecked) {
+            if (llmVerdict) {
+              const prev = verdicts.get(todoId);
+              verdicts.set(todoId, { ...prev, needsProcessing: llmVerdict.needsProcessing, reason: llmVerdict.reason || prev.reason });
+            }
+          }
+        }
+        // auto 模式：Jev 漏判（调用失败/无答案）的条目用 LLM 逐条补齐，不整批回退。
+        if (engine === 'auto') {
+          const missing = mentions.filter((todo) => !verdicts.has(todo.id));
+          if (missing.length > 0) {
+            const filled = await mapLimit(missing, PRECHECK_CONCURRENCY,
+              async (todo) => [todo.id, await this.judgeNeedsProcessing(todo)]);
+            for (const [todoId, llmVerdict] of filled) {
+              if (llmVerdict) verdicts.set(todoId, llmVerdict);
+            }
+          }
+        }
+      } else if (engine === 'auto') {
+        // Jev 整体不可用：auto 自动回退 LLM。
+        engineUsed = 'llm';
+      } else {
+        // engine === 'jev'：严格模式，Jev 不可用就整轮跳过（verdicts 保持空），不走 LLM。
+        engineUsed = 'jev';
+      }
     }
+    if (engineUsed === 'llm') {
+      verdicts = await this.judgeBatchVerdicts(mentions)
+        ?? new Map((await mapLimit(mentions, PRECHECK_CONCURRENCY,
+          async (todo) => [todo.id, await this.judgeNeedsProcessing(todo)]))
+          .filter(([, verdict]) => verdict !== null));
+    }
+    this.lastPrecheckEngine = engineUsed;
     for (const todo of mentions) {
       if (verdicts.has(todo.id)) this.precheckFailures.delete(todo.id);
     }

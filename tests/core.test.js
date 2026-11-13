@@ -7,6 +7,11 @@ import {
   buildBatchJudgePrompt,
   buildDigest,
   buildInbox,
+  buildJevDuplicatePairs,
+  buildJevMatchQuestions,
+  buildJevMatchState,
+  buildJevQuestions,
+  buildJevState,
   buildJudgePrompt,
   buildSessionTitle,
   buildTodoPrompt,
@@ -15,6 +20,7 @@ import {
   findRouteTargets,
   handledPage,
   handledProjection,
+  JEV_SKIP_REASONS,
   mrApiPath,
   mrWatchState,
   parseBatchJudgeReply,
@@ -33,7 +39,10 @@ import {
   publicState,
   selectPendingTodos,
   sessionPage,
+  SYSTEMONE_PRESETS,
   validateSettings,
+  verdictFromJevAnswers,
+  verdictFromJevMatch,
 } from '../core.js';
 import { GitlabTodoRuntime } from '../index.js';
 
@@ -157,6 +166,20 @@ test('settings validation preserves supported fields and drops legacy script fie
   assert.equal(judged.ruleSkipEnabled, false);
   assert.deepEqual(judged.judgeModel, { provider: 'deepseek', model: 'fast-chat' });
   assert.equal(judged.precheckEnabled, true);
+  assert.equal(judged.precheckEngine, 'auto');
+  assert.equal(judged.precheckClassifier, null);
+  const engine = validateSettings({ precheckEngine: 'jev' }, defaultSettings());
+  assert.equal(engine.precheckEngine, 'jev');
+  assert.throws(() => validateSettings({ precheckEngine: 'gpt' }, defaultSettings()), /预检引擎/);
+  assert.throws(() => validateSettings({ precheckEngine: 1 }, defaultSettings()), /预检引擎/);
+  const classifier = validateSettings({
+    precheckClassifier: { provider: ' openrouter ', model: ' typesafe/jev-latest ', apiKeyEnv: ' MY_KEY ', timeoutMs: 20000, apiKey: '', baseUrl: '  ' },
+  }, defaultSettings());
+  assert.deepEqual(classifier.precheckClassifier, { provider: 'openrouter', model: 'typesafe/jev-latest', apiKeyEnv: 'MY_KEY', timeoutMs: 20000 });
+  assert.equal(validateSettings({ precheckClassifier: null }, defaultSettings()).precheckClassifier, null);
+  assert.throws(() => validateSettings({ precheckClassifier: 'typesafe' }, defaultSettings()), /预检分类器/);
+  assert.throws(() => validateSettings({ precheckClassifier: { timeoutMs: 1 } }, defaultSettings()), /timeoutMs/);
+  assert.throws(() => validateSettings({ precheckClassifier: { apiKey: 'x'.repeat(501) } }, defaultSettings()), /apiKey/);
   assert.throws(() => validateSettings({ judgeModel: { provider: 'deepseek' } }, defaultSettings()), /预检模型/);
   assert.throws(() => validateSettings({ ruleSkipEnabled: 'yes' }, defaultSettings()), /ruleSkipEnabled/);
   assert.throws(() => validateSettings({ sessionModel: { provider: 'deepseek' } }, defaultSettings()), /Session 模型/);
@@ -720,6 +743,9 @@ function runtimeWithPrompt(prompt, options = {}) {
   runtime.state = initialState();
   // 旧用例验证“一新 Todo 一新会话”的基线行为；路由专项用例自行开启。
   runtime.state.settings.autoRoute = false;
+  // 预检默认引擎是 auto（Jev 优先）：测试环境可能真的装了 jev CLI，
+  // 不锁死为 llm 会让依赖真实环境的结果不确定；Jev 路径由专项用例自行指定。
+  runtime.state.settings.precheckEngine = 'llm';
   runtime.gitlabUserId = '106';
   runtime.gitlabUsername = 'me';
   runtime.persistQuietly = async () => {};
@@ -3205,4 +3231,203 @@ test('settings validation accepts the follow-up saving switches', () => {
   assert.equal(next.waitProbeEnabled, false);
   assert.equal(next.followUpReuseSession, false);
   assert.throws(() => validateSettings({ followUpReuseSession: 'yes' }, defaultSettings()), /布尔/);
+});
+
+// ---- Jev/System One 预检 ----
+
+test('buildJevQuestions maps every judgment to typed questions with skip-reason criteria', () => {
+  const [todo] = normalizeTodos([directNoteTodo]);
+  const questions = buildJevQuestions(todo);
+  assert.equal(questions.needs.type, 'noul');
+  assert.match(questions.needs.instructions, /@ 我/);
+  assert.equal(questions.skipReason.type, 'choice');
+  assert.deepEqual(Object.keys(questions.skipReason.criteria), Object.keys(JEV_SKIP_REASONS));
+  assert.equal(questions.priority.type, 'score');
+  assert.equal(questions.priority.criteria.length, 5);
+  assert.equal('preferSession' in questions, false);
+  // 有同目标候选会话才出现 preferSession 推测题。
+  const withSession = buildJevQuestions(todo, { sameTargetSessions: [{ title: 't', status: 'done', note: 'n' }] });
+  assert.equal(withSession.preferSession.type, 'choice');
+  assert.deepEqual(Object.keys(withSession.preferSession.criteria).sort(), ['new', 'reuse']);
+});
+
+test('buildJevState carries todo data, same-target sessions and batch peers within length caps', () => {
+  const todo = normalizeTodos([{ ...directNoteTodo, body: 'x'.repeat(5000) }])[0];
+  const state = buildJevState(todo, {
+    sameTargetSessions: [{ title: 't'.repeat(300), status: 'done', note: 'n' }],
+    batchPeers: [{ id: 'p1', author: 'u', title: 'other' }],
+  });
+  assert.equal(state.todoId, 'direct');
+  assert.equal(state.body.length, 2000);
+  assert.equal(state.sameTargetSessions[0].sessionTitle.length, 120);
+  assert.equal(state.sameBatchPeers[0].todoId, 'p1');
+  assert.doesNotThrow(() => JSON.stringify(state));
+});
+
+test('verdictFromJevAnswers normalizes probabilities into the shared verdict shape', () => {
+  const needs = verdictFromJevAnswers({
+    needs: { noul: 0.92, confidence: 0.8 },
+    skipReason: { choice: 'thanks' },
+    priority: { score: 4 },
+    preferSession: { choice: 'new' },
+  });
+  assert.equal(needs.needsProcessing, true);
+  assert.equal(needs.priority, 5);
+  assert.equal(needs.preferSession, 'new');
+  assert.equal(needs.jev.uncertain, false);
+
+  const skip = verdictFromJevAnswers({ needs: { noul: 0.1 }, skipReason: { choice: 'mentionOnly' }, priority: { score: 1 } });
+  assert.equal(skip.needsProcessing, false);
+  assert.equal(skip.reason, JEV_SKIP_REASONS.mentionOnly);
+  assert.equal(skip.priority, 2);
+  assert.equal(skip.preferSession, 'reuse');
+
+  const uncertain = verdictFromJevAnswers({ needs: { noul: 0.5 }, skipReason: { choice: 'other' }, priority: { score: 0 } });
+  assert.equal(uncertain.jev.uncertain, true);
+
+  const unknownReason = verdictFromJevAnswers({ needs: { noul: 0.2 }, skipReason: { choice: 'not-a-key' } });
+  assert.equal(unknownReason.reason, JEV_SKIP_REASONS.other);
+
+  assert.equal(verdictFromJevAnswers({ needs: {} }), null);
+  assert.equal(verdictFromJevAnswers({}), null);
+});
+
+test('duplicate pairs only pair same-target todos and match verdicts are normalized', () => {
+  const [a] = normalizeTodos([{ ...directNoteTodo, id: 'a' }]);
+  const [b] = normalizeTodos([{ ...directNoteTodo, id: 'b', target_url: 'https://gitlab.local/group/project/-/issues/7#note_99' }]);
+  const [other] = normalizeTodos([{ ...directNoteTodo, id: 'other', target_url: 'https://gitlab.local/group/project/-/issues/88#note_1' }]);
+  const pairs = buildJevDuplicatePairs([a, b, other]);
+  assert.equal(pairs.length, 1);
+  assert.deepEqual([pairs[0][0].id, pairs[0][1].id], ['a', 'b']);
+  assert.equal(buildJevDuplicatePairs([a, other]).length, 0);
+
+  assert.deepEqual(verdictFromJevMatch({ same: { noul: 0.9, confidence: 0.7 } }), { duplicate: true, confidence: 0.7, sameP: 0.9 });
+  assert.deepEqual(verdictFromJevMatch({ same: { noul: 0.1 } }), { duplicate: false, confidence: 1, sameP: 0.1 });
+  assert.equal(verdictFromJevMatch({ same: {} }), null);
+
+  const questions = buildJevMatchQuestions(a, b);
+  assert.equal(questions.same.type, 'noul');
+  const state = buildJevMatchState(a, b);
+  assert.equal(state.a.todoId, 'a');
+  assert.equal(state.b.todoId, 'b');
+});
+
+test('SYSTEMONE_PRESETS cover TypeSafe and OpenRouter endpoints with env key names', () => {
+  assert.equal(SYSTEMONE_PRESETS.typesafe.baseUrl, 'https://api.typesafe.ai/v1/');
+  assert.equal(SYSTEMONE_PRESETS.typesafe.modelId, 'jev-latest');
+  assert.equal(SYSTEMONE_PRESETS.typesafe.apiKeyEnv, 'TYPESAFE_API_KEY');
+  assert.equal(SYSTEMONE_PRESETS.openrouter.apiKeyEnv, 'OPENROUTER_API_KEY');
+});
+
+function precheckRuntime({ jevResult = null, jevError = null } = {}) {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.state.settings.precheckEngine = 'auto';
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  runtime.precheckJevVerdicts = jevError
+    ? async () => { throw jevError; }
+    : async () => jevResult;
+  return { runtime, calls };
+}
+
+test('auto engine uses Jev verdicts and dispatches only needs-processing todos', async () => {
+  const { runtime, calls } = precheckRuntime({
+    jevResult: {
+      verdicts: new Map([['direct', {
+        needsProcessing: true, reason: '', priority: 1, preferSession: 'reuse',
+        jev: { needsP: 0.95, confidence: 0.9, uncertain: false },
+      }]]),
+      uncertain: new Set(),
+      transport: 'jev-cli',
+    },
+  });
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 1);
+  assert.equal(runtime.lastPrecheckEngine, 'jev');
+  await runtime.stop();
+});
+
+test('auto engine marks Jev-skipped todos done with the mapped skip reason', async () => {
+  const { runtime, calls } = precheckRuntime({
+    jevResult: {
+      verdicts: new Map([['direct', {
+        needsProcessing: false, reason: '纯感谢/客套/附和，无需处理', priority: 3, preferSession: 'reuse',
+        jev: { needsP: 0.05, confidence: 0.9, uncertain: false },
+      }]]),
+      uncertain: new Set(),
+      transport: 'jev-cli',
+    },
+  });
+  runtime.markTodoDone = async () => {};
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 0);
+  assert.equal(runtime.state.handled.direct.outcome, 'precheck-skipped');
+  assert.equal(runtime.state.handled.direct.skipReason, '纯感谢/客套/附和，无需处理');
+  await runtime.stop();
+});
+
+test('auto engine falls back to the LLM when Jev is unavailable', async () => {
+  const { runtime, calls } = precheckRuntime({ jevResult: null });
+  runtime.ctx.llm = {
+    async prepareCall() {
+      return {
+        config: {},
+        stream: () => ({
+          async *[Symbol.asyncIterator]() {
+            yield { text: '[{"todoId":"direct","needsProcessing":true,"reason":"","priority":1}]' };
+          },
+        }),
+      };
+    },
+    stream() { throw new Error('unused'); },
+  };
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 1);
+  assert.equal(runtime.lastPrecheckEngine, 'llm');
+  await runtime.stop();
+});
+
+test('strict jev engine skips the round when Jev is unavailable', async () => {
+  const { runtime, calls } = precheckRuntime({ jevResult: null });
+  runtime.state.settings.precheckEngine = 'jev';
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 0);
+  assert.match(runtime.state.lastPrecheckError, /预检失败 1\/1/);
+  await runtime.stop();
+});
+
+test('uncertain Jev verdicts are escalated to the LLM in auto mode', async () => {
+  const { runtime, calls } = precheckRuntime({
+    jevResult: {
+      verdicts: new Map([['direct', {
+        needsProcessing: false, reason: '可能无需处理', priority: 3, preferSession: 'reuse',
+        jev: { needsP: 0.5, confidence: 0.3, uncertain: true },
+      }]]),
+      uncertain: new Set(['direct']),
+      transport: 'jev-cli',
+    },
+  });
+  runtime.markTodoDone = async () => {};
+  runtime.ctx.llm = {
+    async prepareCall() {
+      return {
+        config: {},
+        stream: () => ({
+          async *[Symbol.asyncIterator]() { yield { text: '{"needsProcessing":true,"reason":"有明确请求"}' }; },
+        }),
+      };
+    },
+    stream() { throw new Error('unused'); },
+  };
+  await runtime.executePoll('test');
+  await runtime.pump();
+  // LLM 复核翻案为需要处理 → 开会话而不是标完成。
+  assert.equal(calls.create, 1);
+  assert.equal(runtime.state.handled.direct?.outcome, 'session-accepted');
+  await runtime.stop();
 });
