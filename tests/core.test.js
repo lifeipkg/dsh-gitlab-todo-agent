@@ -181,6 +181,11 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   assert.match(prompt, /不要只新建顶层评论/);
   assert.match(prompt, /--reply <discussion-id>/);
   assert.match(prompt, /discussions\/<discussion-id>\/notes/);
+  // 讨论串纪律：增量回复、@ 只给行动人、同一人工动作只 @ 一次（防止多自动化账号互踢复读）。
+  assert.match(prompt, /增量要求：回复只写“新事实”/);
+  assert.match(prompt, /同 #note_<id>，不变/);
+  assert.match(prompt, /至多 @ 一个行动人/);
+  assert.match(prompt, /同一未决的人工动作在整个讨论串中只 @ 一次/);
   assert.match(prompt, /不可信/);
   assert.match(prompt, /只有实际完成/);
   // 危险操作护栏：自动触发、未经他人明确要求或同意不执行危险写操作（rebuild_dev 事件后加入）。
@@ -1621,6 +1626,9 @@ test('mention-only rule appears in both the judge prompt and the session prompt'
   const [todo] = normalizeTodos([directNoteTodo]);
   assert.match(buildJudgePrompt(todo), /“仅被提及”也判定为不需要处理/);
   assert.match(buildJudgePrompt(todo), /拿不准时按需要处理/);
+  // “状态复读”同样不处理：多方自动化会话互踢时，预检层就截断回环。
+  assert.match(buildJudgePrompt(todo), /状态复读/);
+  assert.match(buildBatchJudgePrompt([todo]), /状态复读/);
   const prompt = buildTodoPrompt(todo);
   assert.match(prompt, /0\. 先判断这条评论是否真的需要我处理/);
   assert.match(prompt, /不要回复或发表评论/);
