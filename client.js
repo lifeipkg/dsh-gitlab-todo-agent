@@ -58,7 +58,6 @@ window.__ModuleLoader__.load({
       sessionModelPinDefault: 'Pin the current default model', sessionModelFixedHint: 'Selecting a concrete model pins every new session to that provider/model; it will not follow future default changes.',
       sessionModelUnavailable: 'Currently configured model (not in the available catalog)',
       modelCatalogError: 'Could not load the available model catalog',
-      autoProcess: 'Open sessions automatically for comment mentions from other users (directly addressed or mentioned in the body)',
       precheckEnabled: 'Fast pre-judgment during each poll: mentions that need no handling are marked done directly, in parallel, without opening sessions',
       ruleSkipEnabled: 'Mark pipeline notifications, self-mentions, and description-body mentions done directly by rule (no model call)',
       autoArchive: 'Archive plugin sessions once their loop is closed or a follow-up is scheduled (sessions that need a human stay unarchived)',
@@ -146,7 +145,6 @@ window.__ModuleLoader__.load({
       sessionModelPinDefault: '固定当前默认模型', sessionModelFixedHint: '选择具体模型后，新会话会固定使用该 provider/model，不再随 DSH 默认模型变化。',
       sessionModelUnavailable: '当前配置模型（不在可用目录中）',
       modelCatalogError: '无法加载可用模型目录',
-      autoProcess: '为其他用户在评论中 @ 我的 Todo（直接提及或文中提及）自动创建 Session',
       precheckEnabled: '每轮轮询先并行快速预判：不需要处理的提及直接标记完成，不开会话',
       ruleSkipEnabled: '流水线通知、自己 @ 自己、正文 @ 提及等规则噪声直接标记完成，不经过模型',
       autoArchive: '闭环或已排续办后自动归档会话（仅插件创建的会话；需人工接手的保留不归档）',
@@ -796,20 +794,6 @@ window.__ModuleLoader__.load({
               type: 'number', min: 1, max: 10, value: draft.maxConcurrentSessions,
               onChange: (event) => setDraft({ ...draft, maxConcurrentSessions: Number(event.target.value) }),
             })),
-            h('label', null, t('routeScope'), h('select', {
-              value: draft.routeScope ?? 'plugin',
-              onChange: (event) => setDraft({ ...draft, routeScope: event.target.value }),
-            },
-              h('option', { value: 'plugin' }, t('routeScopePlugin')),
-              h('option', { value: 'any' }, t('routeScopeAny')),
-            )),
-            h('label', null, t('busyRouteMode'), h('select', {
-              value: draft.busyRouteMode ?? 'queue',
-              onChange: (event) => setDraft({ ...draft, busyRouteMode: event.target.value }),
-            },
-              h('option', { value: 'queue' }, t('busyRouteQueue')),
-              h('option', { value: 'steer' }, t('busyRouteSteer')),
-            )),
             h('label', null, t('sessionModel'), h('select', {
               value: sessionModelKey(draft.sessionModel),
               onChange: (event) => setDraft({
@@ -895,6 +879,20 @@ window.__ModuleLoader__.load({
                   type: 'number', min: 1, max: 1440, value: draft.followUpDelayMinutes ?? 15, disabled: draft.followUpEnabled === false,
                   onChange: (event) => setDraft({ ...draft, followUpDelayMinutes: Number(event.target.value) }),
                 })),
+                h('label', null, t('routeScope'), h('select', {
+                  value: draft.routeScope ?? 'plugin',
+                  onChange: (event) => setDraft({ ...draft, routeScope: event.target.value }),
+                },
+                  h('option', { value: 'plugin' }, t('routeScopePlugin')),
+                  h('option', { value: 'any' }, t('routeScopeAny')),
+                )),
+                h('label', null, t('busyRouteMode'), h('select', {
+                  value: draft.busyRouteMode ?? 'queue',
+                  onChange: (event) => setDraft({ ...draft, busyRouteMode: event.target.value }),
+                },
+                  h('option', { value: 'queue' }, t('busyRouteQueue')),
+                  h('option', { value: 'steer' }, t('busyRouteSteer')),
+                )),
                 h('label', { className: 'gta-wide' }, t('cwd'), h('input', {
                   type: 'text', value: draft.cwd, placeholder: t('cwdHint'),
                   onChange: (event) => setDraft({ ...draft, cwd: event.target.value }),
@@ -921,10 +919,6 @@ window.__ModuleLoader__.load({
             ),
             h('p', { className: 'gta-muted gta-wide' }, t('followUpHint')),
           ),
-          h('label', { className: 'gta-check' }, h('input', {
-            type: 'checkbox', checked: draft.autoProcess,
-            onChange: (event) => setDraft({ ...draft, autoProcess: event.target.checked }),
-          }), t('autoProcess')),
           h('label', { className: 'gta-check' }, h('input', {
             type: 'checkbox', checked: draft.precheckEnabled,
             onChange: (event) => setDraft({ ...draft, precheckEnabled: event.target.checked }),

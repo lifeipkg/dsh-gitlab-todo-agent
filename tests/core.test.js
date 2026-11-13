@@ -325,7 +325,6 @@ test('precheck marks a todo done without a session when the judge declines', asy
   let marked = 0;
   runtime.markTodoDone = async () => { marked += 1; };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await runtime.executePoll('test');
   await runtime.pump();
@@ -340,7 +339,6 @@ test('precheck marks a todo done without a session when the judge declines', asy
 test('precheck opens the session when the judge requires handling; judge failures skip the round', async () => {
   const required = runtimeWithLlmJudge('{"needsProcessing":true,"reason":"有具体问题"}');
   required.runtime.state.settings.enabled = true;
-  required.runtime.state.settings.autoProcess = true;
   required.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await required.runtime.executePoll('test');
   await required.runtime.pump();
@@ -350,7 +348,6 @@ test('precheck opens the session when the judge requires handling; judge failure
   // 预检输出不可解析：本轮跳过（不标记、不开会话），Todo 留在待办列表等待下一轮。
   const broken = runtimeWithLlmJudge('模型输出的不是 JSON');
   broken.runtime.state.settings.enabled = true;
-  broken.runtime.state.settings.autoProcess = true;
   broken.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await broken.runtime.executePoll('test');
   await broken.runtime.pump();
@@ -360,7 +357,6 @@ test('precheck opens the session when the judge requires handling; judge failure
   // 无 llm 服务：同样跳过本轮。
   const noLlm = runtimeWithPrompt(async () => ({ accepted: true }));
   noLlm.runtime.state.settings.enabled = true;
-  noLlm.runtime.state.settings.autoProcess = true;
   noLlm.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await noLlm.runtime.executePoll('test');
   await noLlm.runtime.pump();
@@ -395,7 +391,6 @@ test('pipeline notifications are marked done by rule without any model call', as
   runtime.markTodoDone = async () => { marked += 1; };
   runtime.judgeNeedsProcessing = async () => { judged += 1; return { needsProcessing: true, reason: '' }; };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.fetchTodos = async () => normalizeTodos([pipelineTodo, directNoteTodo]);
   await runtime.executePoll('test');
   await runtime.pump();
@@ -418,7 +413,6 @@ test('disabling rule skip keeps pipeline notifications untouched', async () => {
   let marked = 0;
   runtime.markTodoDone = async () => { marked += 1; };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.ruleSkipEnabled = false;
   runtime.fetchTodos = async () => normalizeTodos([pipelineTodo]);
   await runtime.executePoll('test');
@@ -442,7 +436,6 @@ test('poll-stage precheck judges mentions in place and only enqueues the needed 
       : { needsProcessing: true, reason: '有具体问题' };
   };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   const secondMention = { ...directNoteTodo, id: 'direct2', target_url: 'https://gitlab.local/group/project/-/issues/7#note_11' };
   runtime.fetchTodos = async () => normalizeTodos([directNoteTodo, secondMention]);
   await runtime.executePoll('test');
@@ -840,7 +833,6 @@ test('assigned issues are rule-skipped in polls and marked done on manual dispat
   runtime.state.todos = [todo];
   // 轮询：规则直接标记完成。
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.fetchTodos = async () => [todo];
   await runtime.executePoll('test');
   assert.equal(marked, 1);
@@ -886,7 +878,6 @@ test('automatic poll only dispatches direct note mentions from other users', asy
   let marked = 0;
   runtime.markTodoDone = async () => { marked += 1; };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   // 本测试关注“哪些类别进入派发”，预检判定本身另测；关闭预检模拟“判定均需处理”。
   runtime.state.settings.precheckEnabled = false;
   runtime.state.settings.maxSessionsPerPoll = 4;
@@ -927,7 +918,6 @@ test('auto dispatch holds concurrency slots until sessions actually settle', asy
   runtime.config.slotWaitMs = 20;
   runtime.config.sessionPollMs = 20;
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.precheckEnabled = false;
   runtime.state.settings.maxSessionsPerPoll = 4;
   runtime.state.settings.maxConcurrentSessions = 2;
@@ -968,7 +958,6 @@ test('reconcile settles executions by turn/end verdict and never misreads roster
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   runtime.config.sessionPollMs = 20;
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.precheckEnabled = false;
   runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await runtime.executePoll('test');
@@ -1013,7 +1002,6 @@ test('archive refusal and the switch never affect settlement', async () => {
   const refused = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   refused.calls.failArchive = true;
   refused.runtime.state.settings.enabled = true;
-  refused.runtime.state.settings.autoProcess = true;
   refused.runtime.state.settings.precheckEnabled = false;
   refused.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await refused.runtime.executePoll('test');
@@ -1028,7 +1016,6 @@ test('archive refusal and the switch never affect settlement', async () => {
 
   const off = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   off.runtime.state.settings.enabled = true;
-  off.runtime.state.settings.autoProcess = true;
   off.runtime.state.settings.precheckEnabled = false;
   off.runtime.state.settings.autoArchive = false;
   off.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
@@ -1164,7 +1151,6 @@ test('handled page paginates, clamps inputs and marks pending rows', () => {
 test('bridge handled action serves session rows and archive toggling', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.precheckEnabled = false;
   runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await runtime.executePoll('test');
@@ -1209,7 +1195,6 @@ test('bridge handled action serves session rows and archive toggling', async () 
   assert.equal(foreign.result.ok, false);
   const busy = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   busy.runtime.state.settings.enabled = true;
-  busy.runtime.state.settings.autoProcess = true;
   busy.runtime.state.settings.precheckEnabled = false;
   busy.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await busy.runtime.executePoll('test');
@@ -1342,7 +1327,6 @@ function autoRuntime(options = {}) {
     return { accepted: true };
   }, { autoComplete: false });
   built.runtime.state.settings.enabled = true;
-  built.runtime.state.settings.autoProcess = true;
   built.runtime.state.settings.precheckEnabled = false;
   // 既有闭环用例验证“续办 = 新开会话 + 到期即派发”的基线；复用与等待探测由专项用例开启。
   built.runtime.state.settings.followUpReuseSession = false;
@@ -2281,7 +2265,6 @@ test('poll skips repeated precheck but automatically retries pending with the sa
     routeMode: '', requestId: 'pending-request', item: todo,
   };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.precheckEnabled = true;
   runtime.fetchTodos = async () => [todo];
   let judged = 0;
@@ -2358,7 +2341,6 @@ test('externally completed initial pending stops retrying but requires human ver
     requestId: 'unconfirmed-request', item: todo,
   };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.fetchTodos = async () => [];
   await runtime.executePoll('test');
   await runtime.pump();
@@ -2403,7 +2385,6 @@ test('legacy pending without requestId never retries and becomes needs-human wit
   };
   calls.sessions.set('legacy', { running: true, events: [] });
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.fetchTodos = async () => [todo];
   await runtime.reconcileSessions();
   assert.equal(runtime.isTodoTracked('legacy', todo.id), true);
@@ -2658,7 +2639,6 @@ test('batch precheck dispatches by priority and folds duplicates into the primar
   const marked = [];
   runtime.markTodoDone = async (todo) => { marked.push(todo.id); };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.maxSessionsPerPoll = 3;
   runtime.fetchTodos = async () => normalizeTodos([
     // dup 与 main 在同一 Issue 上（重复折叠只作用于同目标对象）。
@@ -2698,7 +2678,6 @@ test('mutual duplicate references never fold both sides of a pair', async () => 
   const marked = [];
   runtime.markTodoDone = async (todo) => { marked.push(todo.id); };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.maxSessionsPerPoll = 2;
   runtime.fetchTodos = async () => normalizeTodos([
     { ...directNoteTodo, id: 'a' },
@@ -2727,7 +2706,6 @@ test('cross-target duplicates are not folded so every thread keeps its reply', a
   const marked = [];
   runtime.markTodoDone = async (todo) => { marked.push(todo.id); };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.maxSessionsPerPoll = 2;
   runtime.fetchTodos = async () => normalizeTodos([
     // 不同 Issue 上的同一问题：不折叠，两个讨论串各自得到回复。
@@ -2751,7 +2729,6 @@ test('missing batch verdicts skip the round instead of dispatching blindly', asy
     stream() { throw new Error('should go through prepareCall'); },
   };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.maxSessionsPerPoll = 2;
   runtime.fetchTodos = async () => normalizeTodos([
     { ...directNoteTodo, id: 'known' },
@@ -3007,7 +2984,6 @@ test('precheck failure reasons are recorded and the model never being reachable 
     stream() { throw new Error('unused'); },
   };
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await runtime.executePoll('test');
   await runtime.pump();
@@ -3026,7 +3002,6 @@ function snapshotError(runtime) {
 
 test('enabling polling while a disabled poll is in flight still runs a full poll afterwards', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
-  runtime.state.settings.autoProcess = true;
   runtime.state.settings.precheckEnabled = false;
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -3329,7 +3304,6 @@ function precheckRuntime({ jevResult = null, jevError = null } = {}) {
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
   runtime.state.settings.precheckEngine = 'auto';
   runtime.state.settings.enabled = true;
-  runtime.state.settings.autoProcess = true;
   runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   runtime.precheckJevVerdicts = jevError
     ? async () => { throw jevError; }
