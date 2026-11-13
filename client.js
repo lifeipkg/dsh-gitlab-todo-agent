@@ -44,7 +44,7 @@ window.__ModuleLoader__.load({
       sessionModelPinDefault: 'Pin the current default model', sessionModelFixedHint: 'Selecting a concrete model pins every new session to that provider/model; it will not follow future default changes.',
       sessionModelUnavailable: 'Currently configured model (not in the available catalog)',
       modelCatalogError: 'Could not load the available model catalog',
-      autoProcess: 'Automatically open sessions only for direct comment mentions from other users',
+      autoProcess: 'Open sessions automatically for comment mentions from other users (directly addressed or mentioned in the body)',
       precheckEnabled: 'Fast pre-judgment during each poll: mentions that need no handling are marked done directly, in parallel, without opening sessions',
       ruleSkipEnabled: 'Mark pipeline notifications, self-mentions, and description-body mentions done directly by rule (no model call)',
       autoArchive: 'Archive plugin sessions once their loop is closed or a follow-up is scheduled (sessions that need a human stay unarchived)',
@@ -74,6 +74,10 @@ window.__ModuleLoader__.load({
       taskModelQuestion: 'Model for questions', taskModelReview: 'Model for code review', taskModelChange: 'Model for code changes',
       taskModelDefault: 'Follow the session model',
       taskModelsHint: 'The batch precheck classifies each todo (question/review/change); each class can use a different model. Unset classes and routed todos use the session model.',
+      confirmMarkDone: 'Confirm mark done?', confirmReprocess: 'Confirm process again?', confirmAcknowledge: 'Confirm mark handled?',
+      signaturePlaceholder: '— Replied by the AI assistant',
+      bridgeTimeout: 'Request timed out (90 seconds). Please try again.', bridgeNetwork: 'Network error: could not reach the plugin service.',
+      colon: ': ',
     };
     const zh = {
       panel: 'GitLab Todo', title: 'GitLab Todo 轮询助手',
@@ -113,7 +117,7 @@ window.__ModuleLoader__.load({
       sessionModelPinDefault: '固定当前默认模型', sessionModelFixedHint: '选择具体模型后，新会话会固定使用该 provider/model，不再随 DSH 默认模型变化。',
       sessionModelUnavailable: '当前配置模型（不在可用目录中）',
       modelCatalogError: '无法加载可用模型目录',
-      autoProcess: '仅为其他用户在评论中直接 @ 我的 Todo 自动创建 Session',
+      autoProcess: '为其他用户在评论中 @ 我的 Todo（直接提及或文中提及）自动创建 Session',
       precheckEnabled: '每轮轮询先并行快速预判：不需要处理的提及直接标记完成，不开会话',
       ruleSkipEnabled: '流水线通知、自己 @ 自己、正文 @ 提及等规则噪声直接标记完成，不经过模型',
       autoArchive: '闭环或已排续办后自动归档会话（仅插件创建的会话；需人工接手的保留不归档）',
@@ -143,18 +147,33 @@ window.__ModuleLoader__.load({
       taskModelQuestion: '咨询问答模型', taskModelReview: '代码审查模型', taskModelChange: '代码修改模型',
       taskModelDefault: '跟随会话模型',
       taskModelsHint: '批量预检会为每条 Todo 分类（question/review/change）；各类可固定不同模型，未配置的类型与路由到已有会话的 Todo 使用会话模型。',
+      confirmMarkDone: '确认标记完成？', confirmReprocess: '确认重新处理？', confirmAcknowledge: '确认已处理？',
+      signaturePlaceholder: '—— 由 AI 助手代复',
+      bridgeTimeout: '请求超时（90 秒），请重试。', bridgeNetwork: '网络错误：无法连接插件服务。',
+      colon: '：',
     };
+
+    // bridge 网络层错误文案：apply 注入 bind 后的 t 之前先用 en 兜底（面板渲染必然晚于 apply）。
+    let bridgeText = (key) => en[key] ?? key;
 
     async function bridge(action, options = {}) {
       const method = options.method ?? (action === 'state' || action === 'models' || action === 'workspaces' ? 'GET' : 'POST');
       const headers = { Accept: 'application/json' };
       if (method === 'POST') headers['Content-Type'] = 'application/json';
       const query = method === 'GET' ? `?action=${encodeURIComponent(action)}` : '';
-      const response = await fetch(`${BRIDGE_PATH}${query}`, {
-        method,
-        headers,
-        body: method === 'POST' ? JSON.stringify({ action, ...(options.payload ?? {}) }) : undefined,
-      });
+      let response;
+      try {
+        response = await fetch(`${BRIDGE_PATH}${query}`, {
+          method,
+          headers,
+          body: method === 'POST' ? JSON.stringify({ action, ...(options.payload ?? {}) }) : undefined,
+          // 与 cordis.patch.yml 的 requestTimeoutMs 对齐：poll 等长操作与其他操作统一 90 秒超时。
+          signal: AbortSignal.timeout(90000),
+        });
+      } catch (cause) {
+        if (cause && (cause.name === 'TimeoutError' || cause.name === 'AbortError')) throw new Error(bridgeText('bridgeTimeout'));
+        throw new Error(bridgeText('bridgeNetwork'));
+      }
       const data = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
       if (!response.ok || data.ok === false) throw new Error(data.error ?? `HTTP ${response.status}`);
       return data;
@@ -244,6 +263,21 @@ window.__ModuleLoader__.load({
       });
     }
 
+    /**
+     * 设置字段级比较：原始值直接比对；sessionModel/taskModels 等嵌套对象递归按字段比对，
+     * 引用不同但等值不算变更；undefined 与 null 归一后视为相同。
+     */
+    function settingsValueEqual(next, prev) {
+      const a = next === undefined ? null : next;
+      const b = prev === undefined ? null : prev;
+      if (a === b) return true;
+      if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
+      const aKeys = Object.keys(a);
+      const bKeys = Object.keys(b);
+      if (aKeys.length !== bKeys.length) return false;
+      return aKeys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && settingsValueEqual(a[key], b[key]));
+    }
+
     function PanelIcon({ size = 20 }) {
       return h('svg', {
         width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
@@ -292,8 +326,13 @@ window.__ModuleLoader__.load({
 
     function TodoPanel({ ctx, t }) {
       const [snapshot, setSnapshot] = React.useState(null);
-      const [busy, setBusy] = React.useState('');
+      // 按 key 隔离的请求互斥：state 驱动各按钮自己的禁用态，ref 保证同 key 重复触发被同步拒绝。
+      const [busyKeys, setBusyKeys] = React.useState([]);
+      const busyKeysRef = React.useRef(new Set());
+      const busySet = new Set(busyKeys);
       const [error, setError] = React.useState(null);
+      // 轮询类错误单独存放：轮询成功即自动清除；操作类错误仍由下一次主动操作清除。
+      const [pollError, setPollError] = React.useState(null);
       const [draft, setDraft] = React.useState(null);
       const [activeTab, setActiveTab] = React.useState('todos');
       const [modelCatalog, setModelCatalog] = React.useState(null);
@@ -421,9 +460,12 @@ window.__ModuleLoader__.load({
         const load = async () => {
           try {
             const next = await getState();
-            if (!disposed) setSnapshot(next);
+            if (!disposed) {
+              setSnapshot(next);
+              setPollError(null);
+            }
           } catch (cause) {
-            if (!disposed) setError(cause.message);
+            if (!disposed) setPollError(cause.message);
           }
         };
         void load();
@@ -435,8 +477,9 @@ window.__ModuleLoader__.load({
       }, []);
 
       const perform = async (key, operation) => {
-        if (busy) return false;
-        setBusy(key);
+        if (busyKeysRef.current.has(key)) return false;
+        busyKeysRef.current.add(key);
+        setBusyKeys([...busyKeysRef.current]);
         setError(null);
         try {
           const data = await operation();
@@ -447,9 +490,48 @@ window.__ModuleLoader__.load({
           setError(cause.message);
           return false;
         } finally {
-          setBusy('');
+          busyKeysRef.current.delete(key);
+          setBusyKeys([...busyKeysRef.current]);
         }
       };
+
+      // 双段确认：不可逆操作第一击只把按钮切到确认文案，3 秒内再次点击才真正执行，超时自动还原。
+      // Map<key, timestamp>：每个按钮独立状态；时间戳兜底，即便还原定时器被节流也不放行过期确认。
+      const [confirmKeys, setConfirmKeys] = React.useState(new Map());
+      const confirmTimers = React.useRef(new Map());
+      const clearConfirm = (key) => {
+        const timer = confirmTimers.current.get(key);
+        if (timer) clearTimeout(timer);
+        confirmTimers.current.delete(key);
+        setConfirmKeys((prev) => {
+          if (!prev.has(key)) return prev;
+          const next = new Map(prev);
+          next.delete(key);
+          return next;
+        });
+      };
+      const guardedRun = (confirmKey, action) => () => {
+        const pendingAt = confirmKeys.get(confirmKey);
+        if (pendingAt && Date.now() - pendingAt <= 3000) {
+          clearConfirm(confirmKey);
+          void action();
+          return;
+        }
+        setConfirmKeys((prev) => {
+          const next = new Map(prev);
+          next.set(confirmKey, Date.now());
+          return next;
+        });
+        clearTimeout(confirmTimers.current.get(confirmKey));
+        confirmTimers.current.set(confirmKey, setTimeout(() => clearConfirm(confirmKey), 3000));
+      };
+      React.useEffect(() => () => {
+        confirmTimers.current.forEach((timer) => clearTimeout(timer));
+        confirmTimers.current.clear();
+      }, []);
+
+      // 模板拼接用冒号：zh 全角“：”，en 半角“: ”，随当前 locale 取词典。
+      const colon = () => t('colon');
 
       const closeRouteTargets = () => {
         routeRequest.current += 1;
@@ -495,7 +577,7 @@ window.__ModuleLoader__.load({
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [routeTodo]);
       const routeToSession = (target) => {
-        if (!routeTodo || !target || target.accepting === false || busy) return;
+        if (!routeTodo || !target || target.accepting === false || busySet.has(`route:${routeTodo.id}`)) return;
         const todoId = routeTodo.id;
         setRouteError(null);
         void perform(`route:${todoId}`, async () => {
@@ -515,11 +597,26 @@ window.__ModuleLoader__.load({
       };
 
       const updateSettings = (settings) => perform('settings', () => post('updateSettings', { settings }));
-      const saveGeneralSettings = () => updateSettings(draft);
+      // 保存时对比当前快照，只提交发生变化的字段（Host 端 updateSettings 为浅合并 patch 语义）：
+      // 面板打开期间页头快捷操作（启停轮询、页头模型下拉）已保存的改动不会被打开面板时的旧 draft 覆盖。
+      const saveGeneralSettings = () => {
+        const current = snapshot?.settings ?? null;
+        const patch = {};
+        let changed = false;
+        Object.keys(draft ?? {}).forEach((key) => {
+          if (!settingsValueEqual(draft[key], current ? current[key] : undefined)) {
+            patch[key] = draft[key];
+            changed = true;
+          }
+        });
+        return changed ? updateSettings(patch) : Promise.resolve(true);
+      };
       const openSession = (sessionId) => ctx.uiWorkspace.openSession(sessionId);
       // 收件箱“我已处理”：成功后连同收件箱一起刷新（snapshot 已由 perform 更新）。
       const acknowledgeInboxItem = (item) => perform(`ack:${item.todoId}`, () => post('acknowledge', { todoId: item.todoId }))
         .then((done) => { if (done) void fetchInbox(); });
+      // Todo 主按钮（开会话/重新处理）与“标记完成”都走 dispatch：Host 端会把非 directMention 的 MR 直接标记完成。
+      const dispatchTodo = (todo) => perform(`dispatch:${todo.id}`, () => post('dispatch', { id: todo.id }));
       // 快捷切换归档状态：成功后连同最近会话页一起刷新。
       const toggleSessionArchive = (record) => perform(`archive:${record.sessionId}`, () => post('setSessionArchived', {
         sessionId: record.sessionId,
@@ -590,20 +687,20 @@ window.__ModuleLoader__.load({
               h('span', null, t('sessionModel')),
               h('select', {
                 value: quickModelKey,
-                disabled: !snapshot || Boolean(busy),
+                disabled: !snapshot || busySet.has('settings'),
                 'aria-label': t('sessionModel'),
                 onChange: (event) => updateSettings({ sessionModel: event.target.value ? JSON.parse(event.target.value) : null }),
               }, modelOptions(settings?.sessionModel)),
             ),
             h(Button, {
               primary: !settings?.enabled,
-              disabled: Boolean(busy) || !snapshot,
+              disabled: busySet.has('settings') || !snapshot,
               onClick: () => updateSettings({ enabled: !settings.enabled }),
             }, settings?.enabled ? t('disable') : t('enable')),
             h(Button, {
-              disabled: Boolean(busy) || !snapshot,
+              disabled: busySet.has('poll') || !snapshot,
               onClick: () => perform('poll', () => post('poll')),
-            }, busy === 'poll' ? t('checking') : t('checkNow')),
+            }, busySet.has('poll') ? t('checking') : t('checkNow')),
             h(Button, {
               disabled: !snapshot,
               onClick: () => setDraft(draft ? null : { ...settings }),
@@ -612,10 +709,10 @@ window.__ModuleLoader__.load({
         ),
         h('p', { className: 'gta-muted gta-paused' }, t('defaultPaused')),
         !snapshot && !error && h('div', { className: 'gta-empty' }, t('loading')),
-        error && h('div', { className: 'gta-banner gta-error', role: 'alert' }, `${t('localError')}：${error}`),
+        (error || pollError) && h('div', { className: 'gta-banner gta-error', role: 'alert' }, `${t('localError')}${colon()}${error || pollError}`),
         snapshot?.lastPollError && h('div', { className: 'gta-banner gta-error', role: 'alert' }, snapshot.lastPollError),
         snapshot?.lastDispatchError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, snapshot.lastDispatchError),
-        modelCatalogError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('modelCatalogError')}：${modelCatalogError}`),
+        modelCatalogError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('modelCatalogError')}${colon()}${modelCatalogError}`),
         snapshot?.digest && h('section', { className: 'gta-card gta-digest' },
           h('div', { className: 'gta-digest-head' },
             h('h2', null, `${t('digestTitle')}（${snapshot.digest.counts.total}）`),
@@ -634,7 +731,7 @@ window.__ModuleLoader__.load({
               item.round > 1 && h('span', { className: 'gta-muted' }, `${t('roundLabel')} ${item.round}`),
               item.closureNote && h('span', { className: 'gta-muted gta-digest-note' }, item.closureNote),
               item.replyExcerpt && h('span', { className: 'gta-muted gta-digest-reply' },
-                `${t('replyPreview')}：`,
+                `${t('replyPreview')}${colon()}`,
                 item.replyUrl
                   ? h('a', { href: item.replyUrl, target: '_blank', rel: 'noreferrer' }, item.replyExcerpt)
                   : item.replyExcerpt),
@@ -704,7 +801,7 @@ window.__ModuleLoader__.load({
               onChange: (event) => setDraft({ ...draft, sessionCwd: event.target.value }),
             },
               h('option', { value: '' }, t('sessionCwdAuto')),
-              draftSessionCwdUnregistered && h('option', { value: draft.sessionCwd }, `${t('sessionCwdUnregistered')}：${draft.sessionCwd}`),
+              draftSessionCwdUnregistered && h('option', { value: draft.sessionCwd }, `${t('sessionCwdUnregistered')}${colon()}${draft.sessionCwd}`),
               workspaceOptions.map((workspace) => h('option', { key: workspace.workspaceId, value: workspace.path },
                 `${workspace.title || workspace.path} · ${workspace.path}`)),
             ), h('span', { className: 'gta-muted' }, t('sessionCwdHint'))),
@@ -718,7 +815,7 @@ window.__ModuleLoader__.load({
             }), h('span', { className: 'gta-muted' }, t('customRulesHint'))),
             h('label', { className: 'gta-wide' }, t('signatureText'), h('input', {
               type: 'text', maxLength: 100, value: draft.signatureText ?? '',
-              disabled: draft.replySignature !== true, placeholder: '—— 由 AI 助手代复',
+              disabled: draft.replySignature !== true, placeholder: t('signaturePlaceholder'),
               onChange: (event) => setDraft({ ...draft, signatureText: event.target.value }),
             }), h('span', { className: 'gta-muted' }, t('signatureHint'))),
             h('label', null, t('maxFollowUps'), h('input', {
@@ -760,8 +857,8 @@ window.__ModuleLoader__.load({
             onChange: (event) => setDraft({ ...draft, replySignature: event.target.checked }),
           }), t('signatureLabel')),
           h('div', { className: 'gta-form-actions' },
-            h(Button, { primary: true, disabled: Boolean(busy), onClick: () => saveGeneralSettings().then((saved) => { if (saved) setDraft(null); }) }, t('save')),
-            h(Button, { disabled: Boolean(busy), onClick: () => setDraft(null) }, t('cancel')),
+            h(Button, { primary: true, disabled: busySet.has('settings'), onClick: () => saveGeneralSettings().then((saved) => { if (saved) setDraft(null); }) }, t('save')),
+            h(Button, { onClick: () => setDraft(null) }, t('cancel')),
           ),
         ),
         snapshot && h('section', { className: 'gta-stats' },
@@ -803,7 +900,7 @@ window.__ModuleLoader__.load({
         ),
         activeTab === 'inbox' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-inbox`, 'aria-labelledby': `${PANEL_ID}-tab-inbox` },
           h('div', { className: 'gta-section-title' }, h('h2', null, t('inboxTitle')), h('span', { className: 'gta-muted' }, `${snapshot.closure?.needsHuman ?? 0}`)),
-          inboxError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('inboxError')}：${inboxError}`),
+          inboxError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('inboxError')}${colon()}${inboxError}`),
           !inboxData && !inboxError && h('div', { className: 'gta-empty' }, t('loading')),
           inboxData && inboxData.length === 0 && h('div', { className: 'gta-empty' }, t('inboxEmpty')),
           inboxData && inboxData.length > 0 && h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('inboxTitle') },
@@ -826,14 +923,15 @@ window.__ModuleLoader__.load({
                 item.sessionId && h(Button, { onClick: () => openSession(item.sessionId) }, t('inboxTakeover')),
                 h(Button, {
                   primary: true,
-                  disabled: Boolean(busy),
-                  onClick: () => acknowledgeInboxItem(item),
-                }, busy === `ack:${item.todoId}` ? '…' : t('inboxAcknowledge')),
+                  disabled: busySet.has(`ack:${item.todoId}`),
+                  onClick: guardedRun(`ack:${item.todoId}`, () => { void acknowledgeInboxItem(item); }),
+                }, busySet.has(`ack:${item.todoId}`) ? '…'
+                  : confirmKeys.has(`ack:${item.todoId}`) ? t('confirmAcknowledge') : t('inboxAcknowledge')),
               ),
             ))),
         ),
         activeTab === 'todos' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-todos`, 'aria-labelledby': `${PANEL_ID}-tab-todos` },
-          h('div', { className: 'gta-section-title' }, h('h2', null, t('todoList')), h('span', { className: 'gta-muted' }, `${t('newFound')}：${snapshot.lastNewCount}`)),
+          h('div', { className: 'gta-section-title' }, h('h2', null, t('todoList')), h('span', { className: 'gta-muted' }, `${t('newFound')}${colon()}${snapshot.lastNewCount}`)),
           snapshot.todos.length === 0
             ? h('div', { className: 'gta-empty' }, t('noTodos'))
             : h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('todoList') }, snapshot.todos.map((todo) =>
@@ -852,13 +950,25 @@ window.__ModuleLoader__.load({
                   ),
                   h('div', { className: 'gta-todo-actions' },
                     todo.sessionId && h(Button, { onClick: () => openSession(todo.sessionId) }, t('openSession')),
+                    // 主按钮只负责开会话：未处理开新会话；已处理为“重新处理”（不可逆，需二次确认）。
                     (!todo.handled || todo.outcome !== 'merge-request-done') && h(Button, {
                       primary: !todo.handled,
-                      disabled: Boolean(busy) || todo.executionStatus === 'running',
-                      onClick: () => perform(`dispatch:${todo.id}`, () => post('dispatch', { id: todo.id })),
-                    }, busy === `dispatch:${todo.id}` ? '…' : todo.handled ? t('reprocess') : isMergeRequest(todo) && !todo.directMention ? t('markDone') : t('process')),
+                      disabled: busySet.has(`dispatch:${todo.id}`) || todo.executionStatus === 'running',
+                      onClick: todo.handled
+                        ? guardedRun(`reprocess:${todo.id}`, () => { void dispatchTodo(todo); })
+                        : () => { void dispatchTodo(todo); },
+                    }, busySet.has(`dispatch:${todo.id}`) ? '…'
+                      : todo.handled && confirmKeys.has(`reprocess:${todo.id}`) ? t('confirmReprocess')
+                      : todo.handled ? t('reprocess') : t('process')),
+                    // “标记完成”独立为次级按钮（沿用原显示条件：非 directMention 的 MR），
+                    // 不再与开会话共用按钮；同样不可逆，需二次确认。
+                    !todo.handled && isMergeRequest(todo) && !todo.directMention && h(Button, {
+                      disabled: busySet.has(`dispatch:${todo.id}`) || todo.executionStatus === 'running',
+                      onClick: guardedRun(`markdone:${todo.id}`, () => { void dispatchTodo(todo); }),
+                    }, busySet.has(`dispatch:${todo.id}`) ? '…'
+                      : confirmKeys.has(`markdone:${todo.id}`) ? t('confirmMarkDone') : t('markDone')),
                     canRouteTodo(todo) && h(Button, {
-                      disabled: Boolean(busy) || todo.executionStatus === 'running',
+                      disabled: todo.executionStatus === 'running',
                       onClick: () => openRouteTargets(todo),
                     }, t('routeToSession')),
                   ),
@@ -868,7 +978,7 @@ window.__ModuleLoader__.load({
         activeTab === 'sessions' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-sessions`, 'aria-labelledby': `${PANEL_ID}-tab-sessions` },
           h('div', { className: 'gta-section-title' }, h('h2', null, t('sessionsTitle')), h('span', { className: 'gta-muted' },
             sessionData ? `${sessionData.items.length}/${sessionData.total}` : `${(snapshot.sessions ?? []).length}`)),
-          sessionError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('sessionsError')}：${sessionError}`),
+          sessionError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('sessionsError')}${colon()}${sessionError}`),
           !sessionData && !sessionError && h('div', { className: 'gta-empty' }, t('loading')),
           sessionData && sessionData.total === 0 && h('div', { className: 'gta-empty' }, t('noSessions')),
           sessionData && sessionData.items.length > 0 && h('div', { className: 'gta-list gta-scroll-list gta-session-list', role: 'list', 'aria-label': t('sessionsTitle') }, sessionData.items.map((record) =>
@@ -896,9 +1006,9 @@ window.__ModuleLoader__.load({
                   h('div', { className: 'gta-todo-actions' },
                     !record.archived && h(Button, { onClick: () => openSession(record.sessionId) }, t('openSession')),
                     record.executionStatus !== 'starting' && record.routed !== true && h(Button, {
-                      disabled: Boolean(busy) || (record.archived !== true && record.executionStatus === 'running'),
+                      disabled: busySet.has(`archive:${record.sessionId}`) || (record.archived !== true && record.executionStatus === 'running'),
                       onClick: () => toggleSessionArchive(record),
-                    }, busy === `archive:${record.sessionId}` ? '…' : (record.archived ? t('unarchiveSession') : t('archiveSession'))),
+                    }, busySet.has(`archive:${record.sessionId}`) ? '…' : (record.archived ? t('unarchiveSession') : t('archiveSession'))),
                   ),
                 ),
               )),
@@ -907,7 +1017,7 @@ window.__ModuleLoader__.load({
         ),
         activeTab === 'workspaces' && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-workspaces`, 'aria-labelledby': `${PANEL_ID}-tab-workspaces` },
           h('div', { className: 'gta-section-title' }, h('h2', null, t('workspacesTitle')), h('span', { className: 'gta-muted' }, `${workspaceOptions.length}`)),
-          workspaceError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('workspacesError')}：${workspaceError}`),
+          workspaceError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('workspacesError')}${colon()}${workspaceError}`),
           workspaceOptions.length === 0 && !workspaceError && h('div', { className: 'gta-empty' }, t('noWorkspaces')),
           h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('workspacesTitle') },
             workspaceOptions.map((workspace) =>
@@ -917,10 +1027,10 @@ window.__ModuleLoader__.load({
                     h('span', { className: 'gta-workspace-name', title: workspace.path },
                       workspace.unassigned ? t('unassignedWorkspace') : workspace.title || workspace.path || workspace.workspaceId),
                     workspace.configured && h('span', { className: 'gta-tag gta-tag-mention' }, t('configuredWorkspace')),
-                    h('span', { className: 'gta-muted' }, `${t('sessionsTitle')}：${workspace.sessionCount}`),
+                    h('span', { className: 'gta-muted' }, `${t('sessionsTitle')}${colon()}${workspace.sessionCount}`),
                   ),
                   h('div', { className: 'gta-muted gta-meta' },
-                    [workspace.path, workspace.updatedAt ? `${t('lastActive')}：${formatTime(workspace.updatedAt, '')}` : ''].filter(Boolean).join(' · ')),
+                    [workspace.path, workspace.updatedAt ? `${t('lastActive')}${colon()}${formatTime(workspace.updatedAt, '')}` : ''].filter(Boolean).join(' · ')),
                   h('div', { className: 'gta-workspace-sessions' },
                     workspace.sessions.length === 0
                       ? h('div', { className: 'gta-muted' }, t('noSessions'))
@@ -959,11 +1069,11 @@ window.__ModuleLoader__.load({
               h(Button, { onClick: closeRouteTargets }, t('close')),
             ),
             routeData && h('div', { className: 'gta-route-summary gta-muted' },
-              h('span', null, `${t('routeScope')}：${routeData.scope === 'any' ? t('routeScopeAny') : t('routeScopePlugin')}`),
-              h('span', null, `${t('busyRouteMode')}：${routeData.busyRouteMode === 'steer' ? t('busyRouteSteer') : t('busyRouteQueue')}`),
-              h('span', null, `${t('maxQueuePerSession')}：${routeMaxQueue}`),
+              h('span', null, `${t('routeScope')}${colon()}${routeData.scope === 'any' ? t('routeScopeAny') : t('routeScopePlugin')}`),
+              h('span', null, `${t('busyRouteMode')}${colon()}${routeData.busyRouteMode === 'steer' ? t('busyRouteSteer') : t('busyRouteQueue')}`),
+              h('span', null, `${t('maxQueuePerSession')}${colon()}${routeMaxQueue}`),
             ),
-            routeError && h('div', { className: 'gta-banner gta-error gta-route-error', role: 'alert' }, `${t('localError')}：${routeError}`),
+            routeError && h('div', { className: 'gta-banner gta-error gta-route-error', role: 'alert' }, `${t('localError')}${colon()}${routeError}`),
             h('div', { className: 'gta-route-tools' },
               h('input', {
                 type: 'text', value: routeSearch, placeholder: t('routeSearch'), 'aria-label': t('routeSearch'),
@@ -971,7 +1081,7 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setRouteSearch(event.target.value),
               }),
               h(Button, {
-                disabled: routeLoading || Boolean(busy),
+                disabled: routeLoading || busySet.has(`route:${routeTodo.id}`),
                 onClick: () => loadRouteTargets(routeTodo.id),
               }, routeLoading ? '…' : t('refresh')),
             ),
@@ -983,7 +1093,7 @@ window.__ModuleLoader__.load({
                 type: 'button', role: 'option', key: item.sessionId,
                 className: `gta-route-target${routeSelection === item.sessionId ? ' gta-route-target-selected' : ''}`,
                 'aria-selected': routeSelection === item.sessionId,
-                disabled: item.accepting === false || Boolean(busy),
+                disabled: item.accepting === false || busySet.has(`route:${routeTodo.id}`),
                 onClick: () => setRouteSelection(item.sessionId),
               },
                 h('div', { className: 'gta-route-target-main' },
@@ -997,16 +1107,16 @@ window.__ModuleLoader__.load({
                     item.accepting === false && h('span', { className: 'gta-tag' }, t('routeNotAccepting')),
                   ),
                   h('div', { className: 'gta-muted gta-route-target-meta' },
-                    [item.sessionId, item.cwd, item.updatedAt ? `${t('lastActive')}：${formatTime(item.updatedAt, '')}` : ''].filter(Boolean).join(' · ')),
+                    [item.sessionId, item.cwd, item.updatedAt ? `${t('lastActive')}${colon()}${formatTime(item.updatedAt, '')}` : ''].filter(Boolean).join(' · ')),
                 ),
                 h('span', { className: 'gta-route-load', title: t('maxQueuePerSession') }, `${t('routeLoad')} ${item.load ?? 0}/${routeMaxQueue}`),
               ))),
             h('div', { className: 'gta-route-footer' },
               h(Button, {
                 primary: true,
-                disabled: !selectedRouteTarget || selectedRouteTarget.accepting === false || routeLoading || Boolean(busy),
+                disabled: !selectedRouteTarget || selectedRouteTarget.accepting === false || routeLoading || busySet.has(`route:${routeTodo.id}`),
                 onClick: () => routeToSession(selectedRouteTarget),
-              }, busy === `route:${routeTodo.id}` ? '…' : t('routeConfirm')),
+              }, busySet.has(`route:${routeTodo.id}`) ? '…' : t('routeConfirm')),
             ),
           ),
         ),
@@ -1047,6 +1157,8 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'gitlab-todo-agent: locale');
         const t = ctx.locale.bind(NS);
+        // bridge 抛错早于任何组件渲染，注入 bind 后的 t 让超时/网络错误文案跟随当前 locale。
+        bridgeText = t;
         function MainPanel() {
           return h(PanelBoundary, { t }, h(TodoPanel, { ctx, t }));
         }
