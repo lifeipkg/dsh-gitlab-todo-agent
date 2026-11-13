@@ -222,7 +222,8 @@ window.__ModuleLoader__.load({
     }
 
     const getState = async () => (await bridge('state')).state;
-    const post = (action, payload) => bridge(action, { payload });
+    // 写操作必须显式覆盖 issues/logs 等只读 action 的默认 GET，否则刷新和清空只会读取缓存。
+    const post = (action, payload) => bridge(action, { method: 'POST', payload });
 
     function formatTime(value, fallback) {
       return value ? new Date(value).toLocaleString() : fallback;
