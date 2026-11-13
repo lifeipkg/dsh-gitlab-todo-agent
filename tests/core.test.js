@@ -12,7 +12,7 @@ import {
   buildTodoPrompt,
   buildWorkspaceOverview,
   discussionsApiPath,
-  findRouteTarget,
+  findRouteTargets,
   mrApiPath,
   mrWatchState,
   parseBatchJudgeReply,
@@ -75,10 +75,11 @@ test('normalizes empty and populated GitLab todo arrays', () => {
   assert.equal(todo.noteId, '');
 });
 
-test('rejects malformed, duplicate or unsafe todo data', () => {
+test('rejects malformed or unsafe todo data and dedupes cross-page repeats', () => {
   assert.throws(() => normalizeTodos({ todos: [] }), /必须是数组/);
   assert.throws(() => normalizeTodos([{ title: 'missing' }]), /有效 id/);
-  assert.throws(() => normalizeTodos([{ id: 'a' }, { id: 'a' }]), /重复 Todo id/);
+  // 分页拉取期间列表变动产生的跨页重复是正常伪影：按 id 去重保留首见，不再击穿整轮轮询。
+  assert.deepEqual(normalizeTodos([{ id: 'a' }, { id: 'a' }]).map((item) => item.id), ['a']);
   assert.equal(normalizeTodos([{ id: 'a', url: 'javascript:alert(1)' }])[0].url, '');
 });
 
@@ -195,11 +196,12 @@ test('prompt identifies the todo as data and defers mark-as-done until completio
   assert.match(prompt, /拿不准就视为没有授权/);
   assert.match(prompt, /绝不主动触发、重试或“顺手修复”/);
   assert.match(prompt, /只做原 note（及讨论串中随后明确要求）的事/);
-  // 等待预算带轮询间隔；回复有极简出口；结案报告禁双引号。
+  // 等待预算带轮询间隔；回复有极简出口；结案报告模板自带 noAction 字段。
   assert.match(prompt, /轮询间隔 60–120 秒/);
   assert.match(prompt, /回复可长可短：一句话能说清的/);
   assert.match(prompt, /没有就写“无”/);
-  assert.match(prompt, /summary 内不要用双引号/);
+  assert.match(prompt, /"noAction":false/);
+  assert.match(prompt, /noAction 改为 true/);
   // MR 合并条款（通用默认）：遵循工作区/目标仓库既有规则，未明确允许不自行合并。
   assert.match(prompt, /AGENTS\.md／CLAUDE\.md/);
   assert.match(prompt, /是否合并、何时合并遵循当前工作区与目标仓库的既有规则/);
@@ -237,7 +239,7 @@ test('session projection lists dispatched sessions with status', () => {
   };
   base.handled.b = { id: 'b', sessionId: 'session-b', acceptedAt: 30, executionStatus: 'running', automatic: false, title: 'B', url: '', project: '' };
   base.handled.mr = { id: 'mr', sessionId: null, outcome: 'merge-request-done', acceptedAt: 40, title: 'MR', url: '', project: '' };
-  base.pending.c = { sessionId: 'session-c', createdAt: 25, automatic: true, item: normalizeTodos([{ ...sessionTodo, id: 'c' }])[0] };
+  base.pending.c = { sessionId: 'session-c', createdAt: 25, automatic: true, round: 3, item: normalizeTodos([{ ...sessionTodo, id: 'c' }])[0] };
   const view = publicState(base, false, '106');
   assert.deepEqual(view.sessions.map((record) => [record.sessionId, record.executionStatus]), [
     ['session-b', 'running'],
@@ -245,6 +247,7 @@ test('session projection lists dispatched sessions with status', () => {
     ['session-a', 'completed'],
   ]);
   assert.equal(view.sessions[2].sessionTitle, '[协助]-issue-1-note-2');
+  assert.equal(view.sessions[1].round, 3);
   assert.equal(view.sessions.some((record) => record.sessionId === null), false);
 });
 
@@ -258,6 +261,9 @@ test('judge prompt and reply parsing are conservative', () => {
   assert.match(prompt, /直接标记完成，之后不会再有任何处理/);
   assert.deepEqual(parseJudgeReply('{"needsProcessing":false,"reason":"纯感谢"}'), { needsProcessing: false, reason: '纯感谢' });
   assert.deepEqual(parseJudgeReply('说明 {"needsProcessing":true} 尾巴'), { needsProcessing: true, reason: '' });
+  // reason 中的花括号或嵌套对象不再截断最外层 JSON。
+  assert.deepEqual(parseJudgeReply('{"needsProcessing":false,"reason":"关于 {配置} 的客套","meta":{"kind":"cc"}}'),
+    { needsProcessing: false, reason: '关于 {配置} 的客套' });
   assert.equal(parseJudgeReply('不是 JSON'), null);
   assert.equal(parseJudgeReply('{"foo":1}'), null);
 });
@@ -297,7 +303,7 @@ test('precheck marks a todo done without a session when the judge declines', asy
   assert.equal(runtime.occupiedSlots(), 0);
 });
 
-test('precheck opens the session when the judge requires handling or is unavailable', async () => {
+test('precheck opens the session when the judge requires handling; judge failures skip the round', async () => {
   const required = runtimeWithLlmJudge('{"needsProcessing":true,"reason":"有具体问题"}');
   required.runtime.state.settings.enabled = true;
   required.runtime.state.settings.autoProcess = true;
@@ -307,21 +313,25 @@ test('precheck opens the session when the judge requires handling or is unavaila
   assert.equal(required.calls.create, 1);
   assert.equal(required.runtime.state.handled.direct.outcome, 'session-accepted');
 
+  // 预检输出不可解析：本轮跳过（不标记、不开会话），Todo 留在待办列表等待下一轮。
   const broken = runtimeWithLlmJudge('模型输出的不是 JSON');
   broken.runtime.state.settings.enabled = true;
   broken.runtime.state.settings.autoProcess = true;
   broken.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await broken.runtime.executePoll('test');
   await broken.runtime.pump();
-  assert.equal(broken.calls.create, 1);
+  assert.equal(broken.calls.create, 0);
+  assert.equal(broken.runtime.state.handled.direct, undefined);
 
+  // 无 llm 服务：同样跳过本轮。
   const noLlm = runtimeWithPrompt(async () => ({ accepted: true }));
   noLlm.runtime.state.settings.enabled = true;
   noLlm.runtime.state.settings.autoProcess = true;
   noLlm.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await noLlm.runtime.executePoll('test');
   await noLlm.runtime.pump();
-  assert.equal(noLlm.calls.create, 1);
+  assert.equal(noLlm.calls.create, 0);
+  assert.equal(noLlm.runtime.state.handled.direct, undefined);
   await Promise.all([required.runtime.stop(), broken.runtime.stop(), noLlm.runtime.stop()]);
 });
 
@@ -840,6 +850,8 @@ test('automatic poll only dispatches direct note mentions from other users', asy
   runtime.markTodoDone = async () => { marked += 1; };
   runtime.state.settings.enabled = true;
   runtime.state.settings.autoProcess = true;
+  // 本测试关注“哪些类别进入派发”，预检判定本身另测；关闭预检模拟“判定均需处理”。
+  runtime.state.settings.precheckEnabled = false;
   runtime.state.settings.maxSessionsPerPoll = 4;
   const directMr = {
     ...directNoteTodo,
@@ -879,6 +891,7 @@ test('auto dispatch holds concurrency slots until sessions actually settle', asy
   runtime.config.sessionPollMs = 20;
   runtime.state.settings.enabled = true;
   runtime.state.settings.autoProcess = true;
+  runtime.state.settings.precheckEnabled = false;
   runtime.state.settings.maxSessionsPerPoll = 4;
   runtime.state.settings.maxConcurrentSessions = 2;
   const directTodos = Array.from({ length: 4 }, (_, index) => ({
@@ -919,6 +932,7 @@ test('reconcile settles executions by turn/end verdict and never misreads roster
   runtime.config.sessionPollMs = 20;
   runtime.state.settings.enabled = true;
   runtime.state.settings.autoProcess = true;
+  runtime.state.settings.precheckEnabled = false;
   runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await runtime.executePoll('test');
   await runtime.pump();
@@ -963,6 +977,7 @@ test('archive refusal and the switch never affect settlement', async () => {
   refused.calls.failArchive = true;
   refused.runtime.state.settings.enabled = true;
   refused.runtime.state.settings.autoProcess = true;
+  refused.runtime.state.settings.precheckEnabled = false;
   refused.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await refused.runtime.executePoll('test');
   await refused.runtime.pump();
@@ -977,6 +992,7 @@ test('archive refusal and the switch never affect settlement', async () => {
   const off = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   off.runtime.state.settings.enabled = true;
   off.runtime.state.settings.autoProcess = true;
+  off.runtime.state.settings.precheckEnabled = false;
   off.runtime.state.settings.autoArchive = false;
   off.runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await off.runtime.executePoll('test');
@@ -1244,7 +1260,7 @@ test('prompt carries the unattended single-turn environment and the closure repo
   assert.match(prompt, /无人值守的单轮会话/);
   assert.match(prompt, /不会有第二回合/);
   assert.match(prompt, /@jum（用户 ID 106）/);
-  assert.match(prompt, /第 1 轮，自动处理最多 4 轮/);
+  assert.match(prompt, /第 1 轮，自动处理预算约 4 轮（纯等待外部条件的轮次不消耗轮数预算）/);
   assert.match(prompt, /累计不超过约 20 分钟/);
   assert.match(prompt, /不以你的自述为准/);
   assert.match(prompt, /自动新开“续办会话”/);
@@ -1282,7 +1298,19 @@ test('follow-up prompt hands over history, carried MRs, missing reply and relate
   assert.match(prompt, /不要重复发布内容相同的回复/);
   assert.match(prompt, /插件记录的前序 MR/);
   assert.match(prompt, /merge_requests\/12/);
-  assert.match(prompt, /或属于上文“插件记录的前序 MR”清单/);
+  // 前序 MR 不再“视同本 Session 新建”：合并前必须核实 author 归属。
+  assert.match(prompt, /未经插件核实，仅供参考与跟踪/);
+  assert.match(prompt, /合并清单中的任何 MR 之前，必须先用 glab 读取该 MR 详情核实/);
+  assert.match(prompt, /上文“前序 MR 清单”中的 MR 须先按其要求核实归属，核实通过后才适用本条/);
+  // 预检折叠进来的重复提及要带进提示词，主条目会话须覆盖处理。
+  const merged = buildTodoPrompt(todo, {
+    me: { username: 'jum', id: '106' },
+    round: 1,
+    mergedDuplicates: [{ todoId: 'dup-1', author: 'alice', excerpt: '和主条目同一个问题：修一下 X' }],
+  });
+  assert.match(merged, /预检判定下列同对象提及与本任务是同一请求/);
+  assert.match(merged, /Todo dup-1（alice）：和主条目同一个问题：修一下 X/);
+  assert.match(merged, /必须一并覆盖这些提及的实际内容/);
   assert.match(prompt, /Todo 900：https:\/\/gitlab\.local\/group\/project\/-\/issues\/7#note_5（上次结论：等待决策）/);
   assert.match(prompt, /todos\/<该 Todo ID>\/mark_as_done/);
   assert.equal(buildSessionTitle(todo, 2), '[协助]-issue-7-note-10-续1');
@@ -1344,13 +1372,14 @@ test('a session that marks the todo done closes the loop and is archived', async
   await runtime.executePoll('test');
   await runtime.pump();
   assert.match(prompts[0], /@me（用户 ID 106）/);
-  assert.match(prompts[0], /第 1 轮，自动处理最多 4 轮/);
+  assert.match(prompts[0], /第 1 轮，自动处理预算约 4 轮/);
   pending = [];
   calls.complete('session-1', 'completed', closureLine({ status: 'done', summary: '已回复并合并 !12', resumeAfterMinutes: 0, openMrs: [] }));
   await runtime.reconcileSessions();
   const record = runtime.state.handled.direct;
   assert.equal(record.closure, 'closed');
-  assert.equal(record.closureNote, '已回复并合并 !12');
+  // 测试桩里 discussions 不可读（replied=null）：闭环成立，但结论注明“回复未核对”。
+  assert.equal(record.closureNote, '已回复并合并 !12（讨论串回复未核对）');
   assert.equal(record.nextAttemptAt, null);
   assert.equal(record.archived, true);
   // 之后的轮询不会再为它开会话。
@@ -1450,7 +1479,7 @@ test('follow-ups stop at the configured limit and failed turns are retried quick
   runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
   await runtime.executePoll('test');
   await runtime.pump();
-  assert.match(prompts[0], /第 1 轮，自动处理最多 2 轮/);
+  assert.match(prompts[0], /第 1 轮，自动处理预算约 2 轮/);
   // 第 1 轮回合失败：不归档，2 分钟后重试。
   calls.complete('session-1', 'error');
   await runtime.reconcileSessions();
@@ -1467,15 +1496,43 @@ test('follow-ups stop at the configured limit and failed turns are retried quick
   assert.match(prompts[1], /不会再自动续办/);
   assert.match(prompts[1], /这是最后一轮自动处理，在同一讨论串追加一条简短回复/);
   assert.doesNotMatch(prompts[1], /不要重复发布内容相同的回复/);
-  calls.complete('session-2', 'completed', closureLine({ status: 'waiting', summary: 'CI 仍未通过', resumeAfterMinutes: 10, openMrs: [] }));
+  // 第 2 轮再次失败（补救轮）：补救预算用尽，转需人工而不是继续重试。
+  calls.complete('session-2', 'error');
   await runtime.reconcileSessions();
   const second = runtime.state.handled.direct;
   assert.equal(second.closure, 'needs-human');
-  assert.match(second.closureNote, /已达自动处理上限（共 2 轮）/);
+  assert.match(second.closureNote, /已达自动补救轮数上限（补救 2 轮）/);
   assert.equal(second.archived, false);
   await runtime.executePoll('test');
   await runtime.pump();
   assert.equal(calls.create, 2);
+  await runtime.stop();
+});
+
+test('pure waiting rounds do not burn the follow-up round budget', async () => {
+  const { runtime, calls } = autoRuntime({ settings: { maxFollowUps: 1 } });
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  // 第 1、2 轮都是纯等待（waiting + 回合正常 + 无缺回复证据）：不消耗轮数预算，链路继续。
+  for (let round = 1; round <= 2; round += 1) {
+    calls.complete(`session-${round}`, 'completed', closureLine({
+      status: 'waiting',
+      summary: `等待 CI（第 ${round} 轮）`,
+      resumeAfterMinutes: 30,
+      openMrs: [],
+    }));
+    await runtime.reconcileSessions();
+    const record = runtime.state.handled.direct;
+    assert.equal(record.closure, 'follow-up');
+    assert.equal(record.round, round);
+    record.nextAttemptAt = Date.now() - 1;
+    await runtime.executePoll('test');
+    await runtime.pump();
+  }
+  // 两个纯等待轮之后仍允许开第 3 轮（补救预算 1 轮未动，改受 72 小时总时限约束）。
+  assert.equal(calls.create, 3);
+  assert.equal(runtime.state.handled.direct.waitRounds, 2);
   await runtime.stop();
 });
 
@@ -1567,6 +1624,7 @@ test('manual sessions and disabled follow-up never schedule automatic follow-ups
   await manual.runtime.stop();
 
   const off = autoRuntime({ settings: { followUpEnabled: false } });
+  off.runtime.state.settings.precheckEnabled = false;
   off.runtime.fetchTodos = async () => [todo];
   await off.runtime.executePoll('test');
   await off.runtime.pump();
@@ -1731,7 +1789,7 @@ test('route settings default safely and validate scope, busy mode and queue cap'
   assert.equal(migrated.settings.autoRoute, true);
 });
 
-test('findRouteTarget picks the newest live session for the same target only', () => {
+test('findRouteTargets picks the newest live session for the same target only', () => {
   const now = Date.now();
   const [todo] = normalizeTodos([directNoteTodo]);
   const handled = {
@@ -1740,17 +1798,17 @@ test('findRouteTarget picks the newest live session for the same target only', (
     other: { id: 'other', sessionId: 'session-other', url: 'https://gitlab.local/group/project/-/issues/99#note_1', acceptedAt: now - 50, archived: false },
     expired: { id: 'expired', sessionId: 'session-expired', url: todo.url, acceptedAt: now - 8 * 24 * 60 * 60 * 1000, archived: false },
   };
-  assert.equal(findRouteTarget(handled, todo, { now })?.sessionId, 'session-old');
-  assert.equal(findRouteTarget(handled, todo, { now, loadOf: () => 3, maxQueue: 3 }), null);
-  assert.equal(findRouteTarget({ other: handled.other }, todo, { now }), null);
+  assert.equal(findRouteTargets(handled, todo, { now })[0]?.sessionId, 'session-old');
+  assert.equal(findRouteTargets(handled, todo, { now, loadOf: () => 3, maxQueue: 3 }).length, 0);
+  assert.equal(findRouteTargets({ other: handled.other }, todo, { now }).length, 0);
   const withBusy = {
     ...handled,
     busy: { id: 'busy', sessionId: 'session-busy', url: todo.url, acceptedAt: now - 1000, archived: false },
   };
-  assert.equal(findRouteTarget(withBusy, todo, {
+  assert.equal(findRouteTargets(withBusy, todo, {
     now,
     loadOf: (id) => id === 'session-busy' ? 3 : 0,
-  })?.sessionId, 'session-old');
+  })[0]?.sessionId, 'session-old');
 });
 
 test('automatic same-target routing reuses the session without renaming or overriding its model', async () => {
@@ -2431,6 +2489,8 @@ test('MR watch state classifies pipelines and terminal outcomes', () => {
   assert.equal(mrWatchState({ state: 'closed' }), 'closed');
   assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'running' } }), 'running');
   assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'pending' } }), 'running');
+  // manual 等待人工触发，不是“已出结果”事件，避免提前续办后空转。
+  assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'manual' } }), 'running');
   assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'success' } }), 'pipeline:success');
   assert.equal(mrWatchState({ state: 'opened', head_pipeline: { status: 'failed' } }), 'pipeline:failed');
   assert.equal(mrWatchState({ state: 'opened' }), 'none');
@@ -2476,6 +2536,11 @@ test('batch precheck dispatches by priority and folds duplicates into the primar
   assert.deepEqual(marked, ['dup']);
   assert.equal(runtime.state.handled.dup.outcome, 'precheck-skipped');
   assert.match(runtime.state.handled.dup.skipReason, /随主条目合并处理/);
+  assert.equal(runtime.state.handled.dup.mergedInto, 'main');
+  assert.equal(runtime.state.handled.dup.excerpt, directNoteTodo.body);
+  const restored = normalizeState(JSON.parse(JSON.stringify(runtime.state)));
+  assert.equal(restored.handled.dup.mergedInto, 'main');
+  assert.equal(restored.handled.dup.author, directNoteTodo.author.username);
   assert.equal(calls.create, 2);
   // priority 1（urgent）先派发，priority 2（main）随后。
   assert.deepEqual(calls.renames.map((request) => request.title), ['[协助]-issue-9-note-30', '[协助]-issue-8-note-20']);
@@ -2543,7 +2608,7 @@ test('cross-target duplicates are not folded so every thread keeps its reply', a
   await runtime.stop();
 });
 
-test('missing batch verdicts fall back conservatively to dispatch', async () => {
+test('missing batch verdicts skip the round instead of dispatching blindly', async () => {
   const reply = JSON.stringify([{ todoId: 'known', needsProcessing: true, reason: '有判定' }]);
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
   runtime.ctx.llm = {
@@ -2561,9 +2626,11 @@ test('missing batch verdicts fall back conservatively to dispatch', async () => 
   ]);
   await runtime.executePoll('test');
   await runtime.pump();
-  // 缺失判定的 unknown 保守视为需要处理，同样开会话。
-  assert.equal(calls.create, 2);
-  assert.equal(runtime.state.handled.unknown.outcome, 'session-accepted');
+  // 有判定的 known 正常开会话；缺失判定的 unknown 本轮跳过（不标记、不开会话），留待下一轮。
+  assert.equal(calls.create, 1);
+  assert.equal(runtime.state.handled.known.outcome, 'session-accepted');
+  assert.equal(runtime.state.handled.unknown, undefined);
+  assert.equal(runtime.precheckFailures.get('unknown'), 1);
   await runtime.stop();
 });
 
@@ -2749,5 +2816,67 @@ test('reply signature setting flows into dispatched prompts', async () => {
   assert.equal(result.ok, true);
   const promptCall = calls.invocations.find((call) => call.method === 'prompt');
   assert.match(promptCall.args.request.content[0].text, /署名「—— 由 AI 助手代复」/);
+  await runtime.stop();
+});
+
+test('follow-up dispatch failures back off and escalate to needs-human instead of retrying forever', async () => {
+  const { runtime, calls } = autoRuntime();
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  calls.complete('session-1', 'error');
+  await runtime.reconcileSessions();
+  const record = runtime.state.handled.direct;
+  assert.equal(record.closure, 'follow-up');
+  // 续办会话创建持续失败。
+  runtime.host.createSession = async () => { throw new Error('host down'); };
+  let previousDelay = 0;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    record.nextAttemptAt = Date.now() - 1;
+    await runtime.executePoll('test');
+    await runtime.pump();
+    assert.equal(record.dispatchFailures, attempt);
+    assert.equal(record.closure, 'follow-up');
+    const delay = record.nextAttemptAt - Date.now();
+    assert.ok(delay > previousDelay, `退避应递增：第 ${attempt} 次 ${delay}ms`);
+    previousDelay = delay;
+  }
+  // 第 5 次失败：升级需人工，进入收件箱，不再重试。
+  record.nextAttemptAt = Date.now() - 1;
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(record.closure, 'needs-human');
+  assert.match(record.closureNote, /连续 5 次派发失败.*host down/);
+  assert.equal(record.nextAttemptAt, null);
+  assert.equal(runtime.snapshot().closure.needsHuman, 1);
+  await runtime.stop();
+});
+
+test('aged follow-ups are escalated instead of being deferred forever', async () => {
+  const { runtime, calls } = autoRuntime();
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  calls.complete('session-1', 'error');
+  await runtime.reconcileSessions();
+  const record = runtime.state.handled.direct;
+  record.firstAcceptedAt = Date.now() - 73 * 60 * 60 * 1000;
+  record.nextAttemptAt = Date.now() - 1;
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(record.closure, 'needs-human');
+  assert.match(record.closureNote, /超出自动续办时限/);
+  assert.equal(calls.create, 1);
+  await runtime.stop();
+});
+
+test('persistence failures are reported separately from dispatch errors', async () => {
+  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
+  delete runtime.persistQuietly;
+  runtime.persist = async () => { throw new Error('disk full'); };
+  await runtime.persistQuietly('测试');
+  assert.match(runtime.state.lastPersistError, /保存测试状态失败：disk full/);
+  assert.equal(runtime.state.lastDispatchError ?? null, null);
+  assert.match(runtime.snapshot().lastPersistError, /disk full/);
   await runtime.stop();
 });

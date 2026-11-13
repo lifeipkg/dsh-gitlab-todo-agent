@@ -52,8 +52,10 @@ const RULE_SKIP_REASONS = {
 const MAX_DISCUSSION_PAGES = 10;
 /** 自首轮派发起超过这个时长的链路不再自动续办，避免升级或长期遗留记录触发续办风暴。 */
 const FOLLOW_UP_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-/** 续办会话创建失败后的重试间隔。 */
+/** 续办会话创建失败后的重试间隔（随失败次数指数退避）。 */
 const FOLLOW_UP_RETRY_MS = 5 * 60 * 1000;
+/** 续办派发连续失败这么多次后升级需人工，不再无限重试。 */
+const FOLLOW_UP_MAX_DISPATCH_FAILURES = 5;
 /** 会话空闲且没有回合结束记录，连续这么多次核对后按“被中断”结算（默认约 2 分钟）。 */
 const IDLE_SETTLE_POLLS = 40;
 /** 提示词里告诉会话的 CI 等待预算。 */
@@ -109,7 +111,7 @@ export class GitlabTodoRuntime {
     this.initialTimer = null;
     this.pollPromise = null;
     this.dispatches = new Map();
-    this.activeChild = null;
+    this.activeChildren = new Set();
     this.writeChain = Promise.resolve();
     this.stopping = false;
     this.unregisterRoute = null;
@@ -126,6 +128,8 @@ export class GitlabTodoRuntime {
     this.pumpPromise = null;
     // 本轮批量预检的判定（todoId → verdict）：派发时消费（taskType 选模型、preferSession 决定路由）。
     this.judgeVerdicts = new Map();
+    // 预检连续失败计数（todoId → 次数）：失败本轮跳过，获得判定或被处理后清零。
+    this.precheckFailures = new Map();
   }
 
   storageDirectory() {
@@ -185,10 +189,13 @@ export class GitlabTodoRuntime {
     clearTimeout(this.initialTimer);
     if (this.unregisterRoute) await this.unregisterRoute();
     this.unregisterRoute = null;
-    this.activeChild?.kill();
+    // 逐个终止所有在飞的 glab 子进程（poll 与核对可能并发，单槽引用会漏杀先前的进程）。
+    for (const child of this.activeChildren) child.kill();
+    this.activeChildren.clear();
     await Promise.allSettled([
       this.reconcilePromise?.catch(() => {}),
       this.pumpPromise?.catch(() => {}),
+      this.pollPromise?.catch(() => {}),
       this.writeChain.catch(() => {}),
     ]);
     await this.host.dispose();
@@ -228,8 +235,9 @@ export class GitlabTodoRuntime {
     try {
       await this.persist();
     } catch (error) {
+      // 持久化故障与派发错误分账：写进独立字段，不污染面板上“最近派发错误”的语义。
       const message = `保存${area}状态失败：${errorMessage(error)}`;
-      this.state.lastDispatchError = message;
+      this.state.lastPersistError = message;
       this.ctx.logger?.warn?.(`[gitlab-todo-agent] ${message}`);
     }
   }
@@ -295,13 +303,15 @@ export class GitlabTodoRuntime {
 
   /**
    * 开会话前的轻量预判：不需要处理的提及直接标记 Todo 完成。
-   * 任何失败（无 llm 服务、路由不可用、超时、解析失败）一律保守判定为需要处理。
+   * 任何失败（无 llm 服务、路由不可用、超时、解析失败）返回 null：调用方让该 Todo
+   * 本轮跳过（不标记、不开会话），留待下一轮重试——对代发账号，误开会话公开回复
+   * 比晚一轮处理更难收回。
    */
   async judgeNeedsProcessing(todo) {
     const llm = this.llmRuntime();
-    if (!llm) return { needsProcessing: true, reason: '' };
+    if (!llm) return null;
     const route = await this.judgeModel();
-    if (!route) return { needsProcessing: true, reason: '' };
+    if (!route) return null;
     const timeoutMs = Number.isFinite(this.config.judgeTimeoutMs) ? Math.max(1000, this.config.judgeTimeoutMs) : 30000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -322,9 +332,9 @@ export class GitlabTodoRuntime {
         if (text.length > 20000) break;
       }
       const verdict = parseJudgeReply(text);
-      return verdict ?? { needsProcessing: true, reason: '' };
+      return verdict;
     } catch {
-      return { needsProcessing: true, reason: '' };
+      return null;
     } finally {
       clearTimeout(timer);
     }
@@ -393,6 +403,8 @@ export class GitlabTodoRuntime {
 
   /**
    * 预检入口：先批量，失败退回逐条；判定不需要处理或同批重复的直接标记完成。
+   * 预检本身失败的 Todo 本轮跳过（不标记、不开会话），留待下一轮重试；连续失败
+   * 记录在 precheckFailures 并周期性告警，可随时手动派发。
    * 返回仍需开会话的 Todo，按 judge 优先级（1 最先）稳定排序；
    * 判定存入 judgeVerdicts，派发时消费（taskType 选模型、preferSession 决定是否路由复用）。
    */
@@ -401,18 +413,15 @@ export class GitlabTodoRuntime {
     if (!verdicts) {
       const fallback = await mapLimit(mentions, PRECHECK_CONCURRENCY,
         async (todo) => [todo.id, await this.judgeNeedsProcessing(todo)]);
-      verdicts = new Map(fallback);
+      verdicts = new Map(fallback.filter(([, verdict]) => verdict !== null));
     }
     for (const todo of mentions) {
-      if (!verdicts.has(todo.id)) {
-        verdicts.set(todo.id, {
-          needsProcessing: true, reason: '', taskType: '', priority: 3, duplicateOf: '', preferSession: 'reuse',
-        });
-      }
+      if (verdicts.has(todo.id)) this.precheckFailures.delete(todo.id);
     }
     // 重复折叠的判定条件：duplicateOf 指向本批另一条“需要处理”的 Todo，且两者在同一个
     // 目标对象上（去掉 note 锚点后同源）——跨讨论串的重复提问不折叠，否则另一线程将无人回应。
     const foldableInto = (todo, verdict) => {
+      if (!verdict) return null;
       const target = verdict.duplicateOf && verdict.duplicateOf !== todo.id
         ? mentions.find((item) => item.id === verdict.duplicateOf)
         : null;
@@ -430,6 +439,16 @@ export class GitlabTodoRuntime {
     const ready = [];
     for (const todo of mentions) {
       const verdict = verdicts.get(todo.id);
+      if (!verdict) {
+        // 预检本身失败（服务不可用/超时/输出不可解析）：本轮跳过，不标记、不开会话，
+        // 下一轮重试；连续失败告警。手动“开 Session 处理”不受影响。
+        const failures = (this.precheckFailures.get(todo.id) ?? 0) + 1;
+        this.precheckFailures.set(todo.id, failures);
+        if (failures % 3 === 1) {
+          this.ctx.logger?.warn?.(`[gitlab-todo-agent] Todo ${todo.id} 预检连续 ${failures} 轮失败，本轮跳过；可手动派发或等待预检恢复。`);
+        }
+        continue;
+      }
       const target = foldableInto(todo, verdict);
       const duplicate = Boolean(target) && !referencedPrimaries.has(todo.id);
       if (!verdict.needsProcessing || duplicate) {
@@ -448,9 +467,17 @@ export class GitlabTodoRuntime {
             title: todo.title,
             url: todo.url,
             project: todo.project,
+            // 折叠进主条目的提及：保留作者与正文摘录，主条目会话提示词会带出并要求覆盖处理。
+            ...(duplicate ? {
+              mergedInto: target.id,
+              author: todo.author,
+              excerpt: String(todo.body ?? '').slice(0, 300),
+            } : {}),
           };
         } catch (error) {
           this.ctx.logger?.warn?.(`[gitlab-todo-agent] 预检跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
+          // 标记失败时不丢判定：下一轮该 Todo 仍在待办列表，避免周期性重复调用预检模型。
+          continue;
         }
         this.judgeVerdicts.delete(todo.id);
         continue;
@@ -634,6 +661,9 @@ export class GitlabTodoRuntime {
         ? (previous.firstAcceptedAt ?? previous.acceptedAt)
         : (pending.firstAcceptedAt ?? pending.createdAt),
       history,
+      // 跨 pending 恢复也要保留纯等待轮计数，否则轮数预算会在续办后重置。
+      waitRounds: continuing && Number.isSafeInteger(previous.waitRounds) ? previous.waitRounds : 0,
+      dispatchFailures: 0,
       openMrs: Array.isArray(pending.openMrs)
         ? pending.openMrs
         : (Array.isArray(previous?.openMrs) ? previous.openMrs : []),
@@ -906,10 +936,15 @@ export class GitlabTodoRuntime {
       : null;
     const replied = replyInfo ? replyInfo.replied : null;
     const round = record.round ?? 1;
+    // 纯等待轮（自述 waiting、回合正常、无缺回复证据）不消耗轮数预算，只受总时限约束；
+    // 补救轮（回合失败、漏回复、漏标记）才计入 maxFollowUps。
+    const cleanWait = record.reportStatus === 'waiting' && record.executionStatus === 'completed' && replied !== false;
+    const waitRounds = Number.isSafeInteger(record.waitRounds) && record.waitRounds >= 0 ? record.waitRounds : 0;
+    const actionRounds = Math.max(0, round - waitRounds - (cleanWait ? 1 : 0));
     let followUpBlocked = '';
     if (record.automatic === false) followUpBlocked = '手动派发的会话不自动续办';
     else if (settings.followUpEnabled === false) followUpBlocked = '自动续办未开启';
-    else if (round > settings.maxFollowUps) followUpBlocked = `已达自动处理上限（共 ${round} 轮）`;
+    else if (actionRounds > settings.maxFollowUps) followUpBlocked = `已达自动补救轮数上限（补救 ${actionRounds} 轮）`;
     else if (Date.now() - (record.firstAcceptedAt ?? record.acceptedAt) > FOLLOW_UP_MAX_AGE_MS) followUpBlocked = '超出自动续办时限';
     else if (!item) followUpBlocked = '缺少 Todo 数据，无法续办';
     const verdict = assessClosure({
@@ -925,6 +960,7 @@ export class GitlabTodoRuntime {
       baseDelayMinutes: settings.followUpDelayMinutes,
     });
     record.replied = replied;
+    if (cleanWait) record.waitRounds = waitRounds + 1;
     // 本轮有新的我方回复时更新快照（面板回复预览/收件箱展示）；本轮没回复保留旧值。
     if (replyInfo?.reply) record.lastReply = replyInfo.reply;
     if (mentionOnly && verdict.closure === 'closed') verdict.note = `仅被提及，无需处理：${record.reportSummary || '会话判定无行动要求'}`.slice(0, 500);
@@ -960,12 +996,8 @@ export class GitlabTodoRuntime {
   }
 
   /**
-   * 核对原 note 所在讨论串里、原 note 之后是否有我方账号的回复。
-   * true/false 为确定结论；null 为无法判断（目标类型不支持、接口失败、没找到讨论串），按未知处理。
-   */
-  /**
    * 核对原 note 所在讨论串里、原 note 之后是否有我方账号的回复，并取回本轮最新一条我方回复。
-   * replied true/false 为确定结论；返回 null 为无法判断（目标类型不支持、接口失败、没找到讨论串）。
+   * replied true/false 为确定结论；返回 null 为无法判断（目标类型不支持、接口失败、没找到讨论串），按未知处理。
    * reply 只取 created_at 不早于 since（本轮派发时间）的最新一条；本轮没有新回复时为 null，
    * 由调用方保留记录上已有的快照。
    */
@@ -1002,7 +1034,9 @@ export class GitlabTodoRuntime {
         }
         if (discussions.length < 100) break;
       }
-    } catch {
+    } catch (error) {
+      // 闭环判定的关键证据拿不到时必须留痕，否则“回复未核对”无从排查。
+      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 核对讨论串回复失败（${api}）：${errorMessage(error)}`);
       return null;
     }
     return null;
@@ -1103,6 +1137,14 @@ export class GitlabTodoRuntime {
       if (!item) {
         record.closure = 'needs-human';
         record.closureNote = `${record.closureNote}；缺少 Todo 数据，无法续办`.replace(/^；/, '');
+        record.nextAttemptAt = null;
+        record.watch = null;
+        continue;
+      }
+      // 链路超龄（如长期被同目标会话占住而无限顺延）：转需人工，不再自动续办。
+      if (Date.now() - (record.firstAcceptedAt ?? record.acceptedAt ?? 0) > FOLLOW_UP_MAX_AGE_MS) {
+        record.closure = 'needs-human';
+        record.closureNote = `${record.closureNote}；超出自动续办时限，转人工接手`.replace(/^；/, '');
         record.nextAttemptAt = null;
         record.watch = null;
         continue;
@@ -1215,8 +1257,9 @@ export class GitlabTodoRuntime {
         this.enqueuePendingRetries();
         // 1) 规则跳过：流水线通知、自己 @ 自己——零模型调用，程序内直接标记完成。
         if (this.state.settings.ruleSkipEnabled !== false) {
+          const classified = new Map(candidates.map((todo) => [todo.id, classifyTodo(todo, this.gitlabUserId)]));
           const noise = candidates
-            .filter((todo) => RULE_SKIP_REASONS[classifyTodo(todo, this.gitlabUserId)])
+            .filter((todo) => RULE_SKIP_REASONS[classified.get(todo.id)])
             .slice(0, MAX_RULE_SKIPS_PER_POLL);
           for (const todo of noise) {
             try {
@@ -1227,7 +1270,7 @@ export class GitlabTodoRuntime {
                 outcome: 'rule-skipped',
                 automatic: true,
                 acceptedAt: Date.now(),
-                skipReason: RULE_SKIP_REASONS[classifyTodo(todo, this.gitlabUserId)],
+                skipReason: RULE_SKIP_REASONS[classified.get(todo.id)],
                 title: todo.title,
                 url: todo.url,
                 project: todo.project,
@@ -1312,7 +1355,7 @@ export class GitlabTodoRuntime {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       });
-      this.activeChild = child;
+      this.activeChildren.add(child);
       const stdout = [];
       const stderr = [];
       let stdoutBytes = 0;
@@ -1333,7 +1376,7 @@ export class GitlabTodoRuntime {
         settled = true;
         clearTimeout(timeout);
         clearTimeout(forceTimer);
-        if (this.activeChild === child) this.activeChild = null;
+        this.activeChildren.delete(child);
         const out = Buffer.concat(stdout).toString('utf8');
         const err = Buffer.concat(stderr).toString('utf8');
         if (error) {
@@ -1476,7 +1519,10 @@ export class GitlabTodoRuntime {
       if (values && typeof values[Symbol.iterator] === 'function') {
         for (const id of values) if (typeof id === 'string') ids.add(id);
       }
-    } catch {}
+    } catch {
+      // 归档名册读取失败不影响主流程，但留一条调试日志便于排查“外部归档过滤失效”。
+      this.ctx.logger?.debug?.('[gitlab-todo-agent] 读取工作区归档会话列表失败，跳过外部归档过滤。');
+    }
     for (const record of Object.values(this.state.handled)) {
       if (record?.sessionId && record.archived === true) ids.add(record.sessionId);
       for (const entry of record?.history ?? []) {
@@ -1681,8 +1727,8 @@ export class GitlabTodoRuntime {
     // 同一 Todo 已有过会话再开新会话（自动续办或手动重新处理）：延续链路，轮次 +1。
     const previous = this.state.handled[todo.id];
     const continuing = Boolean(force && previous?.sessionId);
-    // 任务类型：预检判定优先；续办沿用上一轮分类；未分类（''）跟随会话模型。
-    const taskType = judge?.taskType && judge.taskType !== 'other'
+    // 任务类型：预检判定优先（parseBatchJudgeReply 已把 other 归并为空串）；续办沿用上一轮分类；未分类（''）跟随会话模型。
+    const taskType = judge?.taskType
       ? judge.taskType
       : (continuing ? (previous?.taskType ?? '') : '');
     const round = continuing ? (previous.round ?? 1) + 1 : 1;
@@ -1832,10 +1878,23 @@ export class GitlabTodoRuntime {
       }
       const settings = this.state.settings;
       const followUpsAllowed = settings.followUpEnabled !== false ? settings.maxFollowUps : 0;
-      // 本轮若没闭环，插件还会不会自动续办：只有自动派发、开关开启且轮数未用尽时才会。
-      const autoFollowUp = trackSlot && round <= followUpsAllowed;
+      // 本轮若没闭环，插件还会不会自动续办：以“补救轮数”预算估算（纯等待轮不消耗预算），
+      // 提示词里的表述是预算性质的，实际以插件结算核对为准。
+      const prevWaitRounds = Number.isSafeInteger(previous?.waitRounds) ? previous.waitRounds : 0;
+      const actionRoundsUsed = Math.max(0, (continuing ? (previous.round ?? 1) : 0) - prevWaitRounds);
+      // 本轮先按“会消耗一个补救名额”保守估算（若本轮实为纯等待，结算时不消耗）。
+      const autoFollowUp = trackSlot && actionRoundsUsed + 1 <= followUpsAllowed;
       const relatedOpen = this.relatedOpenTodos(todo);
       const carriedMrs = normalizeMrUrls([...ownMrs, ...relatedOpen.flatMap((entry) => entry.openMrs)], todo.url);
+      // 预检折叠进本条目的重复提及：带进提示词，要求会话覆盖处理并在回复中说明合并。
+      const mergedDuplicates = Object.values(this.state.handled)
+        .filter((entry) => entry?.mergedInto === todo.id && entry.outcome === 'precheck-skipped')
+        .slice(0, 5)
+        .map((entry) => ({
+          todoId: entry.id,
+          author: entry.author ?? '',
+          excerpt: entry.excerpt ?? '',
+        }));
       await this.host.prompt({
         requestId,
         sessionId,
@@ -1847,7 +1906,7 @@ export class GitlabTodoRuntime {
             sessionTitle: effectiveTitle,
             now: Date.now(),
             round,
-            maxRounds: trackSlot ? Math.max(round, 1 + followUpsAllowed) : round,
+            maxRounds: trackSlot ? Math.max(round, 1 + followUpsAllowed + prevWaitRounds) : round,
             autoFollowUp,
             followUpDelayMinutes: settings.followUpDelayMinutes,
             customRules: settings.customRules,
@@ -1858,6 +1917,7 @@ export class GitlabTodoRuntime {
             history,
             carriedMrs,
             relatedOpen,
+            mergedDuplicates,
             route: route ? { mode: route.mode } : null,
             missingReply: continuing && previous.replied === false,
           }),
@@ -1883,6 +1943,8 @@ export class GitlabTodoRuntime {
         taskType,
         firstAcceptedAt,
         history,
+        waitRounds: continuing ? prevWaitRounds : 0,
+        dispatchFailures: 0,
         // 链路上累计的未合并 MR：没有新结案报告时沿用上一轮的记录。
         openMrs: [...ownMrs],
         // 续办时 Todo 可能已不在待办列表，随记录保存一份（正文不保存，提示词用不到）。
@@ -1907,8 +1969,21 @@ export class GitlabTodoRuntime {
         reserved = false;
       }
       if (sessionId && !(!pending?.requestId && pending?.sessionId === sessionId)) this.untrackTodo(sessionId, todo.id);
-      // 续办会话没开起来：记录保持待续办，隔一段时间再试，不在每轮轮询里连续重试。
-      if (followUp && previous?.closure === 'follow-up') previous.nextAttemptAt = Date.now() + FOLLOW_UP_RETRY_MS;
+      // 续办会话没开起来：按失败次数指数退避重试；连续失败达到上限或链路超时则升级需人工（进收件箱），
+      // 不再无限每 5 分钟重试。
+      if (followUp && previous?.closure === 'follow-up') {
+        previous.dispatchFailures = (Number.isSafeInteger(previous.dispatchFailures) ? previous.dispatchFailures : 0) + 1;
+        const agedOut = Date.now() - (previous.firstAcceptedAt ?? previous.acceptedAt ?? Date.now()) > FOLLOW_UP_MAX_AGE_MS;
+        if (previous.dispatchFailures >= FOLLOW_UP_MAX_DISPATCH_FAILURES || agedOut) {
+          previous.closure = 'needs-human';
+          previous.closureNote = `续办会话连续 ${previous.dispatchFailures} 次派发失败：${errorMessage(error)}`.slice(0, 500);
+          previous.nextAttemptAt = null;
+          previous.watch = null;
+        } else {
+          const retryMs = Math.min(FOLLOW_UP_RETRY_MS * 2 ** (previous.dispatchFailures - 1), 60 * 60 * 1000);
+          previous.nextAttemptAt = Date.now() + retryMs;
+        }
+      }
       this.state.lastDispatchError = `Todo ${todo.id} 创建或驱动 Session 失败：${errorMessage(error)}`;
       await this.persistQuietly('派发错误');
       this.ctx.logger?.warn?.(`[gitlab-todo-agent] ${this.state.lastDispatchError}`);
