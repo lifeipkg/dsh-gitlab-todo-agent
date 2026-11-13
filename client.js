@@ -73,9 +73,6 @@ window.__ModuleLoader__.load({
       digestTitle: 'Last 24 hours', digestShow: 'Details', digestHide: 'Hide', digestEmpty: 'No settled records in the last 24 hours.',
       replyPreview: 'Our reply',
       signatureLabel: 'Sign replies as AI-generated', signatureText: 'Signature text', signatureHint: 'When enabled, every GitLab reply ends with a one-line signature so readers know it was sent by an AI assistant. Applies to new prompts only.',
-      taskModelQuestion: 'Model for questions', taskModelReview: 'Model for code review', taskModelChange: 'Model for code changes',
-      taskModelDefault: 'Follow the session model',
-      taskModelsHint: 'The batch precheck classifies each todo (question/review/change); each class can use a different model. Unset classes and routed todos use the session model.',
       confirmMarkDone: 'Confirm mark done?', confirmReprocess: 'Confirm process again?', confirmAcknowledge: 'Confirm mark handled?',
       signaturePlaceholder: '— Replied by the AI assistant',
       bridgeTimeout: 'Request timed out (90 seconds). Please try again.', bridgeNetwork: 'Network error: could not reach the plugin service.',
@@ -148,9 +145,6 @@ window.__ModuleLoader__.load({
       digestTitle: '过去 24 小时', digestShow: '查看明细', digestHide: '收起明细', digestEmpty: '过去 24 小时没有结算记录。',
       replyPreview: '我方回复',
       signatureLabel: '回复署名（AI 代发标识）', signatureText: '署名文本', signatureHint: '开启后，新会话的每条 GitLab 回复末尾单独一行加上署名，让对方知道由 AI 助手代复。只影响之后派发的会话。',
-      taskModelQuestion: '咨询问答模型', taskModelReview: '代码审查模型', taskModelChange: '代码修改模型',
-      taskModelDefault: '跟随会话模型',
-      taskModelsHint: '批量预检会为每条 Todo 分类（question/review/change）；各类可固定不同模型，未配置的类型与路由到已有会话的 Todo 使用会话模型。',
       confirmMarkDone: '确认标记完成？', confirmReprocess: '确认重新处理？', confirmAcknowledge: '确认已处理？',
       signaturePlaceholder: '—— 由 AI 助手代复',
       bridgeTimeout: '请求超时（90 秒），请重试。', bridgeNetwork: '网络错误：无法连接插件服务。',
@@ -268,7 +262,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 设置字段级比较：原始值直接比对；sessionModel/taskModels 等嵌套对象递归按字段比对，
+     * 设置字段级比较：原始值直接比对；sessionModel 等嵌套对象递归按字段比对，
      * 引用不同但等值不算变更；undefined 与 null 归一后视为相同。
      */
     function settingsValueEqual(next, prev) {
@@ -732,7 +726,6 @@ window.__ModuleLoader__.load({
                 ? h('a', { href: item.url, target: '_blank', rel: 'noreferrer' }, item.title || `Todo ${item.todoId}`)
                 : h('span', null, item.title || `Todo ${item.todoId}`),
               h('span', { className: 'gta-tag' }, closureLabel(item.closure, t) || item.closure || '—'),
-              item.taskType && h('span', { className: 'gta-muted' }, item.taskType),
               item.round > 1 && h('span', { className: 'gta-muted' }, `${t('roundLabel')} ${item.round}`),
               item.closureNote && h('span', { className: 'gta-muted gta-digest-note' }, item.closureNote),
               item.replyExcerpt && h('span', { className: 'gta-muted gta-digest-reply' },
@@ -789,18 +782,8 @@ window.__ModuleLoader__.load({
                 judgeModel: event.target.value ? JSON.parse(event.target.value) : null,
               }),
             }, modelOptions(draft.judgeModel, t('judgeModelDefault')))),
-            ...['question', 'review', 'change'].map((type) => h('label', { key: type },
-              t(type === 'question' ? 'taskModelQuestion' : type === 'review' ? 'taskModelReview' : 'taskModelChange'),
-              h('select', {
-                value: sessionModelKey(draft.taskModels?.[type]),
-                onChange: (event) => setDraft({
-                  ...draft,
-                  taskModels: { ...(draft.taskModels ?? {}), [type]: event.target.value ? JSON.parse(event.target.value) : null },
-                }),
-              }, modelOptions(draft.taskModels?.[type], t('taskModelDefault'))))),
             h('p', { className: 'gta-muted gta-wide' }, t('sessionModelFixedHint')),
             h('p', { className: 'gta-muted gta-wide' }, t('judgeModelHint')),
-            h('p', { className: 'gta-muted gta-wide' }, t('taskModelsHint')),
             h('label', { className: 'gta-wide' }, t('sessionCwd'), h('select', {
               value: draft.sessionCwd,
               onChange: (event) => setDraft({ ...draft, sessionCwd: event.target.value }),

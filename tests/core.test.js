@@ -2357,7 +2357,6 @@ test('batch judge prompt frames todos as data and lists every verdict field', ()
   assert.match(prompt, /批量预检器/);
   assert.match(prompt, /无人值守/);
   assert.match(prompt, /needsProcessing/);
-  assert.match(prompt, /taskType/);
   assert.match(prompt, /priority/);
   assert.match(prompt, /duplicateOf/);
   assert.match(prompt, /preferSession/);
@@ -2371,16 +2370,14 @@ test('batch judge prompt frames todos as data and lists every verdict field', ()
 
 test('batch verdict parsing tolerates wrappers and normalizes fields', () => {
   const plain = parseBatchJudgeReply([
-    '{"todoId":"a","needsProcessing":true,"reason":"r","taskType":"review","priority":9,"duplicateOf":"a","preferSession":"new"}',
+    '{"todoId":"a","needsProcessing":true,"reason":"r","priority":9,"duplicateOf":"a","preferSession":"new"}',
     '{"todoId":"b","needsProcessing":false}',
   ].map((entry) => entry.replace('{', '{').replace('}', '}')).join(',').replace(/^/, '[').replace(/$/, ']'));
   assert.equal(plain.get('a').needsProcessing, true);
-  assert.equal(plain.get('a').taskType, 'review');
   assert.equal(plain.get('a').priority, 5);
   assert.equal(plain.get('a').duplicateOf, '');
   assert.equal(plain.get('a').preferSession, 'new');
   assert.equal(plain.get('b').needsProcessing, false);
-  assert.equal(plain.get('b').taskType, '');
   assert.equal(plain.get('b').priority, 3);
   assert.equal(plain.get('b').preferSession, 'reuse');
   const wrapped = parseBatchJudgeReply('说明 {"todos":[{"todoId":"a","needsProcessing":true}]} 完');
@@ -2392,23 +2389,16 @@ test('batch verdict parsing tolerates wrappers and normalizes fields', () => {
   assert.equal(parseBatchJudgeReply('[]'), null);
 });
 
-test('signature and per-task model settings validate strictly', () => {
+test('signature and model settings validate strictly', () => {
   const defaults = defaultSettings();
   assert.equal(defaults.replySignature, false);
   assert.equal(defaults.signatureText, '—— 由 AI 助手代复');
-  assert.deepEqual(defaults.taskModels, { question: null, review: null, change: null });
   const next = validateSettings({
     replySignature: true,
     signatureText: ' —— AI 代复 —— ',
-    taskModels: { question: { provider: ' p ', model: ' m ' }, review: null },
   });
   assert.equal(next.replySignature, true);
   assert.equal(next.signatureText, '—— AI 代复 ——');
-  assert.deepEqual(next.taskModels.question, { provider: 'p', model: 'm' });
-  assert.equal(next.taskModels.review, null);
-  assert.equal(next.taskModels.change, null);
-  assert.throws(() => validateSettings({ taskModels: 'x' }), /taskModels/);
-  assert.throws(() => validateSettings({ taskModels: { review: { provider: 'x' } } }), /taskModels\.review/);
   assert.throws(() => validateSettings({ signatureText: 42 }), /署名文本/);
   assert.throws(() => validateSettings({ signatureText: 'x'.repeat(101) }), /署名文本/);
   assert.throws(() => validateSettings({ replySignature: 'yes' }), /replySignature/);
@@ -2419,11 +2409,9 @@ test('v5 states migrate to v6 and new record fields survive round-trips', () => 
   base.version = 5;
   delete base.settings.replySignature;
   delete base.settings.signatureText;
-  delete base.settings.taskModels;
   const mrUrl = 'https://gitlab.local/g/p/-/merge_requests/3';
   base.handled.x = {
     id: 'x', sessionId: 's1', acceptedAt: 10, url: 'https://gitlab.local/g/p/-/issues/1',
-    taskType: 'review',
     lastReply: { id: '99', body: '已处理，见 MR', url: 'https://gitlab.local/g/p/-/issues/1#note_99', createdAt: 20 },
     watch: { mrs: [mrUrl], lastStates: { [mrUrl]: 'running' } },
     acknowledgedAt: 30,
@@ -2432,18 +2420,16 @@ test('v5 states migrate to v6 and new record fields survive round-trips', () => 
   assert.equal(migrated.version, 6);
   assert.equal(migrated.settings.replySignature, false);
   assert.equal(migrated.settings.signatureText, '—— 由 AI 助手代复');
-  assert.deepEqual(migrated.settings.taskModels, { question: null, review: null, change: null });
-  assert.equal(migrated.handled.x.taskType, 'review');
+  assert.equal(migrated.handled.x.taskType, undefined);
   assert.equal(migrated.handled.x.lastReply.body, '已处理，见 MR');
   assert.equal(migrated.handled.x.watch.mrs[0], mrUrl);
   assert.equal(migrated.handled.x.watch.lastStates[mrUrl], 'running');
   assert.equal(migrated.handled.x.acknowledgedAt, 30);
-  // 坏字段归位：taskType 白名单外归 ''，空 watch / 空回复归 null。
+  // 坏字段归位：空 watch / 空回复归 null；旧记录的 taskType 字段在新版本中被丢弃。
   const dirty = normalizeState(JSON.parse(JSON.stringify({
     ...migrated,
     handled: { ...migrated.handled, y: { ...migrated.handled.x, id: 'y', taskType: 'bogus', watch: { mrs: [] }, lastReply: { body: '' } } },
   })));
-  assert.equal(dirty.handled.y.taskType, '');
   assert.equal(dirty.handled.y.watch, null);
   assert.equal(dirty.handled.y.lastReply, null);
 });
@@ -2520,7 +2506,7 @@ test('batch precheck dispatches by priority and folds duplicates into the primar
   const reply = JSON.stringify([
     { todoId: 'dup', needsProcessing: true, reason: '重复', duplicateOf: 'main' },
     { todoId: 'main', needsProcessing: true, reason: '主条目', taskType: 'question', priority: 2 },
-    { todoId: 'urgent', needsProcessing: true, reason: '紧急', taskType: 'change', priority: 1 },
+    { todoId: 'urgent', needsProcessing: true, reason: '紧急', priority: 1 },
   ]);
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
   runtime.ctx.llm = {
@@ -2555,8 +2541,6 @@ test('batch precheck dispatches by priority and folds duplicates into the primar
   assert.equal(calls.create, 2);
   // priority 1（urgent）先派发，priority 2（main）随后。
   assert.deepEqual(calls.renames.map((request) => request.title), ['[协助]-issue-9-note-30', '[协助]-issue-8-note-20']);
-  assert.equal(runtime.state.handled.urgent.taskType, 'change');
-  assert.equal(runtime.state.handled.main.taskType, 'question');
   assert.equal(runtime.judgeVerdicts.size, 0);
   await runtime.stop();
 });
@@ -2651,24 +2635,6 @@ test('missing batch verdicts skip the round instead of dispatching blindly', asy
   await runtime.stop();
 });
 
-test('task type routes model selection per class', async () => {
-  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
-  runtime.state.settings.sessionModel = { provider: 'deepseek', model: 'deepseek-chat' };
-  runtime.state.settings.taskModels = { question: null, review: { provider: 'x', model: 'review-model' }, change: null };
-  runtime.judgeVerdicts.set('direct', { needsProcessing: true, taskType: 'review', preferSession: 'reuse' });
-  const [reviewTodo] = normalizeTodos([directNoteTodo]);
-  await runtime.dispatch(reviewTodo, false, { trackSlot: true });
-  assert.deepEqual(calls.modelSelections, [{ sessionId: 'session-1', provider: 'x', model: 'review-model' }]);
-  assert.equal(runtime.state.handled.direct.taskType, 'review');
-  calls.modelSelections.length = 0;
-  runtime.judgeVerdicts.set('plain', { needsProcessing: true, taskType: 'question', preferSession: 'reuse' });
-  const [plainTodo] = normalizeTodos([{ ...directNoteTodo, id: 'plain', target_url: 'https://gitlab.local/group/project/-/issues/8#note_11' }]);
-  await runtime.dispatch(plainTodo, false, { trackSlot: true });
-  // 未命中类型映射（question 为 null）退回会话模型。
-  assert.deepEqual(calls.modelSelections, [{ sessionId: 'session-2', provider: 'deepseek', model: 'deepseek-chat' }]);
-  await runtime.stop();
-});
-
 test('preferSession new skips same-target routing and opens a fresh session', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   runtime.state.settings.autoRoute = true;
@@ -2679,12 +2645,12 @@ test('preferSession new skips same-target routing and opens a fresh session', as
   await runtime.dispatch(first, false, { trackSlot: true });
   assert.equal(calls.create, 1);
   // 同目标默认复用（既有行为基线）：判定 preferSession=reuse 仍路由。
-  runtime.judgeVerdicts.set('reuse-todo', { needsProcessing: true, taskType: '', preferSession: 'reuse' });
+  runtime.judgeVerdicts.set('reuse-todo', { needsProcessing: true, preferSession: 'reuse' });
   const [reuseTodo] = normalizeTodos([{ ...directNoteTodo, id: 'reuse-todo', target_url: 'https://gitlab.local/group/project/-/issues/7#note_77' }]);
   const reuseResult = await runtime.dispatch(reuseTodo, false, { trackSlot: true });
   assert.equal(reuseResult.routed, true);
   // 判定 preferSession=new：虽同目标也不复用，改开新会话。
-  runtime.judgeVerdicts.set('later', { needsProcessing: true, taskType: '', preferSession: 'new' });
+  runtime.judgeVerdicts.set('later', { needsProcessing: true, preferSession: 'new' });
   const freshResult = await runtime.dispatch(later, false, { trackSlot: true });
   assert.equal(freshResult.ok, true);
   assert.equal(freshResult.routed, false);
@@ -2811,14 +2777,13 @@ test('acknowledging a needs-human record closes it and archives the session', as
 test('manual dispatch ignores leftover batch verdicts', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
   runtime.state.settings.sessionModel = { provider: 'deepseek', model: 'deepseek-chat' };
-  runtime.state.settings.taskModels = { question: null, review: { provider: 'x', model: 'review-model' }, change: null };
   // 预检留下的判定（pump 等待并发槽时用户点了手动“开 Session 处理”）。
-  runtime.judgeVerdicts.set('direct', { needsProcessing: true, taskType: 'review', preferSession: 'reuse' });
+  runtime.judgeVerdicts.set('direct', { needsProcessing: true, preferSession: 'reuse' });
   const [todo] = normalizeTodos([directNoteTodo]);
   runtime.state.todos = [todo];
   const result = await runtime.dispatchById(todo.id);
   assert.equal(result.ok, true);
-  // 手动派发不吃任务类型映射，仍用会话模型；判定被丢弃不再残留。
+  // 手动派发用会话模型；判定被丢弃不再残留。
   assert.deepEqual(calls.modelSelections, [{ sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-chat' }]);
   assert.equal(runtime.judgeVerdicts.has(todo.id), false);
   await runtime.stop();
