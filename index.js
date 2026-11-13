@@ -25,6 +25,7 @@ import {
   normalizeTodos,
   normalizeWorkspacePath,
   parseBatchJudgeReply,
+  pruneHandled,
   parseJudgeReply,
   publicState,
   selectPendingTodos,
@@ -1073,7 +1074,7 @@ export class GitlabTodoRuntime {
     });
     try {
       for (let page = 1; page <= MAX_DISCUSSION_PAGES; page += 1) {
-        const stdout = await this.runGlab(['api', '-X', 'GET', api, '-F', 'per_page=100', '-F', `page=${page}`]);
+        const stdout = await this.runGlab(['api', '-X', 'GET', api, '-F', 'per_page=100', '-F', `page=${page}`, '-F', 'order_by=updated_at', '-F', 'sort=desc']);
         const discussions = JSON.parse(stdout);
         if (!Array.isArray(discussions)) return null;
         for (const discussion of discussions) {
@@ -1194,7 +1195,7 @@ export class GitlabTodoRuntime {
     if (!api || !item?.noteId || !this.gitlabUserId) return null;
     try {
       for (let page = 1; page <= MAX_DISCUSSION_PAGES; page += 1) {
-        const stdout = await this.runGlab(['api', '-X', 'GET', api, '-F', 'per_page=100', '-F', `page=${page}`]);
+        const stdout = await this.runGlab(['api', '-X', 'GET', api, '-F', 'per_page=100', '-F', `page=${page}`, '-F', 'order_by=updated_at', '-F', 'sort=desc']);
         const discussions = JSON.parse(stdout);
         if (!Array.isArray(discussions)) return null;
         for (const discussion of discussions) {
@@ -1364,6 +1365,11 @@ export class GitlabTodoRuntime {
   }
 
   async executePoll(source) {
+    const pruned = pruneHandled(this.state.handled).deleted;
+    if (pruned.length > 0) {
+      for (const id of pruned) delete this.state.handled[id];
+      this.ctx.logger?.info?.(`[gitlab-todo-agent] 清理 handled 历史记录 ${pruned.length} 条。`);
+    }
     if (this.stopping) return this.snapshot();
     this.state.lastRunAt = Date.now();
     this.state.lastPollError = null;

@@ -19,6 +19,7 @@ import {
   parseClosureReport,
   parseJudgeReply,
   classifyTodo,
+  pruneHandled,
   defaultSettings,
   initialState,
   isDescriptionMention,
@@ -2432,6 +2433,47 @@ test('v5 states migrate to v6 and new record fields survive round-trips', () => 
   })));
   assert.equal(dirty.handled.y.watch, null);
   assert.equal(dirty.handled.y.lastReply, null);
+});
+
+test('handled GC drops settled records past retention and caps the survivors', () => {
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  const mk = (over = {}) => ({
+    id: 'x', sessionId: 's', outcome: 'session-accepted',
+    acceptedAt: now - 10 * day, completedAt: now - 5 * day,
+    closure: 'closed', ...over,
+  });
+  const handled = {
+    // 过期 closed（completedAt 91 天）→ 删
+    oldClosed: mk({ id: 'oldClosed', completedAt: now - 91 * day }),
+    // 未过期 closed → 保留
+    freshClosed: mk({ id: 'freshClosed', completedAt: now - 10 * day }),
+    // 过期 rule-skipped（acceptedAt 31 天，无 completedAt 时按 acceptedAt）→ 删
+    oldSkipped: mk({ id: 'oldSkipped', outcome: 'rule-skipped', completedAt: null, acceptedAt: now - 31 * day, closure: 'closed' }),
+    // 活跃记录永不删：follow-up 哪怕很旧也留
+    activeFollowUp: mk({ id: 'activeFollowUp', closure: 'follow-up', completedAt: null, nextAttemptAt: now + day, acceptedAt: now - 200 * day }),
+    // 未确认的 needs-human 永不删（哪怕 completedAt 很旧）
+    openNeedsHuman: mk({ id: 'openNeedsHuman', closure: 'needs-human', acknowledgedAt: null, completedAt: now - 200 * day }),
+    // 已确认 needs-human 过期（acknowledgedAt 91 天）→ 删
+    ackedNeedsHuman: mk({ id: 'ackedNeedsHuman', closure: 'needs-human', acknowledgedAt: now - 91 * day, completedAt: now - 200 * day }),
+    // pendingUnconfirmed 永不删
+    pendingOld: mk({ id: 'pendingOld', pendingUnconfirmed: true, closure: 'needs-human', acknowledgedAt: now - 200 * day }),
+  };
+  const first = pruneHandled(handled);
+  assert.deepEqual(first.deleted.sort(), ['ackedNeedsHuman', 'oldClosed', 'oldSkipped'].sort());
+  for (const id of first.deleted) delete handled[id];
+  assert.equal(handled.freshClosed.closure, 'closed');
+  assert.equal(handled.activeFollowUp.closure, 'follow-up');
+  assert.equal(handled.openNeedsHuman.closure, 'needs-human');
+  assert.equal(handled.pendingOld.pendingUnconfirmed, true);
+
+  // 上限：再补 505 条新鲜 closed，已结算总数 507 > 500，按结算时间删最旧 7 条。
+  const many = {};
+  for (let i = 0; i < 505; i += 1) {
+    many[`c${i}`] = mk({ id: `c${i}`, completedAt: now - i * 1000 });
+  }
+  const capped = pruneHandled({ ...handled, ...many });
+  // HANDLED_SETTLED_MAX=500 只约束已结算记录，活跃记录不占名额。\n  assert.equal(505 + 1 - capped.deleted.length, 500);
 });
 
 test('digest summarizes the last day and the inbox lists unacknowledged needs-human only', () => {
