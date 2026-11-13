@@ -615,12 +615,16 @@ const TARGET_PATH_PATTERNS = [
 ];
 
 /**
- * 新会话标题：[协助]-<类型短名>-<目标ID>[-note-<noteID>]。
- * 解析不出类型时退回 URL 路径最后两段，再退回 todo id，
- * 保证标题永远非空且尽量可定位回源对象。
+ * Issue 面板会话标题固定为“仓库名 #Issue 编号”，不带轮次。
+ * Todo 仍使用 [协助]-<类型短名>-<目标ID>[-note-<noteID>][-续N]。
  */
 export function buildSessionTitle(todo, round = 1) {
   const url = String(todo?.url ?? '');
+  if (isIssueItem(todo)) {
+    const repository = String(todo.project ?? '').split('/').filter(Boolean).pop() || 'Issue';
+    const number = String(todo.iid ?? '').trim() || url.match(/\/-\/(?:issues|work_items)\/(\d+)/)?.[1] || 'unknown';
+    return `${repository} #${number}`;
+  }
   const noteId = String(todo?.noteId ?? '');
   // 续办会话（第 2 轮起）在标题末尾加 -续N，N 为第几次续办。
   const suffix = Number.isSafeInteger(round) && round > 1 ? `-续${round - 1}` : '';
@@ -1174,9 +1178,8 @@ function buildEnvironmentLines(todo, context) {
 }
 
 /**
- * 任务书提示词（todo / issue 两个变体共享骨架）。
- * unit: 'todo' = 评论提及 Todo（mark_as_done 闭环）；'issue' = 面板手动指派的 Issue（Issue 关闭闭环）。
- * 差异点：触发来源、处理要求第 0/4/6 条、元数据字段（issue 带 iid/labels/body）。
+ * Todo 任务书提示词骨架；Issue 面板使用下方独立的极简 buildIssuePrompt。
+ * 保留内部 unit 分支以避免在本次 Issue 调整中改动 Todo 的既有生成逻辑。
  */
 function buildTaskPrompt(todo, context = {}) {
   const unit = context.unit === 'issue' ? 'issue' : 'todo';
@@ -1311,9 +1314,9 @@ export function buildTodoPrompt(todo, context = {}) {
   return buildTaskPrompt(todo, context);
 }
 
-/** Issue 面板「处理」任务的提示词变体：闭环 = Issue 关闭；完成动作 = 发顶层评论 + 关闭 Issue。 */
-export function buildIssuePrompt(issue, context = {}) {
-  return buildTaskPrompt(issue, { ...context, unit: 'issue' });
+/** Issue 面板只发送目标与动作；项目规则由新会话工作区的 AGENTS.md／CLAUDE.md 提供。 */
+export function buildIssuePrompt(issue) {
+  return [String(issue?.url ?? '').trim(), '开始处理'].filter(Boolean).join('\n');
 }
 
 export function initialState() {
