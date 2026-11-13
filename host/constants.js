@@ -5,6 +5,8 @@
 
 export const TODO_PAGE_SIZE = 100;
 export const MAX_TODO_PAGES = 20;
+/** Issue 面板“指派给我的开放 Issue”最多翻页数（每页 100，覆盖 300 条）。 */
+export const MAX_ISSUE_PAGES = 3;
 export const MAX_RULE_SKIPS_PER_POLL = 20;
 export const PRECHECK_CONCURRENCY = 3;
 /** 同一 Todo 预检连续失败这么多轮后降级为直接派发（此前每轮都会跳过）。 */

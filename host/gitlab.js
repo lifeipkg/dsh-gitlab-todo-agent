@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
-import { normalizeTodos } from '../core.js';
-import { MAX_TODO_PAGES, TODO_PAGE_SIZE } from './constants.js';
+import { issueApiPath, normalizeIssue, normalizeTodos } from '../core.js';
+import { MAX_ISSUE_PAGES, MAX_TODO_PAGES, TODO_PAGE_SIZE } from './constants.js';
 import { errorMessage } from './util.js';
 
 /**
@@ -52,6 +52,57 @@ export const gitlabMethods = {
 
   async markTodoDone(todo) {
     await this.runGlab(['api', '-X', 'POST', `todos/${encodeURIComponent(todo.id)}/mark_as_done`]);
+  },
+
+  /**
+   * 指派给我的开放 Issue 列表（Issue 面板数据源）：REST /issues 跨项目聚合接口，
+   * scope=assigned_to_me 固定；只取 opened。坏行（缺 iid/project_id）由 normalizeIssue 丢弃。
+   */
+  async fetchIssues() {
+    await this.currentGitlabUserId();
+    const items = [];
+    for (let page = 1; page <= MAX_ISSUE_PAGES; page += 1) {
+      const stdout = await this.runGlab([
+        'api', '-X', 'GET', 'issues',
+        '-F', 'scope=assigned_to_me',
+        '-F', 'state=opened',
+        '-F', 'order_by=updated_at',
+        '-F', 'sort=desc',
+        '-F', `per_page=${TODO_PAGE_SIZE}`,
+        '-F', `page=${page}`,
+      ]);
+      let pageItems;
+      try {
+        pageItems = JSON.parse(stdout);
+      } catch (error) {
+        throw new Error(`解析 GitLab Issue 第 ${page} 页失败：${errorMessage(error)}`);
+      }
+      if (!Array.isArray(pageItems)) throw new Error(`GitLab Issue 第 ${page} 页响应不是数组。`);
+      for (const raw of pageItems) {
+        const item = normalizeIssue(raw);
+        if (item) items.push(item);
+      }
+      if (pageItems.length < TODO_PAGE_SIZE) break;
+    }
+    return items;
+  },
+
+  /**
+   * 闭环核对“只认 Issue 关闭”的事实来源：返回 true 已关闭 / false 仍开放 / null 无法判定。
+   * 无法判定（接口失败、解析不出路径）时调用方不得按“已关闭”结算。
+   */
+  async issueIsClosed(item) {
+    const api = issueApiPath(item);
+    if (!api) return null;
+    try {
+      const stdout = await this.runGlab(['api', '-X', 'GET', api]);
+      const issue = JSON.parse(stdout);
+      if (typeof issue?.state !== 'string') return null;
+      return issue.state === 'closed';
+    } catch (error) {
+      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 核对 Issue 状态失败（${api}）：${errorMessage(error)}`);
+      return null;
+    }
   },
 
   async runGlab(args) {

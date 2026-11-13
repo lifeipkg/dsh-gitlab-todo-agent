@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import {
+  buildIssuePrompt,
   buildSessionTitle,
   buildTodoPrompt,
   buildWorkspaceOverview,
   classifyTodo,
   DEFAULT_SIGNATURE_TEXT,
   findRouteTargets,
+  isIssueItem,
   normalizeMrUrls,
   normalizeWorkspacePath,
   pruneHandled,
@@ -226,15 +228,28 @@ export const dispatchMethods = {
     return buildWorkspaceOverview(workspaces, roster, this.pluginSessionRecords(), this.state.settings.sessionCwd);
   },
 
+  /**
+   * 按 id 找任务条目：先查本轮 Todo，再查 Issue 面板缓存（合成 id `issue-*`），
+   * 最后回落到 handled/pending 里保存的 item 快照（列表刷新后仍可重新处理）。
+   */
+  itemById(id) {
+    const key = String(id ?? '');
+    if (!key) return null;
+    const direct = this.state.todos.find((item) => item.id === key)
+      ?? (Array.isArray(this.state.issues) ? this.state.issues.find((item) => item.id === key) : null);
+    if (direct) return direct;
+    return this.state.handled[key]?.item ?? this.state.pending[key]?.item ?? null;
+  },
+
   async dispatchById(id) {
-    const todo = this.state.todos.find((item) => item.id === id);
-    if (!todo) return { ok: false, error: '当前轮询结果中找不到该 Todo，请先重新检查。' };
+    const todo = this.itemById(id);
+    if (!todo) return { ok: false, error: '当前列表中找不到该对象，请刷新后重试。' };
     return this.dispatch(todo, Boolean(this.state.handled[id]));
   },
 
   async routeById(id, sessionId) {
-    const todo = this.state.todos.find((item) => item.id === id);
-    if (!todo) return { ok: false, error: '当前轮询结果中找不到该 Todo，请先重新检查。' };
+    const todo = this.itemById(id);
+    if (!todo) return { ok: false, error: '当前列表中找不到该对象，请刷新后重试。' };
     if (typeof sessionId !== 'string' || !sessionId.trim()) return { ok: false, error: '缺少目标 sessionId。' };
     return this.dispatch(todo, Boolean(this.state.handled[id]), { route: { sessionId: sessionId.trim() } });
   },
@@ -286,7 +301,8 @@ export const dispatchMethods = {
     const owned = this.pluginCreatedSessionIds();
     const archived = this.archivedSessionIds();
     const scope = this.state.settings.routeScope;
-    const todo = this.state.todos.find((item) => item.id === todoId);
+    // Todo 与 Issue 面板条目都可以发起路由：按同一 id 空间查找。
+    const todo = this.itemById(todoId);
     const key = targetKey(todo?.url);
     const recordsBySession = new Map();
     for (const record of Object.values(this.state.handled)) {
@@ -477,7 +493,8 @@ export const dispatchMethods = {
     }
     const item = record.item ?? this.state.todos.find((todo) => todo.id === record.id) ?? null;
     let note = '人工确认已处理';
-    if (item) {
+    // Issue 记录没有对应 GitLab Todo，mark_as_done 必然 404；人工确认只做状态与归档处理。
+    if (item && !isIssueItem(item)) {
       try {
         await this.markTodoDone(item);
       } catch (error) {
@@ -718,7 +735,7 @@ export const dispatchMethods = {
         mode: route?.mode ?? 'queue',
         content: [{
           type: 'text',
-          text: buildTodoPrompt(todo, {
+          text: (isIssueItem(todo) ? buildIssuePrompt : buildTodoPrompt)(todo, {
             me: { username: this.gitlabUsername, id: this.gitlabUserId },
             sessionTitle: effectiveTitle,
             now: Date.now(),

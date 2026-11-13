@@ -89,6 +89,9 @@ window.__ModuleLoader__.load({
       replyPreview: 'Our reply',
       signatureLabel: 'Sign replies as AI-generated', signatureText: 'Signature text', signatureHint: 'When enabled, every GitLab reply ends with a one-line signature so readers know it was sent by an AI assistant. Applies to new prompts only.',
       confirmMarkDone: 'Confirm mark done?', confirmReprocess: 'Confirm process again?', confirmAcknowledge: 'Confirm mark handled?',
+      issuesTitle: 'Issues', issuesEmpty: 'No open issues assigned to you on GitLab.',
+      issuesError: 'Could not load the issue list', issuesHint: 'Open issues assigned to you',
+      issuesOrphans: 'No longer open or assigned (kept for session access)', issueTag: 'Issue',
       signaturePlaceholder: '— Replied by the AI assistant',
       bridgeTimeout: 'Request timed out (90 seconds). Please try again.', bridgeNetwork: 'Network error: could not reach the plugin service.',
       colon: ': ',
@@ -176,6 +179,9 @@ window.__ModuleLoader__.load({
       replyPreview: '我方回复',
       signatureLabel: '回复署名（AI 代发标识）', signatureText: '署名文本', signatureHint: '开启后，新会话的每条 GitLab 回复末尾单独一行加上署名，让对方知道由 AI 助手代复。只影响之后派发的会话。',
       confirmMarkDone: '确认标记完成？', confirmReprocess: '确认重新处理？', confirmAcknowledge: '确认已处理？',
+      issuesTitle: 'Issue', issuesEmpty: 'GitLab 上没有指派给你的开放 Issue。',
+      issuesError: '无法加载 Issue 列表', issuesHint: 'GitLab 上指派给我的开放 Issue',
+      issuesOrphans: '已不在待处理列表（已关闭或不再指派给我）', issueTag: 'Issue',
       signaturePlaceholder: '—— 由 AI 助手代复',
       bridgeTimeout: '请求超时（90 秒），请重试。', bridgeNetwork: '网络错误：无法连接插件服务。',
       colon: '：',
@@ -185,7 +191,7 @@ window.__ModuleLoader__.load({
     let bridgeText = (key) => en[key] ?? key;
 
     async function bridge(action, options = {}) {
-      const method = options.method ?? (action === 'state' || action === 'models' || action === 'workspaces' ? 'GET' : 'POST');
+      const method = options.method ?? (action === 'state' || action === 'models' || action === 'workspaces' || action === 'issues' ? 'GET' : 'POST');
       const headers = { Accept: 'application/json' };
       if (method === 'POST') headers['Content-Type'] = 'application/json';
       const query = method === 'GET' ? `?action=${encodeURIComponent(action)}` : '';
@@ -475,6 +481,38 @@ window.__ModuleLoader__.load({
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [activeTab]);
 
+      // Issue 面板：指派给我的开放 Issue + 处理记录投影。打开 Tab 时重拉一次 GitLab，
+      // 之后跟随快照轮询缓存投影（GET issues 不触发远端请求）；「刷新」按钮走显式 refresh。
+      const [issuesData, setIssuesData] = React.useState(null);
+      const [issuesError, setIssuesError] = React.useState(null);
+      const [issuesBusy, setIssuesBusy] = React.useState(false);
+      const issuesInFlight = React.useRef(false);
+      const fetchIssues = async (refresh = false) => {
+        if (issuesInFlight.current) return;
+        issuesInFlight.current = true;
+        if (refresh) setIssuesBusy(true);
+        try {
+          const data = refresh ? await post('issues', { refresh: true }) : await bridge('issues');
+          setIssuesData({
+            items: Array.isArray(data.items) ? data.items : [],
+            orphans: Array.isArray(data.orphans) ? data.orphans : [],
+          });
+          setIssuesError(null);
+        } catch (cause) {
+          setIssuesError(cause.message);
+        } finally {
+          issuesInFlight.current = false;
+          if (refresh) setIssuesBusy(false);
+        }
+      };
+      React.useEffect(() => {
+        if (activeTab !== 'issues') return undefined;
+        void fetchIssues(true);
+        const timer = setInterval(() => void fetchIssues(false), 5000);
+        return () => clearInterval(timer);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [activeTab]);
+
       const [digestOpen, setDigestOpen] = React.useState(false);
 
       const needWorkspacePolling = activeTab === 'workspaces' || Boolean(draft);
@@ -634,7 +672,10 @@ window.__ModuleLoader__.load({
         }).then((done) => {
           if (!done) return;
           closeRouteTargets();
-          void refreshSessions();
+          // v2.29 遗留笔误：refreshSessions 已不存在；路由成功的记录进已处理投影，
+          // Issue 条目再顺带刷新 Issue 面板。
+          void refreshHandled();
+          if (routeTodo?.source === 'issue') void fetchIssues(false);
         });
       };
 
@@ -659,6 +700,10 @@ window.__ModuleLoader__.load({
         .then((done) => { if (done) void fetchInbox(); });
       // Todo 主按钮（开会话/重新处理）与“标记完成”都走 dispatch：Host 端会把非 directMention 的 MR 直接标记完成。
       const dispatchTodo = (todo) => perform(`dispatch:${todo.id}`, () => post('dispatch', { id: todo.id }));
+      // Issue 面板「处理」：同一 dispatch 通道（Host 端按合成 id 找到缓存条目）；
+      // 成功后立刻刷新投影，把行状态换成“执行中”。
+      const dispatchIssue = (issue) => perform(`dispatch:${issue.id}`, () => post('dispatch', { id: issue.id }))
+        .then((done) => { if (done) void fetchIssues(false); });
       // 快捷切换归档状态：成功后连同已处理页一起刷新。
       const toggleSessionArchive = (record) => perform(`archive:${record.sessionId}`, () => post('setSessionArchived', {
         sessionId: record.sessionId,
@@ -969,6 +1014,12 @@ window.__ModuleLoader__.load({
             onClick: () => setActiveTab('todos'),
           }, `${t('todoList')} (${snapshot.todos.length})`),
           h('button', {
+            type: 'button', role: 'tab', id: `${PANEL_ID}-tab-issues`, 'aria-selected': activeTab === 'issues',
+            'aria-controls': `${PANEL_ID}-panel-issues`,
+            className: `gta-tab${activeTab === 'issues' ? ' gta-tab-active' : ''}`,
+            onClick: () => setActiveTab('issues'),
+          }, `${t('issuesTitle')} (${issuesData?.items.length ?? snapshot.issueCount ?? 0})`),
+          h('button', {
             type: 'button', role: 'tab', id: `${PANEL_ID}-tab-handled`, 'aria-selected': activeTab === 'handled',
             'aria-controls': `${PANEL_ID}-panel-handled`,
             className: `gta-tab${activeTab === 'handled' ? ' gta-tab-active' : ''}`,
@@ -1058,6 +1109,77 @@ window.__ModuleLoader__.load({
                 ),
               )),
         ),
+        activeTab === 'issues' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-issues`, 'aria-labelledby': `${PANEL_ID}-tab-issues` },
+          h('div', { className: 'gta-section-title' },
+            h('h2', null, t('issuesTitle')),
+            h('div', { className: 'gta-todo-actions' },
+              h('span', { className: 'gta-muted' }, `${t('issuesHint')}${colon()}${issuesData ? issuesData.items.length : '…'}`),
+              h(Button, { disabled: issuesBusy, onClick: () => { void fetchIssues(true); } },
+                issuesBusy ? '…' : t('refresh')),
+            )),
+          issuesError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('issuesError')}${colon()}${issuesError}`),
+          !issuesData && !issuesError && h('div', { className: 'gta-empty' }, t('loading')),
+          issuesData && issuesData.items.length === 0 && issuesData.orphans.length === 0 && h('div', { className: 'gta-empty' }, t('issuesEmpty')),
+          issuesData && issuesData.items.length > 0 && h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('issuesTitle') },
+            issuesData.items.map((issue) =>
+              h('article', { className: 'gta-todo', key: issue.id },
+                h('div', { className: 'gta-todo-main' },
+                  h('div', { className: 'gta-todo-title' },
+                    issue.url
+                      ? h('a', { href: issue.url, target: '_blank', rel: 'noreferrer' }, issue.title)
+                      : h('span', null, issue.title),
+                    ...(Array.isArray(issue.labels) ? issue.labels.slice(0, 4).map((label) => h('span', { key: `label:${label}`, className: 'gta-tag' }, label)) : []),
+                    issue.handled && h('span', { className: `gta-tag ${issue.executionStatus === 'completed' || issue.closure === 'closed' ? 'gta-tag-success' : ''}` }, handledStatusLabel(issue, t)),
+                    routedLabel(issue, t) && h('span', { className: 'gta-tag gta-tag-routed' }, routedLabel(issue, t)),
+                  ),
+                  h('div', { className: 'gta-muted gta-meta' }, [
+                    `#${issue.iid ?? ''}`, issue.project,
+                    issue.author && `@${issue.author}`,
+                    issue.updatedAt && formatTime(Date.parse(issue.updatedAt), ''),
+                    ...closureMeta(issue, t),
+                  ].filter(Boolean).join(' · ')),
+                ),
+                h('div', { className: 'gta-todo-actions' },
+                  issue.sessionId && h(Button, { onClick: () => openSession(issue.sessionId) }, t('openSession')),
+                  h(Button, {
+                    primary: !issue.handled,
+                    disabled: busySet.has(`dispatch:${issue.id}`) || issue.executionStatus === 'running' || issue.executionStatus === 'starting',
+                    onClick: issue.handled
+                      ? guardedRun(`reprocess:${issue.id}`, () => { void dispatchIssue(issue); })
+                      : () => { void dispatchIssue(issue); },
+                  }, busySet.has(`dispatch:${issue.id}`) ? '…'
+                    : issue.handled && confirmKeys.has(`reprocess:${issue.id}`) ? t('confirmReprocess')
+                    : issue.handled ? t('reprocess') : t('process')),
+                  !issue.handled && h(Button, {
+                    disabled: busySet.has(`dispatch:${issue.id}`),
+                    onClick: () => openRouteTargets(issue),
+                  }, t('routeToSession')),
+                ),
+              ))),
+          issuesData && issuesData.orphans.length > 0 && h('div', { className: 'gta-section-title', style: { marginTop: '18px' } },
+            h('h2', null, t('issuesOrphans')),
+            h('span', { className: 'gta-muted' }, `${issuesData.orphans.length}`)),
+          issuesData && issuesData.orphans.length > 0 && h('div', { className: 'gta-list', role: 'list', 'aria-label': t('issuesOrphans') },
+            issuesData.orphans.map((issue) =>
+              h('article', { className: 'gta-todo', key: `orphan:${issue.id}` },
+                h('div', { className: 'gta-todo-main' },
+                  h('div', { className: 'gta-todo-title' },
+                    issue.url
+                      ? h('a', { href: issue.url, target: '_blank', rel: 'noreferrer' }, issue.title)
+                      : h('span', null, issue.title),
+                    h('span', { className: `gta-tag ${issue.closure === 'closed' || issue.executionStatus === 'completed' ? 'gta-tag-success' : ''}` }, handledStatusLabel(issue, t)),
+                  ),
+                  h('div', { className: 'gta-muted gta-meta' }, [
+                    `#${issue.iid ?? ''}`, issue.project,
+                    issue.sessionTitle,
+                    ...closureMeta(issue, t),
+                  ].filter(Boolean).join(' · ')),
+                ),
+                h('div', { className: 'gta-todo-actions' },
+                  issue.sessionId && h(Button, { onClick: () => openSession(issue.sessionId) }, t('openSession')),
+                ),
+              ))),
+        ),
         activeTab === 'handled' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-handled`, 'aria-labelledby': `${PANEL_ID}-tab-handled` },
           h('div', { className: 'gta-section-title' }, h('h2', null, t('handledTitle')), h('span', { className: 'gta-muted' },
             handledData ? `${handledData.items.length}/${handledData.total}` : `${snapshot.handledCount}`)),
@@ -1075,6 +1197,7 @@ window.__ModuleLoader__.load({
                       routedLabel(item, t) && h('span', { className: 'gta-tag gta-tag-routed' }, routedLabel(item, t)),
                       item.closure && handledStatusLabel(item, t) !== closureLabel(item.closure, t)
                         && h('span', { className: `gta-tag ${item.closure === 'closed' ? 'gta-tag-success' : ''}` }, closureLabel(item.closure, t)),
+                      item.source === 'issue' && h('span', { className: 'gta-tag gta-tag-mention' }, t('issueTag')),
                       h('span', { className: 'gta-tag gta-tag-mention' }, item.automatic ? t('autoDispatch') : t('manualDispatch')),
                       item.archived && h('span', { className: 'gta-tag gta-tag-success' }, t('sessionArchived')),
                     ),

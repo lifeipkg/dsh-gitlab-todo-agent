@@ -16,6 +16,7 @@ import {
 import { BRIDGE_PATH, MAX_REQUEST_BYTES } from './host/constants.js';
 import { attachRuntimeMethods, errorMessage, jsonResponse } from './host/util.js';
 import { gitlabMethods } from './host/gitlab.js';
+import { issuesMethods } from './host/issues.js';
 import { precheckMethods } from './host/precheck.js';
 import { precheckJevMethods } from './host/precheck-jev.js';
 import { slotsMethods } from './host/slots.js';
@@ -30,7 +31,8 @@ const LEGACY_STATE_FILE = join(PACKAGE_DIR, '.runtime', 'state.json');
 /**
  * 运行时骨架：状态生命周期（加载/迁移/持久化）、轮询与对账定时器、bridge 入口。
  * 业务方法按域拆分在 host/*.js，启动时 attachRuntimeMethods 挂到本类原型：
- *   host/gitlab.js    glab 子进程、当前用户、Todo 分页、标记完成
+ *   host/gitlab.js    glab 子进程、当前用户、Todo/Issue 分页、标记完成、Issue 状态核对
+ *   host/issues.js    Issue 面板（刷新“指派给我的开放 Issue”缓存、面板投影）
  *   host/precheck.js  预检调度（LLM 单条 + 批量 + 失败降级 + 引擎选择）
  *   host/precheck-jev.js  Jev/System One 分类器预检（宿主 classify → jev CLI → HTTP 三层通道）
  *   host/slots.js     并发槽、会话跟踪、对账结算（reconcile）
@@ -232,6 +234,10 @@ export class GitlabTodoRuntime {
       if (request.method === 'GET' && url.searchParams.get('action') === 'workspaces') {
         return jsonResponse(200, { ok: true, workspaces: await this.workspaceOverview() });
       }
+      if (request.method === 'GET' && url.searchParams.get('action') === 'issues') {
+        // Issue 面板：读缓存投影（不发 glab）；刷新走 POST issues {refresh:true}。
+        return jsonResponse(200, { ok: true, ...this.issueProjection() });
+      }
       if (request.method !== 'POST') {
         return jsonResponse(405, { ok: false, error: '不支持的请求方法。' });
       }
@@ -248,6 +254,11 @@ export class GitlabTodoRuntime {
       }
       if (body.action === 'workspaces') {
         return jsonResponse(200, { ok: true, workspaces: await this.workspaceOverview() });
+      }
+      if (body.action === 'issues') {
+        // Issue 面板：refresh 显式重拉 GitLab（慢操作，90s bridge 超时内）；否则返回缓存投影。
+        const projection = body.refresh === true ? await this.refreshIssues() : this.issueProjection();
+        return jsonResponse(200, { ok: true, ...projection });
       }
       if (body.action === 'poll') {
         const state = await this.poll('manual');
@@ -294,6 +305,7 @@ export class GitlabTodoRuntime {
 // 挂载各域方法集；同名冲突会在加载期直接报错，不会静默覆盖。
 attachRuntimeMethods(GitlabTodoRuntime, [
   gitlabMethods,
+  issuesMethods,
   precheckMethods,
   precheckJevMethods,
   slotsMethods,
