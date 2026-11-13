@@ -280,7 +280,7 @@ export const precheckJevMethods = {
       try {
         return [todo.id, await this.jevJudgeTodo(todo, sameTarget[todo.id] ?? [], mentions.filter((peer) => peer.id !== todo.id))];
       } catch (error) {
-        this.ctx.logger?.warn?.(`[gitlab-todo-agent] Todo ${todo.id} Jev 判定失败：${errorMessage(error)}`);
+        this.logger.warn(`Todo ${todo.id} Jev 判定失败：${errorMessage(error)}`);
         return [todo.id, null];
       }
     });
@@ -297,7 +297,7 @@ export const precheckJevMethods = {
         try {
           match = await this.jevMatchPair(a, b);
         } catch (error) {
-          this.ctx.logger?.warn?.(`[gitlab-todo-agent] Todo ${a.id}/${b.id} Jev 去重判定失败：${errorMessage(error)}`);
+          this.logger.warn(`Todo ${a.id}/${b.id} Jev 去重判定失败：${errorMessage(error)}`);
           return;
         }
         if (match?.duplicate) {

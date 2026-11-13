@@ -354,7 +354,7 @@ export const slotsMethods = {
       this.wakeWaiters();
       if (settled) await this.verifySettled();
     } catch (error) {
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 会话状态核对失败：${errorMessage(error)}`);
+      this.logger.warn(`会话状态核对失败：${errorMessage(error)}`);
     } finally {
       this.ensureSessionTimer();
     }

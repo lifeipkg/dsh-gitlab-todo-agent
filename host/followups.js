@@ -75,7 +75,7 @@ export const followupsMethods = {
         record.nextAttemptAt = Date.now();
         record.watch = null;
         triggered = true;
-        this.ctx.logger?.info?.(`[gitlab-todo-agent] Todo ${record.id} 等待的 MR 状态翻转，提前触发续办。`);
+        this.logger.info(`Todo ${record.id} 等待的 MR 状态翻转，提前触发续办。`);
       }
     }
     return { changed, triggered };
@@ -109,7 +109,7 @@ export const followupsMethods = {
         if (discussions.length < 100) break;
       }
     } catch (error) {
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 等待探测读取讨论串失败（${api}）：${errorMessage(error)}`);
+      this.logger.warn(`等待探测读取讨论串失败（${api}）：${errorMessage(error)}`);
     }
     return null;
   },
@@ -150,7 +150,7 @@ export const followupsMethods = {
       record.nextAttemptAt = Date.now() + delayMinutes * 60000;
       record.lastProbeAt = Date.now();
       deferred += 1;
-      this.ctx.logger?.info?.(`[gitlab-todo-agent] Todo ${record.id} 等待探测无变化，推迟续办 ${delayMinutes} 分钟（第 ${record.waitProbes} 次，未开会话）。`);
+      this.logger.info(`Todo ${record.id} 等待探测无变化，推迟续办 ${delayMinutes} 分钟（第 ${record.waitProbes} 次，未开会话）。`);
     }
     return deferred;
   },

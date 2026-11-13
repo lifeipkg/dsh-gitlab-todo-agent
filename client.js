@@ -92,6 +92,10 @@ window.__ModuleLoader__.load({
       issuesTitle: 'Issues', issuesEmpty: 'No open issues assigned to you on GitLab.',
       issuesError: 'Could not load the issue list', issuesHint: 'Open issues assigned to you',
       issuesOrphans: 'No longer open or assigned (kept for session access)', issueTag: 'Issue',
+      logsTitle: 'Log', logsEmpty: 'No runtime log entries yet.',
+      logsError: 'Could not load the runtime log', logsClear: 'Clear log', confirmClearLogs: 'Confirm clear log?',
+      logsDropped: 'entries dropped (over the memory cap)', logsFilterAll: 'All', logsFilterWarn: 'Warnings+',
+      logsHint: 'In-memory only, not written to disk. Ring buffer caps', logsEntriesSuffix: 'entries',
       signaturePlaceholder: '— Replied by the AI assistant',
       bridgeTimeout: 'Request timed out (90 seconds). Please try again.', bridgeNetwork: 'Network error: could not reach the plugin service.',
       colon: ': ',
@@ -182,6 +186,10 @@ window.__ModuleLoader__.load({
       issuesTitle: 'Issue', issuesEmpty: 'GitLab 上没有指派给你的开放 Issue。',
       issuesError: '无法加载 Issue 列表', issuesHint: 'GitLab 上指派给我的开放 Issue',
       issuesOrphans: '已不在待处理列表（已关闭或不再指派给我）', issueTag: 'Issue',
+      logsTitle: 'Log', logsEmpty: '暂无运行时日志。',
+      logsError: '无法加载运行时日志', logsClear: '清空日志', confirmClearLogs: '确认清空日志？',
+      logsDropped: '条因超出内存上限被丢弃', logsFilterAll: '全部', logsFilterWarn: '警告及以上',
+      logsHint: '只进内存、不落盘；环形缓冲上限', logsEntriesSuffix: '条',
       signaturePlaceholder: '—— 由 AI 助手代复',
       bridgeTimeout: '请求超时（90 秒），请重试。', bridgeNetwork: '网络错误：无法连接插件服务。',
       colon: '：',
@@ -191,7 +199,7 @@ window.__ModuleLoader__.load({
     let bridgeText = (key) => en[key] ?? key;
 
     async function bridge(action, options = {}) {
-      const method = options.method ?? (action === 'state' || action === 'models' || action === 'workspaces' || action === 'issues' ? 'GET' : 'POST');
+      const method = options.method ?? (action === 'state' || action === 'models' || action === 'workspaces' || action === 'issues' || action === 'logs' ? 'GET' : 'POST');
       const headers = { Accept: 'application/json' };
       if (method === 'POST') headers['Content-Type'] = 'application/json';
       const query = method === 'GET' ? `?action=${encodeURIComponent(action)}` : '';
@@ -509,6 +517,37 @@ window.__ModuleLoader__.load({
         if (activeTab !== 'issues') return undefined;
         void fetchIssues(true);
         const timer = setInterval(() => void fetchIssues(false), 5000);
+        return () => clearInterval(timer);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [activeTab]);
+
+      // Log Tab：运行时内存日志（只进内存环形缓冲，不落盘）。打开期间每 3s 轮询快照。
+      const [logData, setLogData] = React.useState(null);
+      const [logError, setLogError] = React.useState(null);
+      const [logFilter, setLogFilter] = React.useState('all');
+      const logsInFlight = React.useRef(false);
+      const fetchLogs = async () => {
+        if (logsInFlight.current) return;
+        logsInFlight.current = true;
+        try {
+          const data = await bridge('logs');
+          setLogData({
+            items: Array.isArray(data.items) ? data.items : [],
+            dropped: Number.isFinite(data.dropped) ? data.dropped : 0,
+            total: Number.isFinite(data.total) ? data.total : 0,
+            capacity: data.capacity ?? null,
+          });
+          setLogError(null);
+        } catch (cause) {
+          setLogError(cause.message);
+        } finally {
+          logsInFlight.current = false;
+        }
+      };
+      React.useEffect(() => {
+        if (activeTab !== 'logs') return undefined;
+        void fetchLogs();
+        const timer = setInterval(() => void fetchLogs(), 3000);
         return () => clearInterval(timer);
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [activeTab]);
@@ -1031,6 +1070,12 @@ window.__ModuleLoader__.load({
             className: `gta-tab${activeTab === 'workspaces' ? ' gta-tab-active' : ''}`,
             onClick: () => setActiveTab('workspaces'),
           }, `${t('workspacesTitle')} (${workspaceOptions.length})`),
+          h('button', {
+            type: 'button', role: 'tab', id: `${PANEL_ID}-tab-logs`, 'aria-selected': activeTab === 'logs',
+            'aria-controls': `${PANEL_ID}-panel-logs`,
+            className: `gta-tab${activeTab === 'logs' ? ' gta-tab-active' : ''}`,
+            onClick: () => setActiveTab('logs'),
+          }, `${t('logsTitle')} (${logData?.items.length ?? 0})`),
         ),
         activeTab === 'inbox' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-inbox`, 'aria-labelledby': `${PANEL_ID}-tab-inbox` },
           h('div', { className: 'gta-section-title' }, h('h2', null, t('inboxTitle')), h('span', { className: 'gta-muted' }, `${snapshot.closure?.needsHuman ?? 0}`)),
@@ -1269,6 +1314,39 @@ window.__ModuleLoader__.load({
                 ),
               )),
           ),
+        ),
+        activeTab === 'logs' && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-logs`, 'aria-labelledby': `${PANEL_ID}-tab-logs` },
+          h('div', { className: 'gta-section-title' },
+            h('h2', null, t('logsTitle')),
+            h('div', { className: 'gta-todo-actions' },
+              h('span', { className: 'gta-muted' }, logData?.capacity
+                ? `${t('logsHint')}${colon()}${logData.capacity.maxEntries} ${t('logsEntriesSuffix')} / ${Math.round(logData.capacity.maxChars / 1024)} KB`
+                : ''),
+              logData?.dropped > 0 && h('span', { className: 'gta-muted', title: `${logData.dropped} ${t('logsDropped')}` }, `-${logData.dropped}`),
+              h(Button, { onClick: () => setLogFilter('all') }, t('logsFilterAll')),
+              h(Button, { onClick: () => setLogFilter('warn') }, t('logsFilterWarn')),
+              h(Button, {
+                disabled: busySet.has('logs:clear') || !logData || logData.items.length === 0,
+                onClick: guardedRun('logs:clear', () => { setLogFilter('all'); void perform('logs:clear', async () => { await post('logs', { clear: true }); await fetchLogs(); return { ok: true }; }); }),
+              }, busySet.has('logs:clear') ? '…' : (confirmKeys.has('logs:clear') ? t('confirmClearLogs') : t('logsClear'))),
+            )),
+          logError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('logsError')}${colon()}${logError}`),
+          !logData && !logError && h('div', { className: 'gta-empty' }, t('loading')),
+          logData && logData.items.length === 0 && h('div', { className: 'gta-empty' }, t('logsEmpty')),
+          logData && logData.items.length > 0 && h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('logsTitle') },
+            (logFilter === 'warn' ? logData.items.filter((entry) => entry.level === 'warn' || entry.level === 'error') : logData.items).map((entry, index) =>
+              h('article', { className: 'gta-todo', key: `${entry.ts}-${index}` },
+                h('div', { className: 'gta-todo-main' },
+                  h('div', { className: 'gta-todo-title', style: { fontFamily: 'monospace', fontSize: '12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' } },
+                    h('span', { className: 'gta-muted', style: { marginRight: '8px', flexShrink: 0 } }, formatTime(entry.ts, '')),
+                    h('span', {
+                      className: `gta-tag${entry.level === 'warn' ? ' gta-tag-mention' : entry.level === 'error' ? ' gta-tag-routed' : ''}`,
+                      style: { marginRight: '8px', minWidth: '44px', textAlign: 'center', flexShrink: 0 },
+                    }, (entry.level ?? 'info').toUpperCase()),
+                    h('span', { style: { flex: 1 } }, entry.message),
+                  ),
+                ),
+              ))),
         ),
         routeTodo && h('div', {
           className: 'gta-route-backdrop',

@@ -111,7 +111,7 @@ export const precheckMethods = {
         if (text.length > 20000) break;
       }
       if (text === '' && chunkCount > 0) {
-        this.ctx.logger?.warn?.(`[gitlab-todo-agent] 预检流式返回 ${chunkCount} 个分片但无正文：${safeJsonPreview(firstChunk)}`);
+        this.logger.warn(`预检流式返回 ${chunkCount} 个分片但无正文：${safeJsonPreview(firstChunk)}`);
       }
       const verdict = parseJudgeReply(text);
       if (!verdict) this.lastJudgeError = judgeOutputError(text);
@@ -187,7 +187,7 @@ export const precheckMethods = {
         if (text.length > 60000) break;
       }
       if (text === '' && chunkCount > 0) {
-        this.ctx.logger?.warn?.(`[gitlab-todo-agent] 批量预检流式返回 ${chunkCount} 个分片但无正文：${safeJsonPreview(firstChunk)}`);
+        this.logger.warn(`批量预检流式返回 ${chunkCount} 个分片但无正文：${safeJsonPreview(firstChunk)}`);
       }
       const verdicts = parseBatchJudgeReply(text);
       if (!verdicts) this.lastJudgeError = judgeOutputError(text);
@@ -217,7 +217,7 @@ export const precheckMethods = {
       try {
         jev = await this.precheckJevVerdicts(mentions);
       } catch (error) {
-        this.ctx.logger?.warn?.(`[gitlab-todo-agent] Jev 预检整体失败：${errorMessage(error)}`);
+        this.logger.warn(`Jev 预检整体失败：${errorMessage(error)}`);
         this.lastJudgeError = `Jev 预检整体失败：${errorMessage(error)}`.slice(0, 300);
       }
       if (jev) {
@@ -297,12 +297,12 @@ export const precheckMethods = {
         this.precheckFailures.set(todo.id, failures);
         const reason = this.lastJudgeError || '预检失败（原因未知）';
         if (failures < PRECHECK_MAX_SKIPS) {
-          this.ctx.logger?.warn?.(`[gitlab-todo-agent] Todo ${todo.id} 预检第 ${failures} 轮失败，本轮跳过、下一轮重试：${reason}`);
+          this.logger.warn(`Todo ${todo.id} 预检第 ${failures} 轮失败，本轮跳过、下一轮重试：${reason}`);
           continue;
         }
         // 连续失败达到上限：预检不可用不应让自动处理永久停摆——降级为直接派发（会话自身的
         // “仅被提及”判定与危险操作护栏仍然生效），并把原因留在面板上。
-        this.ctx.logger?.warn?.(`[gitlab-todo-agent] Todo ${todo.id} 预检连续 ${failures} 轮失败，降级为直接派发：${reason}`);
+        this.logger.warn(`Todo ${todo.id} 预检连续 ${failures} 轮失败，降级为直接派发：${reason}`);
         degraded += 1;
         ready.push(todo);
         continue;
@@ -333,7 +333,7 @@ export const precheckMethods = {
             } : {}),
           };
         } catch (error) {
-          this.ctx.logger?.warn?.(`[gitlab-todo-agent] 预检跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
+          this.logger.warn(`预检跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
           // 标记失败时不丢判定：下一轮该 Todo 仍在待办列表，避免周期性重复调用预检模型。
           continue;
         }
