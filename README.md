@@ -74,7 +74,7 @@ Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再�
 
 ### 预检跳过
 
-开启 **开会话前轻量预判**（默认开启）后，自动分派在创建会话之前先用一次轻量模型调用（复用固定模型或 Host 默认模型，经 `llm.prepareCall` 派发，30 秒超时）判断该提及是否真的需要处理：纯感谢/客套、纯 +1 附和、无关闲聊、无需回应的通报、测试性提及等会被判定为不需要，此时直接执行 `mark_as_done` 并把 Todo 记为 **已跳过（无需处理）**，副标题显示判定理由，不创建任何会话。预检本身失败（无 llm 服务、路由不可用、超时、输出不可解析）时，该 Todo **本轮跳过**：既不标记完成也不开会话，留在待办列表等下一轮重试（连续失败会写日志告警）——对代发账号，误开会话公开回复比晚一轮处理更难收回；手动分派不经过预检，随时可以绕过。
+开启 **开会话前轻量预判**（默认开启）后，自动分派在创建会话之前先用一次轻量判定（v2.28 起引擎可选 `precheckEngine`：auto/jev/llm，默认 auto 优先 Jev/System One 决策模型，不可用自动回退聊天模型批量判定；Jev 通道见下文分类器设置）判断该提及是否真的需要处理：纯感谢/客套、纯 +1 附和、无关闲聊、无需回应的通报、测试性提及等会被判定为不需要，此时直接执行 `mark_as_done` 并把 Todo 记为 **已跳过（无需处理）**，副标题显示判定理由，不创建任何会话。预检本身失败（无 llm 服务、路由不可用、超时、输出不可解析）时，该 Todo **本轮跳过**：既不标记完成也不开会话，留在待办列表等下一轮重试（连续失败会写日志告警）——对代发账号，误开会话公开回复比晚一轮处理更难收回；手动分派不经过预检，随时可以绕过。
 - 页面状态栏显示 **自动会话运行中 x/上限** 与 **排队待分派** 数量；页头提供模型快捷下拉，改动立即保存，无需打开设置。
 - **讨论串纪律（防复读回环）**：多方都接入了同类自动化助手时，回复遵守增量要求——只写新事实（新问题的答案、本回合完成的工作、相对上次回复的状态变化、对他人事实错误的更正），既定步骤/阻塞条件/触发方式用"同 #note_<id>"引用不复述；复核已有同值实读证据时直接引用而不重复 GET。可渲染的 @ 只用于"对方有只有其本人能做的具体动作"（一条回复至多 @ 一个行动人，同一请求不重复 @），抄送/知会一律用反引号写法，不给其他自动化账号派新 Todo。需要人工的动作在讨论串中只 @ 一次，之后本线程的无增量提及按"仅被提及"直接标记完成、不回帖，由人工完成后的 @ 单向唤起——避免多个自动化会话互相"复核对方的复核"形成复读回环。
 - **符合条件的 MR 评论提及**：同样创建 Session，不再因为目标是 MR 而直接标记完成。
@@ -163,6 +163,15 @@ Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再�
 - **优先级排序**：`priority` 1（最优先，阻塞他人/生产问题）到 5，派发队列按优先级稳定排序，紧急事项先拿到并发槽。
 - **路由 LLM 化**：批量预检提示词附带给定 Todo 的同目标插件会话摘要（标题、上次结论），judge 输出 `preferSession`：`reuse`（与那个会话上下文相关，适合并入）或 `new`（虽同对象但主题无关）。`new` 时跳过同目标自动路由直接新开会话；`reuse` 或缺省沿用现有规则（最新同目标会话优先，逐候选过宿主校验）。规则始终是兜底，LLM 只否决不复用，不会越权指定任意会话。
 
+### 预检分类器（Jev，v2.28）
+
+`precheckEngine` 选 `auto`/`jev` 时走 System One 决策模型：判定字段映射 `needsProcessing→noul`、跳过理由→`choice`（枚举固定文案）、`priority→score`（1–5 归一）、`preferSession→choice`（有同目标候选会话才问）、批内去重→同 `targetKey` 条目成对 `match`（same/different/unclear）。`P(needs)` 落入 0.35–0.65 不确定带的条目自动交给聊天模型复核，其余条目不再消耗聊天调用。
+
+分类器通道按序探测、首个可用者生效：
+1. 宿主 `llm.classify`（未来 DSH 版本把 pi 的 classifier 层挂进插件服务时自动启用，当前没有）；
+2. PATH 上的 `jev` CLI（读 jevctl 凭证 `~/.config/jev/credentials.json`，支持 `-m/--model`、`-P/--provider` 与内置代理）；
+3. `precheckClassifier` 配置的 System One HTTP 直连（`baseUrl` + Bearer key；内置 typesafe/openrouter 预设，自定义端可填任意兼容地址）。凭证解析：设置里的 `apiKey` → 环境变量（预设 `TYPESAFE_API_KEY`/`OPENROUTER_API_KEY`，自定义填 `apiKeyEnv`）→ jevctl 凭证文件。
+
 ## 事件驱动续办与回复署名（v2.18）
 
 - **事件驱动续办**：闭环结论为“待续办”且会话自述 `waiting`、带有未合并 MR 时，插件建立监视器（每条记录至多 3 个 MR），此后每轮轮询读取这些 MR 的状态：流水线从运行中翻转为 success/failed/canceled、MR 被合并或关闭时，立即把续办提前到本轮（不必等定时间隔）。一次翻转只触发一次，触发后监视器清除、由下一轮会话按需重建；无流水线变化或 API 失败时定时续办照常兜底。
@@ -219,3 +228,4 @@ MIT License。发布到 npm（`npm publish`，scoped 包需公开访问，`publi
 - v2.24（状态版本不变）：诊断增强——预检/批量预检流式返回了分片但无正文时，把首个分片的 JSON 预览写进插件日志，便于定位 devin/swe-2 等 agentic 模型的流分片形态。
 - v2.25（状态版本不变）：修复预检/批量预检在 DeepSeek Messages 协议路由下`message.content`为字符串导致`content.some is not a function`的错误——把 `messages[].content` 改为 block 数组 `[{type:'text',text:'...'}]`。
 - v2.27（状态版本不变，纯结构重构）：`index.js` 巨型类按域拆分为 `host/` 下七个模块——`gitlab.js`（glab 子进程/Todo 分页/标记完成）、`precheck.js`（LLM 预检）、`slots.js`（并发槽/会话跟踪/对账结算）、`closures.js`（闭环裁决/归档/回复核对）、`followups.js`（MR 监视/等待探测/到期入队）、`dispatch.js`（派发管线/路由/手动动作）、`constants.js`+`util.js`（共享常量与工具）。方法体逐字搬迁、行为零变化；模块以 `attachRuntimeMethods` 挂到运行时原型，同名冲突在加载期即报错。
+- v2.28（状态版本不变）：**预检引擎可配置**，新增 `precheckEngine`（auto/jev/llm）。auto（默认）优先用 **Jev/System One 决策模型**判定——返回带概率的结构化答案而不是生成文本，判定字段映射：needsProcessing→noul、跳过理由→choice 枚举（固定文案）、priority→score(1..5)、preferSession→choice、批内去重→同目标成对 match。P(needs) 落入 0.35–0.65 不确定带的条目自动交给 LLM 复核；Jev 整体不可用或单条判定失败时 auto 自动回退/补齐 LLM 路径，`jev` 严格模式不可用则跳过本轮。分类器通道按序：宿主 llm.classify（未来 DSH 版本）→ PATH 上的 `jev` CLI（读 jevctl 凭证）→ System One HTTP 直连（api.typesafe.ai/OpenRouter/自建兼容端，凭证链：设置 apiKey → 环境变量 → `~/.config/jev/credentials.json`）。新模块 `host/precheck-jev.js`；`mapLimit` 移入 `host/util.js` 复用。
