@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
       panel: 'GitLab Todo', title: 'GitLab Todo Watcher',
       subtitle: 'Read GitLab todos directly and open sessions for direct mentions in comments from other users.',
       enable: 'Enable polling', disable: 'Disable polling', checkNow: 'Check now', checking: 'Checking…',
-      settings: 'Settings', save: 'Save settings', cancel: 'Cancel', close: 'Close',
+      settings: 'Settings', save: 'Save settings', cancel: 'Cancel', close: 'Close', advanced: 'Advanced options',
       enabled: 'Enabled', disabled: 'Disabled', running: 'Running', idle: 'Idle',
       activeSessions: 'Auto sessions running', queuedSessions: 'Queued for dispatch',
       pending: 'Pending', handled: 'Handled', lastSuccess: 'Last successful poll', never: 'Never',
@@ -82,7 +82,7 @@ window.__ModuleLoader__.load({
       panel: 'GitLab Todo', title: 'GitLab Todo 轮询助手',
       subtitle: '直接读取 GitLab Todo，仅自动处理他人在评论中直接 @ 你的事项。',
       enable: '启用轮询', disable: '停用轮询', checkNow: '立即检查', checking: '检查中…',
-      settings: '设置', save: '保存设置', cancel: '取消', close: '关闭',
+      settings: '设置', save: '保存设置', cancel: '取消', close: '关闭', advanced: '高级选项',
       enabled: '已启用', disabled: '已停用', running: '运行中', idle: '空闲',
       activeSessions: '自动会话运行中', queuedSessions: '排队待分派',
       pending: '待处理', handled: '已处理', lastSuccess: '最近成功轮询', never: '从未',
@@ -764,10 +764,6 @@ window.__ModuleLoader__.load({
               h('option', { value: 'queue' }, t('busyRouteQueue')),
               h('option', { value: 'steer' }, t('busyRouteSteer')),
             )),
-            h('label', null, t('maxQueuePerSession'), h('input', {
-              type: 'number', min: 1, max: 10, value: draft.maxQueuePerSession ?? 3,
-              onChange: (event) => setDraft({ ...draft, maxQueuePerSession: Number(event.target.value) }),
-            })),
             h('label', null, t('sessionModel'), h('select', {
               value: sessionModelKey(draft.sessionModel),
               onChange: (event) => setDraft({
@@ -793,14 +789,6 @@ window.__ModuleLoader__.load({
               workspaceOptions.map((workspace) => h('option', { key: workspace.workspaceId, value: workspace.path },
                 `${workspace.title || workspace.path} · ${workspace.path}`)),
             ), h('span', { className: 'gta-muted' }, t('sessionCwdHint'))),
-            h('label', { className: 'gta-wide' }, t('cwd'), h('input', {
-              type: 'text', value: draft.cwd, placeholder: t('cwdHint'),
-              onChange: (event) => setDraft({ ...draft, cwd: event.target.value }),
-            })),
-            h('label', { className: 'gta-wide' }, t('customRules'), h('textarea', {
-              className: 'gta-rules', rows: 4, maxLength: 4000, value: draft.customRules ?? '',
-              onChange: (event) => setDraft({ ...draft, customRules: event.target.value }),
-            }), h('span', { className: 'gta-muted' }, t('customRulesHint'))),
             h('label', { className: 'gta-wide' }, t('signatureText'), h('input', {
               type: 'text', maxLength: 100, value: draft.signatureText ?? '',
               disabled: draft.replySignature !== true, placeholder: t('signaturePlaceholder'),
@@ -810,20 +798,47 @@ window.__ModuleLoader__.load({
               type: 'number', min: 0, max: 10, value: draft.maxFollowUps ?? 3, disabled: draft.followUpEnabled === false,
               onChange: (event) => setDraft({ ...draft, maxFollowUps: Number(event.target.value) }),
             })),
-            h('label', null, t('followUpDelay'), h('input', {
-              type: 'number', min: 1, max: 1440, value: draft.followUpDelayMinutes ?? 15, disabled: draft.followUpEnabled === false,
-              onChange: (event) => setDraft({ ...draft, followUpDelayMinutes: Number(event.target.value) }),
-            })),
+            h('details', { className: 'gta-advanced gta-wide' },
+              h('summary', null, t('advanced')),
+              h('div', { className: 'gta-form-grid' },
+                h('label', null, t('maxQueuePerSession'), h('input', {
+                  type: 'number', min: 1, max: 10, value: draft.maxQueuePerSession ?? 3,
+                  onChange: (event) => setDraft({ ...draft, maxQueuePerSession: Number(event.target.value) }),
+                })),
+                h('label', null, t('followUpDelay'), h('input', {
+                  type: 'number', min: 1, max: 1440, value: draft.followUpDelayMinutes ?? 15, disabled: draft.followUpEnabled === false,
+                  onChange: (event) => setDraft({ ...draft, followUpDelayMinutes: Number(event.target.value) }),
+                })),
+                h('label', { className: 'gta-wide' }, t('cwd'), h('input', {
+                  type: 'text', value: draft.cwd, placeholder: t('cwdHint'),
+                  onChange: (event) => setDraft({ ...draft, cwd: event.target.value }),
+                })),
+                h('label', { className: 'gta-wide' }, t('customRules'), h('textarea', {
+                  className: 'gta-rules', rows: 4, maxLength: 4000, value: draft.customRules ?? '',
+                  onChange: (event) => setDraft({ ...draft, customRules: event.target.value }),
+                }), h('span', { className: 'gta-muted' }, t('customRulesHint'))),
+                h('div', { className: 'gta-checks' },
+                  h('label', { className: 'gta-check' }, h('input', {
+                    type: 'checkbox', checked: draft.autoRoute !== false,
+                    onChange: (event) => setDraft({ ...draft, autoRoute: event.target.checked }),
+                  }), t('autoRoute')),
+                  h('label', { className: 'gta-check' }, h('input', {
+                    type: 'checkbox', checked: draft.waitProbeEnabled !== false, disabled: draft.followUpEnabled === false,
+                    onChange: (event) => setDraft({ ...draft, waitProbeEnabled: event.target.checked }),
+                  }), t('waitProbeEnabled')),
+                  h('label', { className: 'gta-check' }, h('input', {
+                    type: 'checkbox', checked: draft.followUpReuseSession !== false, disabled: draft.followUpEnabled === false,
+                    onChange: (event) => setDraft({ ...draft, followUpReuseSession: event.target.checked }),
+                  }), t('followUpReuseSession')),
+                ),
+              ),
+            ),
             h('p', { className: 'gta-muted gta-wide' }, t('followUpHint')),
           ),
           h('label', { className: 'gta-check' }, h('input', {
             type: 'checkbox', checked: draft.autoProcess,
             onChange: (event) => setDraft({ ...draft, autoProcess: event.target.checked }),
           }), t('autoProcess')),
-          h('label', { className: 'gta-check' }, h('input', {
-            type: 'checkbox', checked: draft.autoRoute !== false,
-            onChange: (event) => setDraft({ ...draft, autoRoute: event.target.checked }),
-          }), t('autoRoute')),
           h('label', { className: 'gta-check' }, h('input', {
             type: 'checkbox', checked: draft.precheckEnabled,
             onChange: (event) => setDraft({ ...draft, precheckEnabled: event.target.checked }),
@@ -840,14 +855,6 @@ window.__ModuleLoader__.load({
             type: 'checkbox', checked: draft.followUpEnabled !== false,
             onChange: (event) => setDraft({ ...draft, followUpEnabled: event.target.checked }),
           }), t('followUpEnabled')),
-          h('label', { className: 'gta-check' }, h('input', {
-            type: 'checkbox', checked: draft.waitProbeEnabled !== false, disabled: draft.followUpEnabled === false,
-            onChange: (event) => setDraft({ ...draft, waitProbeEnabled: event.target.checked }),
-          }), t('waitProbeEnabled')),
-          h('label', { className: 'gta-check' }, h('input', {
-            type: 'checkbox', checked: draft.followUpReuseSession !== false, disabled: draft.followUpEnabled === false,
-            onChange: (event) => setDraft({ ...draft, followUpReuseSession: event.target.checked }),
-          }), t('followUpReuseSession')),
           h('label', { className: 'gta-check' }, h('input', {
             type: 'checkbox', checked: draft.replySignature === true,
             onChange: (event) => setDraft({ ...draft, replySignature: event.target.checked }),
@@ -1131,6 +1138,13 @@ window.__ModuleLoader__.load({
       .gta-stats{display:grid;grid-template-columns:repeat(4,minmax(100px,1fr));gap:10px}.gta-stat{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);padding:12px 14px;display:flex;flex-direction:column;gap:4px}.gta-stat>span{color:var(--dsw-alias-label-secondary);font-size:12px}.gta-stat>strong{font-size:18px}.gta-stat-time{grid-column:span 2}.gta-stat-time>strong{font-size:13px}
       .gta-section-title{display:flex;align-items:baseline;justify-content:space-between;gap:16px}.gta-tabs{max-width:1180px;margin:16px auto 0;display:flex;gap:4px;border-bottom:1px solid var(--dsw-alias-border-l1)}.gta-tab{appearance:none;margin-bottom:-1px;padding:9px 18px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;white-space:nowrap}.gta-tab:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}.gta-tab:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}.gta-tab-active{border-bottom-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);font-weight:600}.gta-list{display:flex;flex-direction:column;gap:8px}.gta-load-more{display:flex;justify-content:center;padding:10px 0 2px}.gta-scroll-list{max-height:min(52vh,480px);overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-gutter:stable;padding:2px 6px 2px 2px}.gta-scroll-list::-webkit-scrollbar{width:8px}.gta-scroll-list::-webkit-scrollbar-track{background:transparent}.gta-scroll-list::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l2);border-radius:4px}.gta-scroll-list::-webkit-scrollbar-thumb:hover{background:var(--dsw-alias-label-tertiary,var(--dsw-alias-border-l2))}.gta-todo{display:flex;align-items:center;gap:16px;padding:14px 16px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}.gta-todo-main{min-width:0;flex:1}.gta-todo-title{display:flex;align-items:center;gap:10px;font-weight:550}.gta-todo-title>a{color:var(--dsw-alias-label-primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-todo-title>a:hover{color:var(--dsw-alias-brand-primary);text-decoration:underline}.gta-tag{flex:none;font-size:11px;padding:1px 7px;border-radius:10px;color:var(--dsw-alias-state-warn-primary);border:1px solid var(--dsw-alias-state-warn-primary)}.gta-tag-success{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}.gta-tag-mention{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}.gta-meta{margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-todo-actions{display:flex;gap:8px;flex:none}.gta-session-list{max-height:min(40vh,360px)}
       .gta-workspace{flex-direction:column;align-items:stretch;gap:10px}.gta-workspace-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gta-workspace-sessions{display:flex;flex-direction:column;gap:6px;margin-top:4px}.gta-workspace-session{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-base);min-width:0}.gta-session-link{appearance:none;border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-weight:550;padding:0;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;min-width:0}.gta-session-link:hover{color:var(--dsw-alias-brand-primary);text-decoration:underline}.gta-session-name{font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;min-width:0}.gta-session-meta{margin-left:auto;flex:none}
+      .gta-advanced{border:1px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-base)}
+      .gta-advanced>summary{padding:9px 12px;cursor:pointer;font-size:12.5px;color:var(--dsw-alias-label-secondary);list-style:none;user-select:none}
+      .gta-advanced>summary::-webkit-details-marker{display:none}
+      .gta-advanced>summary::before{content:'>';display:inline-block;margin-right:7px;transition:transform .12s;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-border-l2))}
+      .gta-advanced[open]>summary::before{transform:rotate(90deg)}
+      .gta-advanced>.gta-form-grid{padding:4px 12px 14px}
+      .gta-advanced .gta-checks{grid-column:1/-1;display:flex;flex-direction:column;gap:2px}.gta-advanced .gta-check{margin-top:8px}
       .gta-empty{padding:24px;border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;text-align:center;color:var(--dsw-alias-label-secondary)}.gta-fatal{max-width:720px;margin:48px auto;padding:24px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}.gta-fatal p{white-space:pre-wrap;word-break:break-word;margin:12px 0 20px;color:var(--dsw-alias-state-error-primary)}
       .gta-root .gta-tag-routed{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
       .gta-root .gta-route-backdrop{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgb(0 0 0 / .38)}
