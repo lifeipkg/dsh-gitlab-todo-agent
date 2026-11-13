@@ -359,7 +359,7 @@ export class GitlabTodoRuntime {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     timer.unref?.();
     try {
-      const messages = [{ role: 'user', content: buildJudgePrompt(todo) }];
+      const messages = [{ role: 'user', content: [{ type: 'text', text: buildJudgePrompt(todo) }] }];
       let stream;
       if (typeof llm.prepareCall === 'function') {
         const prepared = await llm.prepareCall(route, controller.signal);
@@ -434,7 +434,7 @@ export class GitlabTodoRuntime {
     try {
       const messages = [{
         role: 'user',
-        content: buildBatchJudgePrompt(todos, { sameTarget: this.batchSameTargetContext(todos) }),
+        content: [{ type: 'text', text: buildBatchJudgePrompt(todos, { sameTarget: this.batchSameTargetContext(todos) }) }],
       }];
       let stream;
       if (typeof llm.prepareCall === 'function') {
