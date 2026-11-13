@@ -71,6 +71,8 @@ window.__ModuleLoader__.load({
       inboxTitle: 'Inbox', inboxEmpty: 'Nothing is waiting for you.', inboxTakeover: 'Open session to take over',
       inboxAcknowledge: 'Mark handled', inboxPendingUnconfirmed: 'Legacy message unconfirmed', inboxError: 'Could not load the inbox',
       digestTitle: 'Last 24 hours', digestShow: 'Details', digestHide: 'Hide', digestEmpty: 'No settled records in the last 24 hours.',
+      handledTitle: 'Handled', handledEmpty: 'No handled todos yet. Skipped and dispatched todos will appear here.',
+      mergedIntoLabel: 'Merged into', pendingStarting: 'Dispatching', acceptedLabel: 'Accepted', outcomeSessionAccepted: 'Session accepted',
       replyPreview: 'Our reply',
       signatureLabel: 'Sign replies as AI-generated', signatureText: 'Signature text', signatureHint: 'When enabled, every GitLab reply ends with a one-line signature so readers know it was sent by an AI assistant. Applies to new prompts only.',
       confirmMarkDone: 'Confirm mark done?', confirmReprocess: 'Confirm process again?', confirmAcknowledge: 'Confirm mark handled?',
@@ -143,6 +145,8 @@ window.__ModuleLoader__.load({
       inboxTitle: '收件箱', inboxEmpty: '没有等待你处理的 Todo。', inboxTakeover: '打开会话接手',
       inboxAcknowledge: '我已处理', inboxPendingUnconfirmed: '旧消息未确认', inboxError: '无法加载收件箱',
       digestTitle: '过去 24 小时', digestShow: '查看明细', digestHide: '收起明细', digestEmpty: '过去 24 小时没有结算记录。',
+      handledTitle: '已处理', handledEmpty: '还没有处理记录。被跳过或已派发的 Todo 会显示在这里。',
+      mergedIntoLabel: '合并进', pendingStarting: '投递中', acceptedLabel: '接受于', outcomeSessionAccepted: '会话处理',
       replyPreview: '我方回复',
       signatureLabel: '回复署名（AI 代发标识）', signatureText: '署名文本', signatureHint: '开启后，新会话的每条 GitLab 回复末尾单独一行加上署名，让对方知道由 AI 助手代复。只影响之后派发的会话。',
       confirmMarkDone: '确认标记完成？', confirmReprocess: '确认重新处理？', confirmAcknowledge: '确认已处理？',
@@ -211,6 +215,20 @@ window.__ModuleLoader__.load({
       if (todo.executionStatus === 'completed') return t('executionCompleted');
       if (todo.executionStatus === 'failed') return t('executionFailed');
       return todo.handled ? t('dispatched') : t('waiting');
+    }
+
+    /** “已处理”页的状态标签：覆盖跳过原因、启动中、执行态与闭环态。 */
+    function handledStatusLabel(item, t) {
+      if (item.pending === true || item.executionStatus === 'starting') return t('pendingStarting');
+      if (item.outcome === 'merge-request-done') return t('mrDone');
+      if (item.outcome === 'precheck-skipped') return t('precheckSkipped');
+      if (item.outcome === 'rule-skipped') return t('ruleSkipped');
+      if (item.executionStatus === 'running') return t('executionRunning');
+      const closure = closureLabel(item.closure, t);
+      if (closure) return closure;
+      if (item.executionStatus === 'completed') return t('executionCompleted');
+      if (item.executionStatus === 'failed') return t('executionFailed');
+      return t('outcomeSessionAccepted');
     }
 
     /** 闭环状态标签；旧记录或尚未结算的记录没有闭环状态，返回空串。 */
@@ -402,6 +420,46 @@ window.__ModuleLoader__.load({
         if (activeTab !== 'sessions') return undefined;
         void refreshSessions();
         const timer = setInterval(() => void refreshSessions(), 10000);
+        return () => clearInterval(timer);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [activeTab]);
+
+      // 已处理（分页）：含规则跳过/预检跳过/会话处理全部记录；打开期间每 10s 静默刷新。
+      const [handledData, setHandledData] = React.useState(null);
+      const [handledError, setHandledError] = React.useState(null);
+      const [handledBusy, setHandledBusy] = React.useState(false);
+      const handledInFlight = React.useRef(false);
+      const handledDataRef = React.useRef(null);
+      const applyHandledPage = (page, append) => {
+        const previous = handledDataRef.current;
+        const items = append && previous ? [...previous.items, ...page.items] : page.items;
+        const next = { ...page, items };
+        handledDataRef.current = next;
+        setHandledData(next);
+      };
+      const fetchHandled = async (append) => {
+        if (handledInFlight.current) return;
+        handledInFlight.current = true;
+        setHandledBusy(true);
+        try {
+          const loaded = handledDataRef.current?.items?.length ?? 0;
+          const request = append
+            ? { offset: loaded, limit: 50 }
+            : { offset: 0, limit: Math.max(50, loaded) };
+          applyHandledPage(await post('handled', request), append);
+          setHandledError(null);
+        } catch (cause) {
+          setHandledError(cause.message);
+        } finally {
+          handledInFlight.current = false;
+          setHandledBusy(false);
+        }
+      };
+      const refreshHandled = () => fetchHandled(false);
+      React.useEffect(() => {
+        if (activeTab !== 'handled') return undefined;
+        void refreshHandled();
+        const timer = setInterval(() => void refreshHandled(), 10000);
         return () => clearInterval(timer);
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [activeTab]);
@@ -889,6 +947,12 @@ window.__ModuleLoader__.load({
             onClick: () => setActiveTab('todos'),
           }, `${t('todoList')} (${snapshot.todos.length})`),
           h('button', {
+            type: 'button', role: 'tab', id: `${PANEL_ID}-tab-handled`, 'aria-selected': activeTab === 'handled',
+            'aria-controls': `${PANEL_ID}-panel-handled`,
+            className: `gta-tab${activeTab === 'handled' ? ' gta-tab-active' : ''}`,
+            onClick: () => setActiveTab('handled'),
+          }, `${t('handledTitle')} (${handledData?.total ?? snapshot.handledCount})`),
+          h('button', {
             type: 'button', role: 'tab', id: `${PANEL_ID}-tab-sessions`, 'aria-selected': activeTab === 'sessions',
             'aria-controls': `${PANEL_ID}-panel-sessions`,
             className: `gta-tab${activeTab === 'sessions' ? ' gta-tab-active' : ''}`,
@@ -977,6 +1041,48 @@ window.__ModuleLoader__.load({
                   ),
                 ),
               )),
+        ),
+        activeTab === 'handled' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-handled`, 'aria-labelledby': `${PANEL_ID}-tab-handled` },
+          h('div', { className: 'gta-section-title' }, h('h2', null, t('handledTitle')), h('span', { className: 'gta-muted' },
+            handledData ? `${handledData.items.length}/${handledData.total}` : `${snapshot.handledCount}`)),
+          handledError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('handledTitle')}${colon()}${handledError}`),
+          !handledData && !handledError && h('div', { className: 'gta-empty' }, t('loading')),
+          handledData && handledData.total === 0 && h('div', { className: 'gta-empty' }, t('handledEmpty')),
+          handledData && handledData.items.length > 0 && h('div', { className: 'gta-list gta-scroll-list', role: 'list', 'aria-label': t('handledTitle') }, handledData.items.map((item) =>
+                h('article', { className: 'gta-todo', key: `${item.todoId}-${item.round}` },
+                  h('div', { className: 'gta-todo-main' },
+                    h('div', { className: 'gta-todo-title' },
+                      item.url
+                        ? h('a', { href: item.url, target: '_blank', rel: 'noreferrer' }, item.title)
+                        : h('span', null, item.title),
+                      h('span', { className: `gta-tag ${item.outcome === 'merge-request-done' || item.outcome === 'precheck-skipped' || item.outcome === 'rule-skipped' || item.executionStatus === 'completed' ? 'gta-tag-success' : ''}` }, handledStatusLabel(item, t)),
+                      routedLabel(item, t) && h('span', { className: 'gta-tag gta-tag-routed' }, routedLabel(item, t)),
+                      item.closure && handledStatusLabel(item, t) !== closureLabel(item.closure, t)
+                        && h('span', { className: `gta-tag ${item.closure === 'closed' ? 'gta-tag-success' : ''}` }, closureLabel(item.closure, t)),
+                      h('span', { className: 'gta-tag gta-tag-mention' }, item.automatic ? t('autoDispatch') : t('manualDispatch')),
+                      item.archived && h('span', { className: 'gta-tag gta-tag-success' }, t('sessionArchived')),
+                    ),
+                    h('div', { className: 'gta-muted gta-meta' },
+                      [`#${item.todoId}`, item.project,
+                        item.round > 1 && `${t('roundLabel')} ${item.round}`,
+                        item.mergedInto ? `${t('mergedIntoLabel')} #${item.mergedInto}` : '',
+                        item.skipReason, item.reportSummary, item.closureNote,
+                        item.sessionTitle && item.sessionId ? item.sessionTitle : '',
+                        item.executionError,
+                        item.closure === 'follow-up' && item.nextAttemptAt ? `${t('nextAttempt')} ${formatTime(item.nextAttemptAt, '')}` : '',
+                        `${item.completedAt ? formatTime(item.completedAt, '') : `${t('acceptedLabel')} ${formatTime(item.acceptedAt, '')}`}`,
+                      ].filter(Boolean).join(' · ')),
+                    item.excerpt && h('div', { className: 'gta-muted gta-meta' },
+                      `${item.author ? `@${item.author}${colon()}` : ''}${item.excerpt}`),
+                    h(ReplyPreview, { reply: item.lastReply, t }),
+                  ),
+                  h('div', { className: 'gta-todo-actions' },
+                    item.sessionId && !item.archived && h(Button, { onClick: () => openSession(item.sessionId) }, t('openSession')),
+                  ),
+                ),
+              )),
+          handledData && handledData.items.length < handledData.total && h('div', { className: 'gta-load-more' },
+            h(Button, { disabled: Boolean(handledBusy), onClick: () => fetchHandled(true) }, handledBusy ? '…' : t('loadMore'))),
         ),
         activeTab === 'sessions' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-sessions`, 'aria-labelledby': `${PANEL_ID}-tab-sessions` },
           h('div', { className: 'gta-section-title' }, h('h2', null, t('sessionsTitle')), h('span', { className: 'gta-muted' },

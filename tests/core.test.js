@@ -13,6 +13,8 @@ import {
   buildWorkspaceOverview,
   discussionsApiPath,
   findRouteTargets,
+  handledPage,
+  handledProjection,
   mrApiPath,
   mrWatchState,
   parseBatchJudgeReply,
@@ -1064,6 +1066,68 @@ test('session page paginates recent plugin sessions newest-first', () => {
   // 越界与非法参数按默认处理，不抛错。
   assert.equal(sessionPage(base, 100, 30).items.length, 0);
   assert.equal(sessionPage(base, -5, 500).items.length, 35 > 100 ? 100 : 35);
+});
+
+test('handled page includes skipped records and orders by activity newest-first', () => {
+  const base = initialState();
+  // 会话记录：completedAt 作为活动时刻。
+  base.handled.done = {
+    id: 'done', sessionId: 's-done', acceptedAt: 1000, completedAt: 2000,
+    executionStatus: 'completed', outcome: 'session-accepted', closure: 'closed',
+    title: '会话处理', url: '', project: 'g/p', sessionTitle: 'S1', automatic: true,
+  };
+  // 规则跳过：无 sessionId，acceptedAt 作为活动时刻——必须出现在列表里。
+  base.handled.skip = {
+    id: 'skip', sessionId: null, outcome: 'rule-skipped', acceptedAt: 3000,
+    skipReason: '流水线通知，规则判定无需处理', title: '流水线', url: '', project: 'g/p', automatic: true,
+  };
+  // 预检跳过且被折叠：带 mergedInto/author/excerpt。
+  base.handled.merged = {
+    id: 'merged', sessionId: null, outcome: 'precheck-skipped', acceptedAt: 4000,
+    skipReason: '与 Todo main 是同一请求，随主条目合并处理', mergedInto: 'main',
+    author: 'alice', excerpt: '摘录', title: '重复', url: '', project: 'g/p', automatic: true,
+  };
+  const projection = handledProjection(base);
+  assert.equal(projection.length, 3);
+  // 按活动时刻倒序：merged(4000) > skip(3000) > done(2000)。
+  assert.deepEqual(projection.map((item) => item.todoId), ['merged', 'skip', 'done']);
+  assert.equal(projection[0].mergedInto, 'main');
+  assert.equal(projection[0].excerpt, '摘录');
+  assert.equal(projection[1].sessionId, null);
+  const page = handledPage(base);
+  assert.equal(page.total, 3);
+  assert.equal(page.items.length, 3);
+  assert.equal(page.limit, 50);
+});
+
+test('handled page paginates, clamps inputs and marks pending rows', () => {
+  const base = initialState();
+  for (let index = 0; index < 60; index += 1) {
+    base.handled[`t${index}`] = {
+      id: `t${index}`, sessionId: `s${index}`, acceptedAt: 1000 + index,
+      outcome: 'session-accepted', executionStatus: 'completed', title: `T${index}`,
+      url: '', project: '', automatic: true,
+    };
+  }
+  // pending 投递中记录：标 pending:true、executionStatus 'starting'，排在最前（createdAt 最新）。
+  base.pending.p1 = {
+    sessionId: 's-new', createdAt: 9999, automatic: true, followUp: false, routed: true,
+    routeMode: 'steer', requestId: 'r1', round: 2, item: { id: 'p1', title: 'P', url: '', project: 'g/p' },
+  };
+  const first = handledPage(base);
+  assert.equal(first.total, 61);
+  assert.equal(first.items.length, 50);
+  assert.equal(first.items[0].todoId, 'p1');
+  assert.equal(first.items[0].pending, true);
+  assert.equal(first.items[0].executionStatus, 'starting');
+  assert.equal(first.items[0].routed, true);
+  assert.equal(first.items[0].routeMode, 'steer');
+  const second = handledPage(base, 50, 50);
+  assert.equal(second.items.length, 11);
+  // 非法参数按默认/夹取处理。
+  assert.equal(handledPage(base, -1, 0).items.length, 50);
+  assert.equal(handledPage(base, 0, 999).limit, 200);
+  assert.equal(handledPage(base, 99999999).items.length, 0);
 });
 
 test('bridge sessions action serves the first page and archive toggling', async () => {
