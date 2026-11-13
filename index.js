@@ -149,7 +149,7 @@ export class GitlabTodoRuntime {
     this.sessionTimer = null;
     this.dispatchQueue = [];
     this.pumpPromise = null;
-    // 本轮批量预检的判定（todoId → verdict）：派发时消费（taskType 选模型、preferSession 决定路由）。
+    // 本轮批量预检的判定（todoId → verdict）：派发时消费（preferSession 决定路由、priority 排序）。
     this.judgeVerdicts = new Map();
     // 预检连续失败计数（todoId → 次数）：失败本轮跳过，获得判定或被处理后清零。
     this.precheckFailures = new Map();
@@ -450,7 +450,7 @@ export class GitlabTodoRuntime {
    * 预检本身失败的 Todo 本轮跳过（不标记、不开会话），留待下一轮重试；连续失败
    * 记录在 precheckFailures 并周期性告警，可随时手动派发。
    * 返回仍需开会话的 Todo，按 judge 优先级（1 最先）稳定排序；
-   * 判定存入 judgeVerdicts，派发时消费（taskType 选模型、preferSession 决定是否路由复用）。
+   * 判定存入 judgeVerdicts，派发时消费（preferSession 决定是否路由复用、priority 决定顺序）。
    */
   async precheckMentions(mentions) {
     this.lastJudgeError = '';
@@ -705,7 +705,6 @@ export class GitlabTodoRuntime {
       automatic: pending.automatic !== false,
       routed: pending.routed === true,
       routeMode: pending.routeMode ?? '',
-      taskType: pending.taskType || previous?.taskType || '',
       requestId: pending.requestId ?? '',
       sessionTitle: pending.sessionTitle || buildSessionTitle(item, round),
       archived: false,
@@ -1897,10 +1896,6 @@ export class GitlabTodoRuntime {
     // 同一 Todo 已有过会话再开新会话（自动续办或手动重新处理）：延续链路，轮次 +1。
     const previous = this.state.handled[todo.id];
     const continuing = Boolean(force && previous?.sessionId);
-    // 任务类型：预检判定优先（parseBatchJudgeReply 已把 other 归并为空串）；续办沿用上一轮分类；未分类（''）跟随会话模型。
-    const taskType = judge?.taskType
-      ? judge.taskType
-      : (continuing ? (previous?.taskType ?? '') : '');
     const round = continuing ? (previous.round ?? 1) + 1 : 1;
     const firstAcceptedAt = continuing ? (previous.firstAcceptedAt ?? previous.acceptedAt) : Date.now();
     const history = continuing
@@ -2008,7 +2003,6 @@ export class GitlabTodoRuntime {
           followUp,
           routed: true,
           routeMode: route.mode,
-          taskType,
           requestId,
           round,
           firstAcceptedAt,
@@ -2028,7 +2022,6 @@ export class GitlabTodoRuntime {
           routed: false,
           reused: true,
           reuseCount,
-          taskType,
           requestId,
           round,
           firstAcceptedAt,
@@ -2055,7 +2048,6 @@ export class GitlabTodoRuntime {
           automatic: trackSlot,
           followUp,
           routed: false,
-          taskType,
           requestId,
           round,
           firstAcceptedAt,
@@ -2071,9 +2063,8 @@ export class GitlabTodoRuntime {
         reserved = false;
       }
       if (!route && !reuse) {
-        // 按任务类型选模型：预检分类命中且配置了映射时优先，否则用会话模型；路由会话不改模型。
-        const typeModel = taskType ? (this.state.settings.taskModels?.[taskType] ?? null) : null;
-        const modelSelection = typeModel ?? this.state.settings.sessionModel;
+        // 新开会话固定用会话模型；路由到已有会话与复用回合不改其模型。
+        const modelSelection = this.state.settings.sessionModel;
         if (modelSelection) {
           await this.host.selectModel({
             sessionId,
@@ -2147,7 +2138,6 @@ export class GitlabTodoRuntime {
         url: todo.url,
         project: todo.project,
         round,
-        taskType,
         firstAcceptedAt,
         history,
         waitRounds: continuing ? prevWaitRounds : 0,
