@@ -218,3 +218,4 @@ MIT License。发布到 npm（`npm publish`，scoped 包需公开访问，`publi
 - v2.23（状态版本不变）：`handled` 历史按保留策略自动清理（closed/已确认 needs-human 90 天、预检跳过 30 天、已结算硬上限 500），`state.json` 不再无限增长；`checkThreadActivity` 拉讨论串改为按 `updated_at` 降序，通常一页命中。
 - v2.24（状态版本不变）：诊断增强——预检/批量预检流式返回了分片但无正文时，把首个分片的 JSON 预览写进插件日志，便于定位 devin/swe-2 等 agentic 模型的流分片形态。
 - v2.25（状态版本不变）：修复预检/批量预检在 DeepSeek Messages 协议路由下`message.content`为字符串导致`content.some is not a function`的错误——把 `messages[].content` 改为 block 数组 `[{type:'text',text:'...'}]`。
+- v2.27（状态版本不变，纯结构重构）：`index.js` 巨型类按域拆分为 `host/` 下七个模块——`gitlab.js`（glab 子进程/Todo 分页/标记完成）、`precheck.js`（LLM 预检）、`slots.js`（并发槽/会话跟踪/对账结算）、`closures.js`（闭环裁决/归档/回复核对）、`followups.js`（MR 监视/等待探测/到期入队）、`dispatch.js`（派发管线/路由/手动动作）、`constants.js`+`util.js`（共享常量与工具）。方法体逐字搬迁、行为零变化；模块以 `attachRuntimeMethods` 挂到运行时原型，同名冲突在加载期即报错。

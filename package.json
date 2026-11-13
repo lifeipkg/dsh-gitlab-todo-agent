@@ -1,6 +1,6 @@
 {
   "name": "@lifeipkg/dsh-gitlab-todo-agent",
-  "version": "2.26.0",
+  "version": "2.27.0",
   "description": "DSH bundle: poll GitLab todos via glab, batch-precheck mentions, route them to sessions, verify closure and surface an inbox for human follow-up.",
   "type": "module",
   "license": "MIT",
@@ -32,6 +32,7 @@
     "core.js",
     "client.js",
     "dsh-host.js",
+    "host/*.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
@@ -40,7 +41,7 @@
   ],
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "check": "node --check index.js && node --check core.js && node --check client.js",
+    "check": "node --check index.js && node --check core.js && node --check client.js && node --check host/constants.js && node --check host/util.js && node --check host/gitlab.js && node --check host/precheck.js && node --check host/slots.js && node --check host/closures.js && node --check host/followups.js && node --check host/dispatch.js",
     "pack:check": "npm pack --dry-run --json"
   },
   "publishConfig": {
