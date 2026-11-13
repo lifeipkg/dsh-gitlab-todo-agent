@@ -34,6 +34,11 @@ export const DEFAULT_SIGNATURE_TEXT = '—— 由 AI 助手代复';
 
 /** 路由目标的时效：超过该时长没有新消息的旧会话不再作为自动路由目标。 */
 export const ROUTE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** handled 历史保留策略：已闭环/已确认记录超过该天数后从状态文件里清掉（活跃记录永不删）。 */
+export const HANDLED_CLOSED_RETENTION_DAYS = 90;
+export const HANDLED_SKIPPED_RETENTION_DAYS = 30;
+/** 已结算记录的硬上限：超过时按结算时间删最旧，保护所有未结算与未确认记录。 */
+export const HANDLED_SETTLED_MAX = 500;
 /** busyRouteMode 与 routeMode 的合法取值：queue 排队下一回合，steer 在当前回合下一步插入引导。 */
 export const ROUTE_MODES = ['queue', 'steer'];
 
@@ -1151,6 +1156,11 @@ export function normalizeState(value) {
     .filter((record) => Boolean(record.sessionId))
     .sort((a, b) => b.acceptedAt - a.acceptedAt)
     .slice(0, 50);
+
+  // handled 状态文件 GC：返回被删除的 todoId 列表。活跃记录（follow-up/verifying/未确认的
+  // needs-human/pendingUnconfirmed）永不删；已结算记录按保留期清，超出上限再按结算时间删最旧。
+  const pruneResult = pruneHandled(handled);
+  for (const id of pruneResult.deleted) delete handled[id];
   const storedSettings = isRecord(value.settings) ? { ...value.settings } : {};
   // v2.21 移除按任务类型分模型：旧状态里的 taskModels 直接丢弃。
   delete storedSettings.taskModels;
@@ -1173,6 +1183,39 @@ export function normalizeState(value) {
 }
 
 /** 工作区路径归一化：比较时忽略大小写、正反斜杠与结尾分隔符。 */
+export function pruneHandled(handled) {
+  const now = Date.now();
+  const entries = Object.entries(isRecord(handled) ? handled : {});
+  const settled = [];
+  const deleted = [];
+  for (const [id, record] of entries) {
+    if (!isRecord(record)) continue;
+    const outcome = record.outcome ?? '';
+    const closure = record.closure ?? '';
+    // 活跃保护：待续办、待核对、未人工确认、待重试确认的一律保留。
+    if (closure === 'follow-up' || closure === 'verifying') continue;
+    if (closure === 'needs-human' && record.acknowledgedAt == null) continue;
+    if (record.pendingUnconfirmed === true) continue;
+    if (outcome !== 'precheck-skipped' && outcome !== 'rule-skipped' && closure !== 'closed' && closure !== 'needs-human') continue;
+    const ref = Number.isFinite(record.acknowledgedAt) ? record.acknowledgedAt
+      : (Number.isFinite(record.completedAt) ? record.completedAt : (record.acceptedAt ?? 0));
+    settled.push({ id, ref, outcome, closure });
+  }
+  const closedCutoff = now - HANDLED_CLOSED_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const skippedCutoff = now - HANDLED_SKIPPED_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const survivors = [];
+  for (const item of settled) {
+    const cutoff = (item.outcome === 'precheck-skipped' || item.outcome === 'rule-skipped') ? skippedCutoff : closedCutoff;
+    if (item.ref < cutoff) deleted.push(item.id); else survivors.push(item);
+  }
+  if (survivors.length > HANDLED_SETTLED_MAX) {
+    survivors.sort((a, b) => a.ref - b.ref);
+    const overflow = survivors.length - HANDLED_SETTLED_MAX;
+    for (const item of survivors.slice(0, overflow)) deleted.push(item.id);
+  }
+  return { deleted };
+}
+
 export function normalizeWorkspacePath(value) {
   return String(value ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
 }
