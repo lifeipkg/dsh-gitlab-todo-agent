@@ -101,7 +101,7 @@ export const dispatchMethods = {
       const candidates = selectPendingTodos(todos, this.state.handled, todos.length)
         .filter((todo) => !this.dispatches.has(todo.id) && !this.state.pending[todo.id]);
       this.state.lastNewCount = candidates.length;
-      if (this.state.settings.enabled && this.state.settings.autoProcess) {
+      if (this.state.settings.enabled) {
         // 上轮残留的预检判定：Todo 已由其他路径出结果时清掉，避免派发时误用。
         for (const todoId of [...this.judgeVerdicts.keys()]) {
           const handled = this.state.handled[todoId];

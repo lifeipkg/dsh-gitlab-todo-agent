@@ -2,7 +2,6 @@ export const STATE_VERSION = 6;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   enabled: false,
-  autoProcess: true,
   precheckEnabled: true,
   ruleSkipEnabled: true,
   autoArchive: true,
@@ -268,7 +267,10 @@ export function defaultSettings() {
 export function validateSettings(input, current = defaultSettings()) {
   if (!isRecord(input)) throw new Error('设置必须是 JSON 对象。');
   const next = { ...current };
-  for (const key of ['enabled', 'autoProcess', 'precheckEnabled', 'ruleSkipEnabled', 'autoArchive', 'followUpEnabled', 'waitProbeEnabled', 'followUpReuseSession', 'autoRoute', 'replySignature']) {
+  // v2.30：autoProcess 与 enabled 语义重复，已删除；旧状态里的残留字段直接清掉，
+  // 不再做"启用轮询但不自动处理"的模式（要只读就关 enabled）。
+  delete next.autoProcess;
+  for (const key of ['enabled', 'precheckEnabled', 'ruleSkipEnabled', 'autoArchive', 'followUpEnabled', 'waitProbeEnabled', 'followUpReuseSession', 'autoRoute', 'replySignature']) {
     if (key in input) {
       if (typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值。`);
       next[key] = input[key];
