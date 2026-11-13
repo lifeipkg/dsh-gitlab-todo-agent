@@ -88,7 +88,7 @@ export const dispatchMethods = {
     const pruned = pruneHandled(this.state.handled).deleted;
     if (pruned.length > 0) {
       for (const id of pruned) delete this.state.handled[id];
-      this.ctx.logger?.info?.(`[gitlab-todo-agent] 清理 handled 历史记录 ${pruned.length} 条。`);
+      this.logger.info(`清理 handled 历史记录 ${pruned.length} 条。`);
     }
     if (this.stopping) return this.snapshot();
     this.state.lastRunAt = Date.now();
@@ -103,6 +103,7 @@ export const dispatchMethods = {
       const candidates = selectPendingTodos(todos, this.state.handled, todos.length)
         .filter((todo) => !this.dispatches.has(todo.id) && !this.state.pending[todo.id]);
       this.state.lastNewCount = candidates.length;
+      this.logger.info(`轮询完成（${source}）：待办 ${todos.length} 条，新候选 ${candidates.length} 条，自动处理 ${this.state.settings.enabled ? '开启' : '关闭'}。`);
       if (this.state.settings.enabled) {
         // 上轮残留的预检判定：Todo 已由其他路径出结果时清掉，避免派发时误用。
         for (const todoId of [...this.judgeVerdicts.keys()]) {
@@ -139,7 +140,7 @@ export const dispatchMethods = {
                 project: todo.project,
               };
             } catch (error) {
-              this.ctx.logger?.warn?.(`[gitlab-todo-agent] 规则跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
+              this.logger.warn(`规则跳过 Todo ${todo.id} 标记完成失败：${errorMessage(error)}`);
             }
           }
         }
@@ -156,7 +157,7 @@ export const dispatchMethods = {
       }
     } catch (error) {
       this.state.lastPollError = `轮询失败：${errorMessage(error)}`;
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] ${this.state.lastPollError}`);
+      this.logger.warn(`${this.state.lastPollError}`);
     } finally {
       await this.persistQuietly('轮询');
     }
@@ -278,7 +279,7 @@ export const dispatchMethods = {
       }
     } catch {
       // 归档名册读取失败不影响主流程，但留一条调试日志便于排查“外部归档过滤失效”。
-      this.ctx.logger?.debug?.('[gitlab-todo-agent] 读取工作区归档会话列表失败，跳过外部归档过滤。');
+      this.logger.debug('读取工作区归档会话列表失败，跳过外部归档过滤。');
     }
     for (const record of Object.values(this.state.handled)) {
       if (record?.sessionId && record.archived === true) ids.add(record.sessionId);
@@ -396,7 +397,7 @@ export const dispatchMethods = {
       try {
         await this.host.unarchiveSession(sessionId);
       } catch (error) {
-        this.ctx.logger?.warn?.(`[gitlab-todo-agent] 取消归档会话 ${sessionId} 失败，续办改为新开会话：${errorMessage(error)}`);
+        this.logger.warn(`取消归档会话 ${sessionId} 失败，续办改为新开会话：${errorMessage(error)}`);
         return null;
       }
       previous.archived = false;
@@ -593,7 +594,7 @@ export const dispatchMethods = {
       } else if (followUp && !pending && continuing) {
         // 自动续办优先接力上一轮的会话：省掉新会话的冷启动与重新摸索；不满足条件时退回新开会话。
         reuse = await this.pickReusableSession(previous, todo).catch((reuseError) => {
-          this.ctx.logger?.warn?.(`[gitlab-todo-agent] 续办复用会话检查失败，改为新开会话：${errorMessage(reuseError)}`);
+          this.logger.warn(`续办复用会话检查失败，改为新开会话：${errorMessage(reuseError)}`);
           return null;
         });
         if (reuse) {
@@ -800,6 +801,7 @@ export const dispatchMethods = {
       this.state.recent = [record, ...this.state.recent.filter((item) => item.id !== todo.id)].slice(0, 50);
       this.state.lastDispatchError = null;
       await this.persistQuietly('已接受 Todo');
+      this.logger.info(`派发 ${isIssueItem(todo) ? 'Issue' : 'Todo'} ${todo.id} → ${route ? `路由会话 ${sessionId}` : `会话 ${sessionId}`}（${effectiveTitle}）。`);
       return { ok: true, sessionId, duplicate: false, routed: route !== null, routeMode: route?.mode ?? '' };
     } catch (error) {
       if (reserved) {
@@ -824,7 +826,7 @@ export const dispatchMethods = {
       }
       this.state.lastDispatchError = `Todo ${todo.id} 创建或驱动 Session 失败：${errorMessage(error)}`;
       await this.persistQuietly('派发错误');
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] ${this.state.lastDispatchError}`);
+      this.logger.warn(`${this.state.lastDispatchError}`);
       return { ok: false, error: this.state.lastDispatchError, sessionId };
     }
   },

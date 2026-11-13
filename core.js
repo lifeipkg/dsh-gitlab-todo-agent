@@ -1919,6 +1919,54 @@ export function buildDigest(state, now = Date.now(), windowMs = 24 * 60 * 60 * 1
   return { windowHours: Math.round(windowMs / 3600000), counts, items, open };
 }
 
+/**
+ * 运行时内存日志（Log Tab 用）：只进内存、不落文件的环形缓冲区。
+ * 内存封顶是硬性要求，采用三条独立防线（见 host/constants.js 注释）：
+ *   ① LOG_MAX_ENTRIES 条数上限 → 淘汰最旧（FIFO）；
+ *   ② LOG_MAX_CHARS 合计字符数上限 → 淘汰最旧直到配额内；
+ *   ③ LOG_MAX_LINE_CHARS 单条裁剪 → 长栈/长 JSON 截断标注，不塞进缓冲。
+ * dropped 记录被丢弃的条数（面板显示“已丢弃 N 条”），reset 时清零。
+ * list 返回副本（新→旧），防止外部意外改动内部数组。
+ */
+export function createLogBuffer({ maxEntries = 500, maxChars = 65536, maxLineChars = 500 } = {}) {
+  const buffer = {
+    entries: [],
+    chars: 0,
+    dropped: 0,
+  };
+  const api = {
+    get dropped() { return buffer.dropped; },
+    push(level, message) {
+      const safeLevel = ['info', 'warn', 'error', 'debug'].includes(level) ? level : 'info';
+      let textMessage = String(message ?? '').replace(/\s+/g, ' ').trim();
+      if (textMessage.length > maxLineChars) {
+        textMessage = `${textMessage.slice(0, maxLineChars)}…（截断 ${textMessage.length - maxLineChars} 字）`;
+      }
+      if (!textMessage) return;
+      buffer.entries.push({ ts: Date.now(), level: safeLevel, message: textMessage });
+      buffer.chars += textMessage.length;
+      // 双维度封顶：条数与合计字符任一超限都从头部淘汰最旧。
+      while (buffer.entries.length > maxEntries || buffer.chars > maxChars) {
+        const removed = buffer.entries.shift();
+        if (!removed) break;
+        buffer.chars -= removed.message.length;
+        buffer.dropped += 1;
+      }
+    },
+    list(limit = 200) {
+      const safeLimit = Number.isSafeInteger(limit) && limit >= 1 ? Math.min(limit, maxEntries) : 200;
+      return buffer.entries.slice(-safeLimit).reverse();
+    },
+    reset() {
+      buffer.dropped += buffer.entries.length;
+      buffer.entries.length = 0;
+      buffer.chars = 0;
+    },
+    get size() { return buffer.entries.length; },
+  };
+  return api;
+}
+
 /** 需人工收件箱：未确认的 needs-human 记录，按结算时间倒序，含原因与接手入口。 */
 export function buildInbox(state, limit = 100) {
   const safeLimit = Number.isSafeInteger(limit) && limit >= 1 ? Math.min(limit, 200) : 100;

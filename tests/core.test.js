@@ -9,6 +9,7 @@ import {
   buildInbox,
   buildIssueProjection,
   buildIssuePrompt,
+  createLogBuffer,
   buildJevDuplicatePairs,
   buildJevMatchQuestions,
   buildJevMatchState,
@@ -3622,4 +3623,56 @@ test('normalizeState preserves issue cache and issue-shaped handled items', () =
   assert.equal(isIssueItem(state.issues[0]), true);
   assert.equal(isIssueItem(state.handled[issue.id].item), true);
   assert.equal(state.handled[issue.id].item.projectId, '555');
+});
+
+test('log buffer normalizes lines, truncates, and enforces entry/char caps', () => {
+  const logs = createLogBuffer({ maxEntries: 3, maxChars: 1024, maxLineChars: 12 });
+  logs.push('info', 'first');
+  logs.push('warn', '  warn   two ');
+  logs.push('error', 'this message is far too long for the cap');
+  const items = logs.list();
+  assert.equal(items.length, 3);
+  // 新→旧；单行归一化；超长单条截断并标注。
+  assert.equal(items[0].level, 'error');
+  assert.ok(items[0].message.includes('截断'));
+  assert.equal(items[1].message, 'warn two');
+  assert.equal(items[1].level, 'warn');
+  // 条数封顶：第四进一最旧淘汰，dropped 计数。
+  logs.push('info', 'fourth');
+  assert.equal(logs.size, 3);
+  assert.equal(logs.dropped, 1);
+  assert.equal(logs.list()[0].message, 'fourth');
+  // 总字符封顶：条数没到也按字数淘汰最旧。
+  const tight = createLogBuffer({ maxEntries: 100, maxChars: 25, maxLineChars: 10 });
+  tight.push('info', 'aaaaaaaaaa');
+  tight.push('info', 'bbbbbbbbbb');
+  tight.push('info', 'cccccccccc');
+  assert.equal(tight.size, 2);
+  assert.ok(tight.dropped >= 1);
+  // 清空：现有条目计入 dropped，缓冲归零。
+  const droppedBefore = tight.dropped;
+  tight.reset();
+  assert.equal(tight.size, 0);
+  assert.equal(tight.dropped, droppedBefore + 2);
+});
+
+test('runtime logger feeds the in-memory buffer and logProjection/clearLogEntries expose it', async () => {
+  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.logger.warn('测试警告消息');
+  runtime.logger.info('  [gitlab-todo-agent] 旧调用点自带前缀 ');
+  const view = runtime.logProjection();
+  // 新→旧；前缀被剥掉（透传宿主时才补回），级别保留。
+  assert.equal(view.items[0].message, '旧调用点自带前缀');
+  assert.equal(view.items[0].level, 'info');
+  assert.equal(view.items[1].message, '测试警告消息');
+  assert.equal(view.items[1].level, 'warn');
+  assert.ok(view.capacity.maxEntries > 0);
+  assert.ok(view.capacity.maxChars > 0);
+  // 清空：缓冲归零并留一条审计行，先前条目计入 dropped。
+  runtime.clearLogEntries();
+  const after = runtime.logProjection();
+  assert.equal(after.items.length, 1);
+  assert.match(after.items[0].message, /清空/);
+  assert.ok(after.dropped >= 2);
+  await runtime.stop();
 });

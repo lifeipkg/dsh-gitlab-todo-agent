@@ -17,6 +17,7 @@ export const issuesMethods = {
     this.state.issues = items;
     this.state.lastIssuesAt = Date.now();
     await this.persistQuietly('Issue 列表');
+    this.logger.info(`Issue 面板已刷新：指派给我的开放 Issue ${items.length} 条。`);
     return this.issueProjection();
   },
 
@@ -25,7 +26,7 @@ export const issuesMethods = {
     try {
       return buildIssueProjection(this.state);
     } catch (error) {
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] Issue 投影构建失败：${errorMessage(error)}`);
+      this.logger.warn(`Issue 投影构建失败：${errorMessage(error)}`);
       return { items: [], orphans: [] };
     }
   },

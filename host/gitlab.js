@@ -100,7 +100,7 @@ export const gitlabMethods = {
       if (typeof issue?.state !== 'string') return null;
       return issue.state === 'closed';
     } catch (error) {
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 核对 Issue 状态失败（${api}）：${errorMessage(error)}`);
+      this.logger.warn(`核对 Issue 状态失败（${api}）：${errorMessage(error)}`);
       return null;
     }
   },

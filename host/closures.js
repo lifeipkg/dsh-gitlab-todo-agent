@@ -20,7 +20,7 @@ export const closuresMethods = {
     try {
       todos = await this.fetchTodos();
     } catch (error) {
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 闭环核对读取 Todo 失败，留待下一轮轮询：${errorMessage(error)}`);
+      this.logger.warn(`闭环核对读取 Todo 失败，留待下一轮轮询：${errorMessage(error)}`);
       return;
     }
     this.state.todos = todos;
@@ -148,6 +148,7 @@ export const closuresMethods = {
     record.closure = verdict.closure;
     record.closureNote = verdict.note;
     record.nextAttemptAt = verdict.closure === 'follow-up' ? Date.now() + verdict.delayMinutes * 60000 : null;
+    this.logger.info(`闭环裁决 ${isIssueItem(record.item) ? 'Issue' : 'Todo'} ${record.id}：${verdict.closure}${verdict.note ? `（${verdict.note.slice(0, 120)}）` : ''}`);
     // 事件驱动续办：waiting 且挂着未合并 MR 时建立监视器（MR 状态翻转提前续办，定时器兜底）。
     record.watch = null;
     if (verdict.closure === 'follow-up' && record.reportStatus === 'waiting'
@@ -172,7 +173,7 @@ export const closuresMethods = {
     } catch (archiveError) {
       // 归档失败不影响闭环结论；仍有工作在跑等拒绝只记录原因，不强行停止任何工作。
       record.archiveError = errorMessage(archiveError);
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 归档会话 ${record.sessionId} 失败：${record.archiveError}`);
+      this.logger.warn(`归档会话 ${record.sessionId} 失败：${record.archiveError}`);
     }
   },
 
@@ -217,7 +218,7 @@ export const closuresMethods = {
       }
     } catch (error) {
       // 闭环判定的关键证据拿不到时必须留痕，否则“回复未核对”无从排查。
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] 核对讨论串回复失败（${api}）：${errorMessage(error)}`);
+      this.logger.warn(`核对讨论串回复失败（${api}）：${errorMessage(error)}`);
       return null;
     }
     return null;

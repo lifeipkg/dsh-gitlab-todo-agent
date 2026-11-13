@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { DshHostClient } from './dsh-host.js';
 import {
   buildInbox,
+  createLogBuffer,
   handledPage,
   initialState,
   normalizeState,
@@ -13,10 +14,17 @@ import {
   STATE_VERSION,
   validateSettings,
 } from './core.js';
-import { BRIDGE_PATH, MAX_REQUEST_BYTES } from './host/constants.js';
+import {
+  BRIDGE_PATH,
+  LOG_MAX_CHARS,
+  LOG_MAX_ENTRIES,
+  LOG_MAX_LINE_CHARS,
+  MAX_REQUEST_BYTES,
+} from './host/constants.js';
 import { attachRuntimeMethods, errorMessage, jsonResponse } from './host/util.js';
 import { gitlabMethods } from './host/gitlab.js';
 import { issuesMethods } from './host/issues.js';
+import { logsMethods } from './host/logs.js';
 import { precheckMethods } from './host/precheck.js';
 import { precheckJevMethods } from './host/precheck-jev.js';
 import { slotsMethods } from './host/slots.js';
@@ -33,6 +41,7 @@ const LEGACY_STATE_FILE = join(PACKAGE_DIR, '.runtime', 'state.json');
  * 业务方法按域拆分在 host/*.js，启动时 attachRuntimeMethods 挂到本类原型：
  *   host/gitlab.js    glab 子进程、当前用户、Todo/Issue 分页、标记完成、Issue 状态核对
  *   host/issues.js    Issue 面板（刷新“指派给我的开放 Issue”缓存、面板投影）
+ *   host/logs.js      运行时内存日志（Log Tab 投影、清空）
  *   host/precheck.js  预检调度（LLM 单条 + 批量 + 失败降级 + 引擎选择）
  *   host/precheck-jev.js  Jev/System One 分类器预检（宿主 classify → jev CLI → HTTP 三层通道）
  *   host/slots.js     并发槽、会话跟踪、对账结算（reconcile）
@@ -71,6 +80,24 @@ export class GitlabTodoRuntime {
     // 预检连续失败计数（todoId → 次数）：失败本轮跳过，获得判定或被处理后清零。
     this.precheckFailures = new Map();
     this.lastJudgeError = '';
+    // 运行时内存日志（Log Tab）：只进内存环形缓冲（条数/总字符双封顶、单行截断），不落盘。
+    // this.logger.<level>() 统一入口：进缓冲 + 透传宿主 logger（自动补 [gitlab-todo-agent] 前缀）。
+    // 消息规范：单行「<对象/动作>：<结果/细节>」，不要在业务代码里自己加前缀。
+    this.logs = createLogBuffer({
+      maxEntries: LOG_MAX_ENTRIES,
+      maxChars: LOG_MAX_CHARS,
+      maxLineChars: LOG_MAX_LINE_CHARS,
+    });
+    const upstream = this.ctx.logger ?? {};
+    this.logger = {};
+    for (const level of ['debug', 'info', 'warn', 'error']) {
+      this.logger[level] = (message) => {
+        // 历史调用点自带 [gitlab-todo-agent] 前缀：缓冲里剥掉保持整洁，透传时再补回。
+        const entry = String(message ?? '').replace(/^\s*\[gitlab-todo-agent\]\s*/u, '');
+        this.logs.push(level, entry);
+        try { upstream[level]?.(`[gitlab-todo-agent] ${entry}`); } catch { /* 宿主日志失败不影响业务 */ }
+      };
+    }
   }
 
   storageDirectory() {
@@ -119,6 +146,7 @@ export class GitlabTodoRuntime {
     });
     await this.reconcileSessions();
     this.resetTimer();
+    this.logger.info(`运行时已启动：${this.state.settings.enabled ? `自动轮询开启（间隔 ${this.state.settings.intervalSeconds}s）` : '自动轮询关闭（仅手动动作）'}。`);
   }
 
   async stop() {
@@ -179,7 +207,7 @@ export class GitlabTodoRuntime {
       // 持久化故障与派发错误分账：写进独立字段，不污染面板上“最近派发错误”的语义。
       const message = `保存${area}状态失败：${errorMessage(error)}`;
       this.state.lastPersistError = message;
-      this.ctx.logger?.warn?.(`[gitlab-todo-agent] ${message}`);
+      this.logger.warn(message);
     }
   }
 
@@ -238,6 +266,10 @@ export class GitlabTodoRuntime {
         // Issue 面板：读缓存投影（不发 glab）；刷新走 POST issues {refresh:true}。
         return jsonResponse(200, { ok: true, ...this.issueProjection() });
       }
+      if (request.method === 'GET' && url.searchParams.get('action') === 'logs') {
+        // 运行时内存日志：只读快照（新→旧）。清空走 POST logs {clear:true}。
+        return jsonResponse(200, { ok: true, ...this.logProjection() });
+      }
       if (request.method !== 'POST') {
         return jsonResponse(405, { ok: false, error: '不支持的请求方法。' });
       }
@@ -259,6 +291,11 @@ export class GitlabTodoRuntime {
         // Issue 面板：refresh 显式重拉 GitLab（慢操作，90s bridge 超时内）；否则返回缓存投影。
         const projection = body.refresh === true ? await this.refreshIssues() : this.issueProjection();
         return jsonResponse(200, { ok: true, ...projection });
+      }
+      if (body.action === 'logs') {
+        // Log Tab：clear 清空缓冲（并留一条审计行）；否则返回当前投影。
+        if (body.clear === true) this.clearLogEntries();
+        return jsonResponse(200, { ok: true, ...this.logProjection() });
       }
       if (body.action === 'poll') {
         const state = await this.poll('manual');
@@ -306,6 +343,7 @@ export class GitlabTodoRuntime {
 attachRuntimeMethods(GitlabTodoRuntime, [
   gitlabMethods,
   issuesMethods,
+  logsMethods,
   precheckMethods,
   precheckJevMethods,
   slotsMethods,
