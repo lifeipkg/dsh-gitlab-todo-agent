@@ -3543,6 +3543,23 @@ test('issue closure verdict closes only on the issue being closed', async () => 
   assert.match(closed.note, /Issue 已关闭/);
 });
 
+test('issue closure without an embedded report uses factual diagnostics only', () => {
+  const open = assessClosure({
+    todoPending: true, turnOk: true, unit: 'issue', replied: null,
+    followUpBlocked: '手动派发的会话不自动续办',
+  });
+  assert.equal(open.closure, 'needs-human');
+  assert.equal(open.note, 'Issue 仍未关闭；手动派发的会话不自动续办');
+
+  const closed = assessClosure({ todoPending: false, turnOk: true, unit: 'issue', replied: null });
+  assert.equal(closed.closure, 'closed');
+  assert.equal(closed.note, 'Issue 已关闭');
+
+  // Todo 仍保留结案报告和回复核对诊断，不能被 Issue 极简契约影响。
+  assert.match(assessClosure({ todoPending: true, turnOk: true }).note, /没有输出结案报告/);
+  assert.match(assessClosure({ todoPending: false, turnOk: true, replied: null }).note, /讨论串回复未核对/);
+});
+
 test('assessClosures checks the issue state instead of the todo list', async () => {
   const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
   const issue = normalizeIssue(gitlabIssue);

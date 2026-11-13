@@ -854,8 +854,8 @@ export function assessClosure(input) {
   if (!todoPending && replied !== false) {
     return {
       closure: 'closed',
-      // replied === null（无法核对）时在结论里注明，避免把“未核对”伪装成“已回复”。
-      note: `${summary || (turnOk ? closedFact : `回合异常结束，但${closedFact}`)}${replied === null ? '（讨论串回复未核对）' : ''}`.slice(0, 500),
+      // Todo 在 replied === null 时注明未核对；Issue 极简任务没有插件回复契约，只报告真实关闭状态。
+      note: `${summary || (turnOk ? closedFact : `回合异常结束，但${closedFact}`)}${unit !== 'issue' && replied === null ? '（讨论串回复未核对）' : ''}`.slice(0, 500),
       delayMinutes: null,
     };
   }
@@ -868,7 +868,7 @@ export function assessClosure(input) {
     if (report?.status === 'done') issues.push(`会话自述已完成，但 ${stillOpenFact}`);
     else if (report?.status === 'waiting') issues.push(`等待外部条件${summary ? `：${summary}` : ''}`);
     else if (report?.status === 'needs-human') issues.push(`需要人工接手${summary ? `：${summary}` : ''}`);
-    else if (turnOk) issues.push(`${stillOpenFact}，且会话没有输出结案报告`);
+    else if (turnOk) issues.push(unit === 'issue' ? stillOpenFact : `${stillOpenFact}，且会话没有输出结案报告`);
   }
   if (replied === false) issues.push(unit === 'issue' ? 'Issue 讨论区没有我方回复' : '原 note 讨论串中没有我方回复');
   const note = issues.join('；').slice(0, 500);
