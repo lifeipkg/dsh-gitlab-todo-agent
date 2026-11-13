@@ -1247,6 +1247,9 @@ function autoRuntime(options = {}) {
   built.runtime.state.settings.enabled = true;
   built.runtime.state.settings.autoProcess = true;
   built.runtime.state.settings.precheckEnabled = false;
+  // 既有闭环用例验证“续办 = 新开会话 + 到期即派发”的基线；复用与等待探测由专项用例开启。
+  built.runtime.state.settings.followUpReuseSession = false;
+  built.runtime.state.settings.waitProbeEnabled = false;
   Object.assign(built.runtime.state.settings, options.settings ?? {});
   return { ...built, prompts };
 }
@@ -1268,7 +1271,7 @@ test('prompt carries the unattended single-turn environment and the closure repo
   assert.match(prompt, /第 1 轮，自动处理预算约 4 轮（纯等待外部条件的轮次不消耗轮数预算）/);
   assert.match(prompt, /累计不超过约 20 分钟/);
   assert.match(prompt, /不以你的自述为准/);
-  assert.match(prompt, /自动新开“续办会话”/);
+  assert.match(prompt, /自动发起续办/);
   assert.match(prompt, /默认约 15 分钟/);
   assert.match(prompt, /waiting（可自动续办）/);
   assert.match(prompt, /needs-human（需人接手）/);
@@ -1280,7 +1283,7 @@ test('prompt carries the unattended single-turn environment and the closure repo
   const lastRound = buildTodoPrompt(todo, { me: { username: 'jum', id: '106' }, round: 4, maxRounds: 4, autoFollowUp: false });
   assert.match(lastRound, /不会再自动续办/);
   assert.match(lastRound, /提及 `@jum` 即可触发新一轮处理/);
-  assert.doesNotMatch(lastRound, /自动新开“续办会话”/);
+  assert.doesNotMatch(lastRound, /自动发起续办/);
 });
 
 test('follow-up prompt hands over history, carried MRs, missing reply and related open todos', () => {
@@ -2639,6 +2642,12 @@ test('missing batch verdicts skip the round instead of dispatching blindly', asy
   assert.equal(runtime.state.handled.known.outcome, 'session-accepted');
   assert.equal(runtime.state.handled.unknown, undefined);
   assert.equal(runtime.precheckFailures.get('unknown'), 1);
+  assert.match(runtime.state.lastPrecheckError, /预检失败 1\/2/);
+  // 连续失败达到上限：降级为直接派发，不再让自动处理永久停摆。
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(runtime.state.handled.unknown?.outcome, 'session-accepted');
+  assert.equal(calls.create, 2);
   await runtime.stop();
 });
 
@@ -2887,4 +2896,242 @@ test('persistence failures are reported separately from dispatch errors', async 
   assert.equal(runtime.state.lastDispatchError ?? null, null);
   assert.match(runtime.snapshot().lastPersistError, /disk full/);
   await runtime.stop();
+});
+test('precheck failure reasons are recorded and the model never being reachable degrades to dispatch', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.ctx.llm = {
+    async prepareCall() { throw new Error('model route unavailable'); },
+    stream() { throw new Error('unused'); },
+  };
+  runtime.state.settings.enabled = true;
+  runtime.state.settings.autoProcess = true;
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 0);
+  assert.match(runtime.state.lastPrecheckError, /model route unavailable/);
+  assert.equal(snapshotError(runtime), runtime.state.lastPrecheckError);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 1);
+  await runtime.stop();
+});
+
+function snapshotError(runtime) {
+  return runtime.snapshot().lastPrecheckError;
+}
+
+test('enabling polling while a disabled poll is in flight still runs a full poll afterwards', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }));
+  runtime.state.settings.autoProcess = true;
+  runtime.state.settings.precheckEnabled = false;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  runtime.fetchTodos = async () => {
+    await gate;
+    return normalizeTodos([directNoteTodo]);
+  };
+  const inFlight = runtime.poll('manual');
+  await runtime.updateSettings({ enabled: true });
+  release();
+  await inFlight;
+  // 启动轮询（500ms）要等在飞的那轮结束再跑，而不是并入它。
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  await runtime.pump();
+  assert.equal(calls.create, 1);
+  await runtime.stop();
+});
+
+const reuseMr = 'https://gitlab.local/group/project/-/merge_requests/12';
+
+test('a remedial follow-up reuses the previous session instead of opening a new one', async () => {
+  const { runtime, calls, prompts } = autoRuntime({ settings: { followUpReuseSession: true } });
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  await runtime.executePoll('test');
+  await runtime.pump();
+  // 回合正常但没标记完成、没输出报告 → 补救类续办。
+  calls.complete('session-1', 'completed', closureLine({ status: 'done', summary: '处理了', resumeAfterMinutes: 0, openMrs: [] }));
+  await runtime.reconcileSessions();
+  const first = runtime.state.handled.direct;
+  assert.equal(first.closure, 'follow-up');
+  assert.equal(first.archived, true);
+  first.nextAttemptAt = Date.now() - 1;
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 1);
+  assert.equal(calls.prompt, 2);
+  assert.deepEqual(calls.unarchives, ['session-1']);
+  assert.equal(calls.renames.length, 1);
+  const second = runtime.state.handled.direct;
+  assert.equal(second.sessionId, 'session-1');
+  assert.equal(second.round, 2);
+  assert.equal(second.reused, true);
+  assert.equal(second.reuseCount, 1);
+  assert.equal(second.archived, false);
+  assert.equal(second.history[0].archived, false);
+  assert.match(prompts[1], /同一条 Todo 的续办回合，运行在上一轮的同一个会话里/);
+  assert.match(prompts[1], /前序回合的上下文仍在本会话中/);
+  assert.match(prompts[1], /在原会话中追加的续办回合/);
+  // 复用后仍按各自 requestId 结算并重新归档。
+  calls.complete('session-1', 'completed', closureLine({ status: 'done', summary: '补上了', resumeAfterMinutes: 0, openMrs: [] }));
+  await runtime.reconcileSessions();
+  assert.equal(runtime.state.handled.direct.executionStatus, 'completed');
+  assert.equal(runtime.state.handled.direct.reused, true);
+  const restored = normalizeState(JSON.parse(JSON.stringify(runtime.state)));
+  assert.equal(restored.handled.direct.reuseCount, 1);
+  assert.equal(restored.handled.direct.reused, true);
+  await runtime.stop();
+});
+
+test('session reuse falls back to a new session when the limit, the turn state or the switch forbids it', async () => {
+  for (const scenario of ['limit', 'failed', 'off', 'running']) {
+    const { runtime, calls } = autoRuntime({ settings: { followUpReuseSession: scenario !== 'off' } });
+    runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+    await runtime.executePoll('test');
+    await runtime.pump();
+    calls.complete('session-1', scenario === 'failed' ? 'failed' : 'completed', closureLine({ status: 'done', summary: 'x', resumeAfterMinutes: 0, openMrs: [] }));
+    await runtime.reconcileSessions();
+    const first = runtime.state.handled.direct;
+    assert.equal(first.closure, 'follow-up', scenario);
+    if (scenario === 'limit') first.reuseCount = 2;
+    if (scenario === 'running') calls.sessions.get('session-1').running = true;
+    first.nextAttemptAt = Date.now() - 1;
+    if (scenario === 'running') {
+      // 会话仍在跑：reconcile 看到 running 不会结算；直接验证复用判定。
+      assert.equal(await runtime.pickReusableSession(first, directNoteTodo), null);
+      await runtime.stop();
+      continue;
+    }
+    await runtime.executePoll('test');
+    await runtime.pump();
+    assert.equal(calls.create, 2, scenario);
+    assert.equal(runtime.state.handled.direct.sessionId, 'session-2', scenario);
+    assert.equal(runtime.state.handled.direct.reused, false, scenario);
+    assert.equal(runtime.state.handled.direct.reuseCount, 0, scenario);
+    await runtime.stop();
+  }
+});
+
+test('pure waiting follow-ups are probed with glab and deferred without opening a session', async () => {
+  const { runtime, calls } = autoRuntime({ settings: { waitProbeEnabled: true } });
+  runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+  let otherReplied = false;
+  let pipeline = 'running';
+  runtime.runGlab = async (args) => {
+    if (args[3] === 'projects/group%2Fproject/merge_requests/12') {
+      return JSON.stringify({ state: 'opened', head_pipeline: { status: pipeline } });
+    }
+    assert.equal(args[3], 'projects/group%2Fproject/issues/7/discussions');
+    return JSON.stringify([{ id: 'd1', notes: [
+      { id: 9, author: { id: 106 } },
+      { id: 10, author: { id: 52 } },
+      { id: 12, author: { id: 106 } },
+      ...(otherReplied ? [{ id: 13, author: { id: 52 } }] : []),
+    ] }]);
+  };
+  await runtime.executePoll('test');
+  await runtime.pump();
+  calls.complete('session-1', 'completed', closureLine({ status: 'waiting', summary: '等 CI', resumeAfterMinutes: 30, openMrs: [reuseMr] }));
+  await runtime.reconcileSessions();
+  const record = runtime.state.handled.direct;
+  assert.equal(record.closure, 'follow-up');
+  assert.ok(record.watch);
+  // 到期但 MR 没翻转、讨论串也没人回应：不开会话，顺延。
+  record.nextAttemptAt = Date.now() - 1;
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 1);
+  assert.equal(record.waitProbes, 1);
+  assert.ok(record.nextAttemptAt - Date.now() > 29 * 60000);
+  // 有人在讨论串里回应：放行续办。
+  otherReplied = true;
+  record.nextAttemptAt = Date.now() - 1;
+  await runtime.executePoll('test');
+  await runtime.pump();
+  assert.equal(calls.create, 2);
+  assert.equal(runtime.state.handled.direct.waitProbes, 0);
+  await runtime.stop();
+});
+
+test('wait probes fail open: no evidence, heartbeat cap, MR events and remedial rounds all dispatch', async () => {
+  const mk = async () => {
+    const built = autoRuntime({ settings: { waitProbeEnabled: true } });
+    const { runtime, calls } = built;
+    runtime.fetchTodos = async () => normalizeTodos([directNoteTodo]);
+    runtime.runGlab = async (args) => {
+      if (args[3].includes('merge_requests')) return JSON.stringify({ state: 'opened', head_pipeline: { status: 'running' } });
+      return JSON.stringify([{ id: 'd1', notes: [{ id: 10, author: { id: 52 } }, { id: 12, author: { id: 106 } }] }]);
+    };
+    await runtime.executePoll('test');
+    await runtime.pump();
+    return built;
+  };
+  const waiting = (openMrs) => closureLine({ status: 'waiting', summary: '等', resumeAfterMinutes: 30, openMrs });
+  // 心跳上限：已推迟 4 次后放行。
+  {
+    const { runtime, calls } = await mk();
+    calls.complete('session-1', 'completed', waiting([]));
+    await runtime.reconcileSessions();
+    const record = runtime.state.handled.direct;
+    record.waitProbes = 4;
+    record.nextAttemptAt = Date.now() - 1;
+    await runtime.executePoll('test');
+    await runtime.pump();
+    assert.equal(calls.create, 2);
+    await runtime.stop();
+  }
+  // 无 MR 的纯等待：讨论串安静即推迟。
+  {
+    const { runtime, calls } = await mk();
+    calls.complete('session-1', 'completed', waiting([]));
+    await runtime.reconcileSessions();
+    runtime.state.handled.direct.nextAttemptAt = Date.now() - 1;
+    await runtime.executePoll('test');
+    await runtime.pump();
+    assert.equal(calls.create, 1);
+    assert.equal(runtime.state.handled.direct.waitProbes, 1);
+    await runtime.stop();
+  }
+  // 讨论串读取失败：无证据，放行。
+  {
+    const { runtime, calls } = await mk();
+    calls.complete('session-1', 'completed', waiting([]));
+    await runtime.reconcileSessions();
+    runtime.runGlab = async () => { throw new Error('glab down'); };
+    runtime.state.handled.direct.nextAttemptAt = Date.now() - 1;
+    await runtime.executePoll('test').catch(() => {});
+    await runtime.pump();
+    assert.equal(runtime.state.handled.direct.waitProbes ?? 0, 0);
+    await runtime.stop();
+  }
+  // 补救类续办（回合失败）不探测，直接放行。
+  {
+    const { runtime, calls } = await mk();
+    calls.complete('session-1', 'failed', '');
+    await runtime.reconcileSessions();
+    runtime.state.handled.direct.nextAttemptAt = Date.now() - 1;
+    assert.equal(await runtime.probeWaitingFollowUps(), 0);
+    await runtime.stop();
+  }
+  // 有 MR 但监视器尚无观测：无证据，放行。
+  {
+    const { runtime, calls } = await mk();
+    calls.complete('session-1', 'completed', waiting([reuseMr]));
+    await runtime.reconcileSessions();
+    const record = runtime.state.handled.direct;
+    record.nextAttemptAt = Date.now() - 1;
+    assert.equal(await runtime.probeWaitingFollowUps(), 0);
+    record.watch.lastStates[reuseMr] = 'running';
+    assert.equal(await runtime.probeWaitingFollowUps(), 1);
+    await runtime.stop();
+  }
+});
+
+test('settings validation accepts the follow-up saving switches', () => {
+  assert.equal(defaultSettings().waitProbeEnabled, true);
+  assert.equal(defaultSettings().followUpReuseSession, true);
+  const next = validateSettings({ waitProbeEnabled: false, followUpReuseSession: false }, defaultSettings());
+  assert.equal(next.waitProbeEnabled, false);
+  assert.equal(next.followUpReuseSession, false);
+  assert.throws(() => validateSettings({ followUpReuseSession: 'yes' }, defaultSettings()), /布尔/);
 });

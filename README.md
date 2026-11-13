@@ -124,6 +124,12 @@ Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再�
 
 设置项：自动续办开关（默认开）、每条 Todo 最多自动补救轮数（默认 3）、续办等待时间（默认 15 分钟）。
 
+**续办省 token（v2.20）**：
+
+- **等待探测**（`waitProbeEnabled`，默认开）：到期的“纯等待”续办（上一轮自述 `waiting`、回合正常、无缺回复证据）不再直接开会话，而是先用 glab 看一眼——监视的 MR 没有状态翻转、原讨论串里我方最后一条回复之后也没有他人新回应，就把续办顺延一个等待周期，不消耗任何模型调用。任何不确定（读取失败、监视器还没有观测、补救类续办、MR 事件已触发）一律放行；连续推迟 4 次后放行一次心跳会话。
+- **会话复用**（`followUpReuseSession`，默认开）：补救类与有变化的续办优先接力上一轮的同一个会话（已归档的先取消归档），沿用已有上下文、命中前缀缓存；会话已不存在、仍在执行、上一回合异常结束、挂有其他未结算任务，或已被接力 2 次时，退回“新开会话 + 摘要交接”。复用回合的提示词会明确告知“上下文仍在，但外部状态必须重新核实”。
+- 以上两项都只影响续办，首轮派发不变；总时限（72 小时）与补救轮数预算照旧。
+
 ## DSH 会话交互（对齐 dsh-task-board 实现）
 
 插件与 DSH 的全部会话操作都经 **typertGateway** 以 Host 本地 owner peer 调用（`session/modelCatalog|create|rename|selectModel|prompt|list|page` 与流式 `session/follow`），不使用浏览器传入的身份，与 [dsh-task-board](https://github.com/zhu1090093659/dsh-web/tree/main/packages/dsh-task-board) 的 HostExecutionRunner 同一调用契约。
@@ -180,6 +186,7 @@ Host 每次轮询先通过 `glab api user` 获取并缓存当前用户 ID，再�
 - v4 → v5：增加会话路由设置与记录的 `routed/routeMode/requestId` 字段；旧记录自动补默认值，无需手工改写。
 - v5 → v6：增加收件箱/批量预检/按类型模型/事件驱动续办相关设置与记录字段（`taskType/lastReply/watch/acknowledgedAt` 等）；旧记录自动补默认值，无需手工改写。
 - v2.19（状态版本不变）：记录新增可选字段 `waitRounds`（纯等待轮计数）、`dispatchFailures`（续办派发失败计数）、`mergedInto/author/excerpt`（预检折叠来源）；旧记录缺省为 0／空，无需迁移。持久化故障改记 `lastPersistError`，不再混入 `lastDispatchError`。
+- v2.20（状态版本不变）：新增设置 `waitProbeEnabled`、`followUpReuseSession`；记录新增可选字段 `waitProbes`、`reused`、`reuseCount`；面板新增 `lastPrecheckError`（预检失败原因）。**预检降级**：同一 Todo 预检连续 2 轮失败后降级为直接派发（此前每轮都跳过，会让未配置可用预检模型的环境永远不开会话）；失败原因同时写入日志与面板横幅。修复：启用轮询的瞬间若恰有一轮“未启用”的轮询在飞，启动轮询不再并入它而是等它结束后再跑完整一轮。
 - 全新安装默认 `customRules` 为空，使用通用提示词。
 
 ## 去重与失败恢复

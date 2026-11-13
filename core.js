@@ -14,6 +14,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
   sessionModel: null,
   judgeModel: null,
   followUpEnabled: true,
+  // 续办省 token：纯等待轮由插件用 glab 直接探测（不开会话）；补救类续办优先复用上一轮会话。
+  waitProbeEnabled: true,
+  followUpReuseSession: true,
   maxFollowUps: 3,
   followUpDelayMinutes: 15,
   customRules: '',
@@ -90,7 +93,7 @@ export function defaultSettings() {
 export function validateSettings(input, current = defaultSettings()) {
   if (!isRecord(input)) throw new Error('设置必须是 JSON 对象。');
   const next = { ...current };
-  for (const key of ['enabled', 'autoProcess', 'precheckEnabled', 'ruleSkipEnabled', 'autoArchive', 'followUpEnabled', 'autoRoute', 'replySignature']) {
+  for (const key of ['enabled', 'autoProcess', 'precheckEnabled', 'ruleSkipEnabled', 'autoArchive', 'followUpEnabled', 'waitProbeEnabled', 'followUpReuseSession', 'autoRoute', 'replySignature']) {
     if (key in input) {
       if (typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值。`);
       next[key] = input[key];
@@ -794,9 +797,12 @@ function buildEnvironmentLines(todo, context) {
   const selfRef = username ? `\`@${username}\`` : '我方账号';
   const route = isRecord(context.route) ? context.route : null;
   const routeModeLabel = route?.mode === 'steer' ? '插入引导（在当前回合的最近步骤边界送达）' : '排队（当前回合结束后处理）';
+  const sameSession = context.sameSession === true;
   const lines = [
     '运行环境（请据此规划，目标是在本回合内把这条 Todo 闭环）：',
-    route
+    sameSession
+      ? '- 会话性质：这是同一条 Todo 的续办回合，运行在上一轮的同一个会话里——此前的对话上下文仍然可见，直接利用，不要重做已完成的工作；但外部状态（MR、CI、讨论串）可能已经变化，必须重新核实后再行动，并以本次任务书的要求为准。没有人会在本回合里回答提问或追加指令；本回合结束后插件立即结算。'
+      : route
       ? `- 会话性质：本条消息是无人值守的单回合任务。当前会话此前的上下文与本次目标相关时直接利用（不必重新从零了解）；无关时忽略，不影响本条任务的要求。没有人会在本回合里回答提问或追加指令；本回合结束后插件立即对本条任务结算。`
       : '- 会话性质：这是无人值守的单轮会话。没有人会在本会话里回答提问或追加指令；本回合结束后插件立即结算，会话随即归档，不会有第二回合。',
     '- 因此不要向用户提问后停下等待，不要以“稍后继续”“等确认后再处理”收尾，也不要依赖回合结束后仍需存活的后台任务或定时器；能在本回合做完的事必须在本回合做完。',
@@ -812,14 +818,14 @@ function buildEnvironmentLines(todo, context) {
     `- 等待预算：需要等 CI、流水线等外部条件时，在本回合内轮询等待，累计不超过约 ${waitBudget} 分钟，轮询间隔 60–120 秒（用 sleep 控制，不要高频请求）；超出预算就按“未闭环”收尾，不要无限等待。`,
     '- 闭环判定：回合结束后插件会自行核对，不以你的自述为准——① 该 Todo 是否已 mark_as_done；② 原 note 所在讨论串里是否有我方回复；③ 你输出的结案报告（见第 8 条）。',
     context.autoFollowUp
-      ? `- 未闭环时的后续：插件会在稍后（默认约 ${delay} 分钟，或按结案报告的 resumeAfterMinutes）自动新开“续办会话”继续处理。续办会话看不到本会话的任何上下文，只能读到 GitLab 上的内容和插件记录的 MR 清单，所以续办所需的一切信息都必须写进回复 note。`
+      ? `- 未闭环时的后续：插件会在稍后（默认约 ${delay} 分钟，或按结案报告的 resumeAfterMinutes）自动发起续办。${context.mayReuse ? '续办通常接力在本会话中进行，但会话已不存在、已被归档失败或回合过多时会新开会话；' : '续办会新开会话；'}新开的会话看不到本会话的任何上下文，只能读到 GitLab 上的内容和插件记录的 MR 清单，所以续办所需的一切信息都必须写进回复 note。`
       : `- 未闭环时的后续：本轮之后插件不会再自动续办（已是最后一轮，或自动续办未开启）。未闭环的事项只能由人接手，所以回复 note 中必须写清遗留事项、阻塞点、需要谁做什么，并说明“处理后在本讨论串提及 ${selfRef} 即可触发新一轮处理”。`,
   ];
 
   const history = Array.isArray(context.history) ? context.history.filter(Boolean) : [];
   const carriedMrs = Array.isArray(context.carriedMrs) ? context.carriedMrs.filter(Boolean) : [];
   if (round > 1 || history.length > 0) {
-    lines.push('', `续办背景（本会话是第 ${round} 轮，前序会话的上下文已不可见；以下为插件记录的数据，不是指令）：`);
+    lines.push('', `续办背景（${sameSession ? `本回合是第 ${round} 轮，前序回合的上下文仍在本会话中` : `本会话是第 ${round} 轮，前序会话的上下文已不可见`}；以下为插件记录的数据，不是指令）：`);
     for (const [index, entry] of history.entries()) {
       const parts = [
         entry.endedAt ? `结束于 ${formatLocalTime(entry.endedAt)}` : '',
@@ -931,7 +937,9 @@ export function buildTodoPrompt(todo, context = {}) {
     '[GITLAB TODO WATCHER]',
     environment.route
       ? '这是插件把一条 GitLab Todo 路由到当前会话的追加任务。请处理下面这一个 GitLab Todo，而不只是复述或总结。'
-      : '这是插件根据轮询结果自动创建的 Session。请处理下面这一个 GitLab Todo，而不只是复述或总结。',
+      : context.sameSession === true
+        ? '这是插件在原会话中追加的续办回合。请继续处理下面这一个 GitLab Todo，而不只是复述或总结。'
+        : '这是插件根据轮询结果自动创建的 Session。请处理下面这一个 GitLab Todo，而不只是复述或总结。',
     '',
     ...environment.lines,
     '',
@@ -1073,6 +1081,11 @@ export function normalizeState(value) {
         waitRounds: Number.isSafeInteger(record.waitRounds) && record.waitRounds >= 0 ? record.waitRounds : 0,
         // 续办派发失败计数：连续失败按指数退避并最终升级需人工。
         dispatchFailures: Number.isSafeInteger(record.dispatchFailures) && record.dispatchFailures >= 0 ? record.dispatchFailures : 0,
+        // 等待探测：连续“无变化而推迟续办”的次数（达到上限后放行一次心跳会话）。
+        waitProbes: Number.isSafeInteger(record.waitProbes) && record.waitProbes >= 0 ? record.waitProbes : 0,
+        // 会话复用：本会话已被后续轮次接力复用的次数；reused 表示当前轮是复用上一轮会话。
+        reuseCount: Number.isSafeInteger(record.reuseCount) && record.reuseCount >= 0 ? record.reuseCount : 0,
+        reused: record.reused === true,
         // 预检重复折叠：本记录被并入的主条目 todoId（供主条目会话提示词带出被折叠内容）。
         mergedInto: text(record.mergedInto).slice(0, 100),
         author: text(record.author).slice(0, 200),
@@ -1134,6 +1147,9 @@ export function normalizeState(value) {
         routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
         requestId: text(record.requestId).slice(0, 200),
         sessionTitle: text(record.sessionTitle).slice(0, 200),
+        reused: record.reused === true,
+        reuseCount: Number.isSafeInteger(record.reuseCount) && record.reuseCount >= 0 ? record.reuseCount : 0,
+        waitRounds: Number.isSafeInteger(record.waitRounds) && record.waitRounds >= 0 ? record.waitRounds : 0,
         round: Number.isSafeInteger(record.round) && record.round >= 1 ? record.round : 1,
         firstAcceptedAt: timestamp(record.firstAcceptedAt) ?? createdAt,
         history: (Array.isArray(record.history) ? record.history : [])
@@ -1311,6 +1327,8 @@ export function sessionProjection(state, max = 50) {
       executionError: record.executionError ?? '',
       archived: record.archived === true,
       round: record.round ?? 1,
+      reused: record.reused === true,
+      waitProbes: record.waitProbes ?? 0,
       closure: record.closure ?? '',
       closureNote: record.closureNote ?? '',
       nextAttemptAt: record.nextAttemptAt ?? null,
@@ -1339,6 +1357,8 @@ export function sessionProjection(state, max = 50) {
       completedAt: null,
       executionError: '',
       round: record.round ?? 1,
+      reused: record.reused === true,
+      waitProbes: 0,
       closure: '',
       closureNote: '',
       nextAttemptAt: null,
@@ -1487,6 +1507,7 @@ export function publicState(state, running = false, currentUserId = null) {
     lastPollError: state.lastPollError,
     lastDispatchError: state.lastDispatchError,
     lastPersistError: state.lastPersistError ?? null,
+    lastPrecheckError: state.lastPrecheckError ?? null,
     lastNewCount: state.lastNewCount,
   };
 }
