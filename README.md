@@ -215,3 +215,4 @@ MIT License。发布到 npm（`npm publish`，scoped 包需公开访问，`publi
 - v2.21（状态版本不变）：删除按任务类型选模型（`taskModels` 设置与预检判定的 `taskType` 字段）；所有会话统一用会话模型，预检/手动/路由行为一致；旧状态中的 `taskModels` 与记录字段 `taskType` 在读取时自动丢弃。
 - v2.22（状态版本不变）：设置面板新增`高级选项`折叠区，把 maxQueuePerSession、续办等待分钟数、glab 工作目录、会话附加规则、autoRoute、waitProbeEnabled、followUpReuseSession 收入其中；`busyRouteMode` 与 `routeScope` 仍在主区。
 - v2.23（状态版本不变）：`handled` 历史按保留策略自动清理（closed/已确认 needs-human 90 天、预检跳过 30 天、已结算硬上限 500），`state.json` 不再无限增长；`checkThreadActivity` 拉讨论串改为按 `updated_at` 降序，通常一页命中。
+- v2.24（状态版本不变）：诊断增强——预检/批量预检流式返回了分片但无正文时，把首个分片的 JSON 预览写进插件日志，便于定位 devin/swe-2 等 agentic 模型的流分片形态。
