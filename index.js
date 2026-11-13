@@ -105,6 +105,12 @@ function judgeOutputError(text) {
   return sample ? `预检模型输出无法解析：${sample}` : '预检模型没有返回任何文本。';
 }
 
+/** 序列化分片对象成 ≤200 字 JSON 预览，供诊断日志用。 */
+function safeJsonPreview(value) {
+  try { return JSON.stringify(value).slice(0, 200); }
+  catch { return String(value).slice(0, 200); }
+}
+
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -362,9 +368,16 @@ export class GitlabTodoRuntime {
         stream = llm.stream({ ...route, messages, signal: controller.signal });
       }
       let text = '';
+      let chunkCount = 0;
+      let firstChunk = null;
       for await (const chunk of stream) {
+        chunkCount += 1;
+        if (firstChunk === null) firstChunk = chunk;
         text += chunkText(chunk);
         if (text.length > 20000) break;
+      }
+      if (text === '' && chunkCount > 0) {
+        this.ctx.logger?.warn?.(`[gitlab-todo-agent] 预检流式返回 ${chunkCount} 个分片但无正文：${safeJsonPreview(firstChunk)}`);
       }
       const verdict = parseJudgeReply(text);
       if (!verdict) this.lastJudgeError = judgeOutputError(text);
@@ -431,9 +444,16 @@ export class GitlabTodoRuntime {
         stream = llm.stream({ ...route, messages, signal: controller.signal });
       }
       let text = '';
+      let chunkCount = 0;
+      let firstChunk = null;
       for await (const chunk of stream) {
+        chunkCount += 1;
+        if (firstChunk === null) firstChunk = chunk;
         text += chunkText(chunk);
         if (text.length > 60000) break;
+      }
+      if (text === '' && chunkCount > 0) {
+        this.ctx.logger?.warn?.(`[gitlab-todo-agent] 批量预检流式返回 ${chunkCount} 个分片但无正文：${safeJsonPreview(firstChunk)}`);
       }
       const verdicts = parseBatchJudgeReply(text);
       if (!verdicts) this.lastJudgeError = judgeOutputError(text);
