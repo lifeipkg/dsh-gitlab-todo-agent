@@ -1,4 +1,4 @@
-import { assessClosure, discussionsApiPath } from '../core.js';
+import { assessClosure, discussionsApiPath, isIssueItem } from '../core.js';
 import { FOLLOW_UP_MAX_AGE_MS, MAX_DISCUSSION_PAGES } from './constants.js';
 import { errorMessage } from './util.js';
 
@@ -35,6 +35,9 @@ export const closuresMethods = {
     const pendingIds = new Set(todos.map((todo) => todo.id));
     let changed = false;
     for (const [todoId, pending] of Object.entries(this.state.pending)) {
+      // Issue 条目本就不在 GitLab Todo 列表里，缺席不代表被外部完成；否则 pending
+      // 会在消息未确认前被误判成“外部已完成”并强制转需人工。
+      if (isIssueItem(pending.item)) continue;
       if (pending.followUp === true || pendingIds.has(todoId)) continue;
       if (this.dispatches.has(todoId) || this.isTodoTracked(pending.sessionId, todoId)) continue;
       const existing = this.state.handled[todoId];
@@ -75,14 +78,20 @@ export const closuresMethods = {
         if (before !== `${record.archived}|${record.archiveError}`) changed = true;
         continue;
       }
+      const issue = isIssueItem(record.item);
       const todoPending = pendingIds.has(record.id);
+      // Issue 闭环事实：只认“Issue 已关闭”——证明为 true 才算 closed，
+      // 其余（仍开放、不可判定）一律按“仍开放”保守处理。
+      const issueClosed = issue ? await this.issueIsClosed(record.item) : null;
+      const targetOpen = issue ? issueClosed !== true : todoPending;
       if (record.closure === 'verifying') {
         if ((record.completedAt ?? 0) > fetchStartedAt) continue;
-        await this.concludeRecord(record, todoPending);
+        if (issue && issueClosed === null) continue;
+        await this.concludeRecord(record, targetOpen);
         changed = true;
-      } else if (!todoPending && record.replied !== false && record.pendingUnconfirmed !== true) {
+      } else if (!targetOpen && record.replied !== false && record.pendingUnconfirmed !== true) {
         record.closure = 'closed';
-        record.closureNote = 'Todo 已不在待办列表（已被标记完成）';
+        record.closureNote = issue ? 'Issue 已关闭' : 'Todo 已不在待办列表（已被标记完成）';
         record.nextAttemptAt = null;
         record.watch = null;
         await this.archiveRecord(record);
@@ -95,7 +104,10 @@ export const closuresMethods = {
   /** 对一条刚结算的记录下闭环结论，并按结论归档。 */
   async concludeRecord(record, todoPending) {
     const settings = this.state.settings;
-    const item = record.item ?? this.state.todos.find((todo) => todo.id === record.id) ?? null;
+    const item = record.item ?? this.state.todos.find((todo) => todo.id === record.id)
+      ?? (Array.isArray(this.state.issues) ? this.state.issues.find((todo) => todo.id === record.id) : null)
+      ?? null;
+    const issue = isIssueItem(item);
     // 会话判定为“仅被提及”且 Todo 已标记完成：本就不该回复，不核对讨论串。
     const mentionOnly = record.reportNoAction === true && !todoPending;
     // since 留 120 秒余量：本机时钟快于 GitLab 时，本轮回复的 created_at 可能早于派发时间。
@@ -126,6 +138,7 @@ export const closuresMethods = {
       round,
       followUpBlocked,
       baseDelayMinutes: settings.followUpDelayMinutes,
+      unit: issue ? 'issue' : 'todo',
     });
     record.replied = replied;
     if (cleanWait) record.waitRounds = waitRounds + 1;

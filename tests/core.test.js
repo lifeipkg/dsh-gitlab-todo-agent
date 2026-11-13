@@ -7,6 +7,8 @@ import {
   buildBatchJudgePrompt,
   buildDigest,
   buildInbox,
+  buildIssueProjection,
+  buildIssuePrompt,
   buildJevDuplicatePairs,
   buildJevMatchQuestions,
   buildJevMatchState,
@@ -20,9 +22,12 @@ import {
   findRouteTargets,
   handledPage,
   handledProjection,
+  isIssueItem,
+  issueApiPath,
   JEV_SKIP_REASONS,
   mrApiPath,
   mrWatchState,
+  normalizeIssue,
   parseBatchJudgeReply,
   parseClosureReport,
   parseJudgeReply,
@@ -35,6 +40,7 @@ import {
   isSelfMention,
   LEGACY_WORKFLOW_RULES,
   normalizeState,
+  normalizeTodo,
   normalizeTodos,
   publicState,
   selectPendingTodos,
@@ -3410,4 +3416,210 @@ test('uncertain Jev verdicts are escalated to the LLM in auto mode', async () =>
   assert.equal(calls.create, 1);
   assert.equal(runtime.state.handled.direct?.outcome, 'session-accepted');
   await runtime.stop();
+});
+
+const gitlabIssue = {
+  id: 555001,
+  iid: 42,
+  project_id: 555,
+  title: 'Implement the feature flag',
+  description: 'Please wire the flag into the pipeline.',
+  state: 'opened',
+  web_url: 'https://gitlab.local/group/project/-/issues/42',
+  references: { short: '#42', relative: 'group/project#42', full: 'group/project#42' },
+  author: { id: 77, username: 'manager' },
+  labels: ['backend', 'priority:high'],
+  created_at: '2026-11-10T08:00:00.000Z',
+  updated_at: '2026-11-12T09:30:00.000Z',
+};
+
+test('normalizeIssue maps REST issue fields into a synthetic todo-shaped item', () => {
+  const issue = normalizeIssue(gitlabIssue);
+  assert.equal(issue.id, 'issue-555-42');
+  assert.equal(issue.title, 'Implement the feature flag');
+  assert.equal(issue.url, gitlabIssue.web_url);
+  assert.equal(issue.project, 'group/project');
+  assert.equal(issue.targetType, 'issue');
+  assert.equal(issue.action, 'issue-processing');
+  assert.equal(issue.iid, 42);
+  assert.equal(issue.projectId, '555');
+  assert.deepEqual(issue.labels, ['backend', 'priority:high']);
+  assert.equal(isIssueItem(issue), true);
+  // 项目路径回退到 web_url 解析；坏行返回 null 而不是抛错。
+  const fallback = normalizeIssue({ ...gitlabIssue, references: {} });
+  assert.equal(fallback.project, 'group/project');
+  assert.equal(normalizeIssue({ iid: 1 }), null);
+  assert.equal(normalizeIssue({ iid: 'x', project_id: 1 }), null);
+  // 归一化后的 Issue 条目经 normalizeTodo 回读不丢来源字段（状态文件往返）。
+  const reread = normalizeTodo(issue);
+  assert.equal(isIssueItem(reread), true);
+  assert.equal(reread.iid, 42);
+  assert.equal(reread.projectId, '555');
+});
+
+test('issueApiPath prefers projectId/iid and falls back to web_url parsing', () => {
+  assert.equal(issueApiPath(normalizeIssue(gitlabIssue)), 'projects/555/issues/42');
+  assert.equal(
+    issueApiPath({ url: 'https://gitlab.local/group/sub/proj/-/issues/9' }),
+    'projects/group%2Fsub%2Fproj/issues/9');
+  assert.equal(issueApiPath({ url: 'https://gitlab.local/groups/team/-/epics/2' }), '');
+  assert.equal(issueApiPath(null), '');
+});
+
+test('issue dispatch builds the issue prompt with close semantics and manual record', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async (request) => {
+    const text = request.content.map((part) => part.text).join('');
+    assert.match(text, /请处理下面这一个指派给我的 GitLab Issue/);
+    assert.match(text, /issues\/42 -F state_event=close/);
+    assert.match(text, /该 Issue 是否已关闭/);
+    assert.match(text, /用户通过插件的 Issue 面板手动发起/);
+    assert.doesNotMatch(text, /mark_as_done/);
+    return { accepted: true };
+  });
+  const issue = normalizeIssue(gitlabIssue);
+  runtime.state.issues = [issue];
+  const result = await runtime.dispatchById(issue.id);
+  assert.equal(result.ok, true);
+  assert.equal(calls.create, 1);
+  // 会话仍在执行时重发派发必须被拒绝（不能同一对象并行两个会话）。
+  const busy = await runtime.dispatchById(issue.id);
+  assert.equal(busy.ok, false);
+  assert.equal(calls.create, 1);
+  // 结算（核对 Issue 状态 → 未关则转需人工）后，再点“处理”走 force 重开一轮新会话，round+1。
+  runtime.runGlab = async () => JSON.stringify({ state: 'opened' });
+  await runtime.reconcileSessions();
+  const again = await runtime.dispatchById(issue.id);
+  assert.equal(again.ok, true);
+  assert.equal(calls.create, 2);
+  const record = runtime.state.handled[issue.id];
+  assert.equal(record.automatic, false);
+  assert.equal(record.round, 2);
+  assert.equal(record.sessionTitle, '[协助]-issue-42-续1');
+  assert.equal(publicState(runtime.state).issueCount, 1);
+  await runtime.stop();
+});
+
+test('issue items route to an existing session like todos', async () => {
+  const { runtime, calls } = runtimeWithPrompt(async (request) => {
+    const text = request.content.map((part) => part.text).join('');
+    assert.match(text, /把一个 GitLab Issue 路由到当前会话的追加任务/);
+    return { accepted: true };
+  });
+  calls.sessions.set('existing-session', { running: true, events: [], archived: false });
+  // 路由目标不是插件创建的会话：测试环境放宽为 any（默认 plugin 范围会拒绝）。
+  runtime.state.settings.routeScope = 'any';
+  const issue = normalizeIssue(gitlabIssue);
+  runtime.state.issues = [issue];
+  const result = await runtime.routeById(issue.id, 'existing-session');
+  assert.equal(result.ok, true);
+  const record = runtime.state.handled[issue.id];
+  assert.equal(record.routed, true);
+  assert.equal(record.sessionId, 'existing-session');
+  await runtime.stop();
+});
+
+test('issue closure verdict closes only on the issue being closed', async () => {
+  // Issue 记录：todoPending 槽位表示的是“Issue 仍开放”。自述 done 不算数。
+  const open = assessClosure({
+    todoPending: true, turnOk: true, unit: 'issue',
+    report: { status: 'done', summary: 'work finished' }, followUpBlocked: 'manual',
+  });
+  assert.equal(open.closure, 'needs-human');
+  assert.match(open.note, /Issue 仍未关闭/);
+  const closed = assessClosure({ todoPending: false, turnOk: true, unit: 'issue' });
+  assert.equal(closed.closure, 'closed');
+  assert.match(closed.note, /Issue 已关闭/);
+});
+
+test('assessClosures checks the issue state instead of the todo list', async () => {
+  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const issue = normalizeIssue(gitlabIssue);
+  runtime.state.issues = [issue];
+  runtime.runGlab = async () => JSON.stringify({ state: 'closed' });
+  runtime.state.handled[issue.id] = {
+    id: issue.id, sessionId: 'session-x', item: issue, automatic: false,
+    executionStatus: 'completed', completedAt: Date.now() - 1000,
+    closure: 'verifying', acceptedAt: Date.now() - 2000, firstAcceptedAt: Date.now() - 2000,
+  };
+  const changed = await runtime.assessClosures([], Date.now());
+  assert.equal(changed, true);
+  const record = runtime.state.handled[issue.id];
+  assert.equal(record.closure, 'closed');
+  assert.match(record.closureNote, /Issue 已关闭/);
+  await runtime.stop();
+});
+
+test('assessClosures keeps verifying when the issue state cannot be determined', async () => {
+  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const issue = normalizeIssue(gitlabIssue);
+  runtime.state.issues = [issue];
+  runtime.runGlab = async () => { throw new Error('glab down'); };
+  runtime.state.handled[issue.id] = {
+    id: issue.id, sessionId: 'session-x', item: issue, automatic: false,
+    executionStatus: 'completed', completedAt: Date.now() - 1000,
+    closure: 'verifying', acceptedAt: Date.now() - 2000, firstAcceptedAt: Date.now() - 2000,
+  };
+  await runtime.assessClosures([], Date.now());
+  // 接口不可判定时不下结论：记录仍停在 verifying，等下一轮核对。
+  assert.equal(runtime.state.handled[issue.id].closure, 'verifying');
+  await runtime.stop();
+});
+
+test('assessClosures leaves an open issue for a human instead of closing it', async () => {
+  const { runtime } = runtimeWithPrompt(async () => ({ accepted: true }));
+  const issue = normalizeIssue(gitlabIssue);
+  runtime.state.issues = [issue];
+  runtime.runGlab = async () => JSON.stringify({ state: 'opened' });
+  runtime.state.handled[issue.id] = {
+    id: issue.id, sessionId: 'session-x', item: issue, automatic: false,
+    executionStatus: 'completed', completedAt: Date.now() - 1000,
+    reportStatus: 'done', reportSummary: 'work finished but kept open',
+    closure: 'verifying', acceptedAt: Date.now() - 2000, firstAcceptedAt: Date.now() - 2000,
+  };
+  await runtime.assessClosures([], Date.now());
+  const record = runtime.state.handled[issue.id];
+  // 会话自述 done 但 Issue 未关：手动链路不续办，转需人工。
+  assert.equal(record.closure, 'needs-human');
+  assert.match(record.closureNote, /Issue 仍未关闭/);
+  await runtime.stop();
+});
+
+test('issue projection joins open issues with handled records and lists orphans', () => {
+  const state = initialState();
+  const issue = normalizeIssue(gitlabIssue);
+  const gone = normalizeIssue({ ...gitlabIssue, iid: 77, project_id: 555, web_url: 'https://gitlab.local/group/project/-/issues/77' });
+  state.issues = [issue];
+  state.handled[gone.id] = {
+    id: gone.id, sessionId: 'session-old', item: gone, executionStatus: 'completed',
+    closure: 'needs-human', acceptedAt: Date.now(),
+  };
+  const view = buildIssueProjection(state);
+  assert.equal(view.items.length, 1);
+  assert.equal(view.items[0].handled, false);
+  assert.equal(view.items[0].missing, false);
+  assert.equal(view.orphans.length, 1);
+  assert.equal(view.orphans[0].id, 'issue-555-77');
+  assert.equal(view.orphans[0].missing, true);
+  assert.equal(view.orphans[0].sessionId, 'session-old');
+  // 已处理投影带 Issue 来源标记。
+  const handled = handledProjection(state).find((row) => row.todoId === gone.id);
+  assert.equal(handled.source, 'issue');
+});
+
+test('normalizeState preserves issue cache and issue-shaped handled items', () => {
+  const issue = normalizeIssue(gitlabIssue);
+  const state = normalizeState({
+    version: 6,
+    issues: [issue, { iid: 3 }],
+    handled: {
+      [issue.id]: {
+        id: issue.id, sessionId: 'session-x', item: issue, title: issue.title,
+        url: issue.url, outcome: 'session-accepted', acceptedAt: Date.now(),
+      },
+    },
+  });
+  assert.equal(state.issues.length, 1);
+  assert.equal(isIssueItem(state.issues[0]), true);
+  assert.equal(isIssueItem(state.handled[issue.id].item), true);
+  assert.equal(state.handled[issue.id].item.projectId, '555');
 });
