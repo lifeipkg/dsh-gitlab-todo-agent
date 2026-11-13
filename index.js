@@ -10,7 +10,6 @@ import {
   initialState,
   normalizeState,
   publicState,
-  sessionPage,
   STATE_VERSION,
   validateSettings,
 } from './core.js';
@@ -253,10 +252,6 @@ export class GitlabTodoRuntime {
       if (body.action === 'poll') {
         const state = await this.poll('manual');
         return jsonResponse(200, { ok: true, state });
-      }
-      if (body.action === 'sessions') {
-        // “最近会话”分页：首页默认 30 条，limit 上限 100，offset 由客户端翻页推进。
-        return jsonResponse(200, { ok: true, ...sessionPage(this.state, body.offset, body.limit) });
       }
       if (body.action === 'inbox') {
         // 需人工收件箱：未确认的 needs-human 记录全集（面板轮询刷新）。

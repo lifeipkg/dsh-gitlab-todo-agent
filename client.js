@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
       sessionsTitle: 'Recent sessions', noSessions: 'No session has been dispatched yet.', autoDispatch: 'auto', manualDispatch: 'manual',
       loadMore: 'Load more', sessionsError: 'Could not load recent sessions',
       archiveSession: 'Archive', unarchiveSession: 'Unarchive',
-      sessionStarting: 'Starting', sessionAccepted: 'Queued',
+      sessionStarting: 'Starting', sessionAccepted: 'Queued', waitProbesLabel: 'Wait probes: ',
       process: 'Open session', reprocess: 'Process again', dispatched: 'Accepted', waiting: 'Waiting',
       executionRunning: 'Running', executionCompleted: 'Completed', executionFailed: 'Failed',
       precheckSkipped: 'Skipped (no handling needed)',
@@ -109,7 +109,7 @@ window.__ModuleLoader__.load({
       sessionsTitle: '最近会话', noSessions: '还没有分派过会话。', autoDispatch: '自动', manualDispatch: '手动',
       loadMore: '加载更多', sessionsError: '无法加载最近会话列表',
       archiveSession: '归档', unarchiveSession: '取消归档',
-      sessionStarting: '启动中', sessionAccepted: '已入队',
+      sessionStarting: '启动中', sessionAccepted: '已入队', waitProbesLabel: '等待探测：',
       process: '开 Session 处理', reprocess: '重新处理', dispatched: '已接受', waiting: '待处理',
       executionRunning: '执行中', executionCompleted: '执行完成', executionFailed: '执行失败',
       precheckSkipped: '已跳过（无需处理）',
@@ -411,48 +411,8 @@ window.__ModuleLoader__.load({
         return () => { disposed = true; };
       }, []);
 
-      // 最近会话（分页）：首页 30 条，“加载更多”按 offset 追加；
-      // 会话页打开期间每 10s 静默刷新已加载范围（刷新不重置已翻页）。
-      const [sessionData, setSessionData] = React.useState(null);
-      const [sessionError, setSessionError] = React.useState(null);
-      const [sessionBusy, setSessionBusy] = React.useState(false);
-      const sessionInFlight = React.useRef(false);
-      const sessionDataRef = React.useRef(null);
-      const applySessionPage = (page, append) => {
-        const previous = sessionDataRef.current;
-        const items = append && previous ? [...previous.items, ...page.items] : page.items;
-        const next = { ...page, items };
-        sessionDataRef.current = next;
-        setSessionData(next);
-      };
-      const fetchSessions = async (append) => {
-        if (sessionInFlight.current) return;
-        sessionInFlight.current = true;
-        setSessionBusy(true);
-        try {
-          const loaded = sessionDataRef.current?.items?.length ?? 0;
-          const request = append
-            ? { offset: loaded, limit: 30 }
-            : { offset: 0, limit: Math.max(30, loaded) };
-          applySessionPage(await post('sessions', request), append);
-          setSessionError(null);
-        } catch (cause) {
-          setSessionError(cause.message);
-        } finally {
-          sessionInFlight.current = false;
-          setSessionBusy(false);
-        }
-      };
-      const refreshSessions = () => fetchSessions(false);
-      React.useEffect(() => {
-        if (activeTab !== 'sessions') return undefined;
-        void refreshSessions();
-        const timer = setInterval(() => void refreshSessions(), 10000);
-        return () => clearInterval(timer);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-      }, [activeTab]);
-
-      // 已处理（分页）：含规则跳过/预检跳过/会话处理全部记录；打开期间每 10s 静默刷新。
+      // 已处理（分页，v2.29 起含会话入口/归档）：规则跳过、预检跳过、会话派发与
+      // 投递中记录全部在列；打开期间每 10s 静默刷新已加载范围（刷新不重置已翻页）。
       const [handledData, setHandledData] = React.useState(null);
       const [handledError, setHandledError] = React.useState(null);
       const [handledBusy, setHandledBusy] = React.useState(false);
@@ -701,12 +661,12 @@ window.__ModuleLoader__.load({
         .then((done) => { if (done) void fetchInbox(); });
       // Todo 主按钮（开会话/重新处理）与“标记完成”都走 dispatch：Host 端会把非 directMention 的 MR 直接标记完成。
       const dispatchTodo = (todo) => perform(`dispatch:${todo.id}`, () => post('dispatch', { id: todo.id }));
-      // 快捷切换归档状态：成功后连同最近会话页一起刷新。
+      // 快捷切换归档状态：成功后连同已处理页一起刷新。
       const toggleSessionArchive = (record) => perform(`archive:${record.sessionId}`, () => post('setSessionArchived', {
         sessionId: record.sessionId,
         archived: record.archived !== true,
       })).then((done) => {
-        if (done) void refreshSessions();
+        if (done) void refreshHandled();
       });
       const settings = snapshot?.settings;
       // 与 task-board 的 model-options 实现一致：直接遍历目录 groups，不按 routableProviders 二次过滤。
@@ -1021,12 +981,6 @@ window.__ModuleLoader__.load({
             onClick: () => setActiveTab('handled'),
           }, `${t('handledTitle')} (${handledData?.total ?? snapshot.handledCount})`),
           h('button', {
-            type: 'button', role: 'tab', id: `${PANEL_ID}-tab-sessions`, 'aria-selected': activeTab === 'sessions',
-            'aria-controls': `${PANEL_ID}-panel-sessions`,
-            className: `gta-tab${activeTab === 'sessions' ? ' gta-tab-active' : ''}`,
-            onClick: () => setActiveTab('sessions'),
-          }, `${t('sessionsTitle')} (${sessionData?.total ?? (snapshot.sessions ?? []).length})`),
-          h('button', {
             type: 'button', role: 'tab', id: `${PANEL_ID}-tab-workspaces`, 'aria-selected': activeTab === 'workspaces',
             'aria-controls': `${PANEL_ID}-panel-workspaces`,
             className: `gta-tab${activeTab === 'workspaces' ? ' gta-tab-active' : ''}`,
@@ -1137,6 +1091,8 @@ window.__ModuleLoader__.load({
                         item.skipReason, item.reportSummary, item.closureNote,
                         item.sessionTitle && item.sessionId ? item.sessionTitle : '',
                         item.executionError,
+                        item.archiveError,
+                        item.waitProbes > 0 ? `${t('waitProbesLabel')}${item.waitProbes}` : '',
                         item.closure === 'follow-up' && item.nextAttemptAt ? `${t('nextAttempt')} ${formatTime(item.nextAttemptAt, '')}` : '',
                         `${item.completedAt ? formatTime(item.completedAt, '') : `${t('acceptedLabel')} ${formatTime(item.acceptedAt, '')}`}`,
                       ].filter(Boolean).join(' · ')),
@@ -1145,52 +1101,18 @@ window.__ModuleLoader__.load({
                     h(ReplyPreview, { reply: item.lastReply, t }),
                   ),
                   h('div', { className: 'gta-todo-actions' },
+                    // 有会话的记录：会话入口 + 归档切换（原「最近会话」Tab 的动作并入这里）；
+                    // 无会话的记录（规则/预检跳过）：判定原因已在上面的 skipReason 行展示。
                     item.sessionId && !item.archived && h(Button, { onClick: () => openSession(item.sessionId) }, t('openSession')),
+                    item.sessionId && item.executionStatus !== 'starting' && item.routed !== true && h(Button, {
+                      disabled: busySet.has(`archive:${item.sessionId}`) || (item.archived !== true && item.executionStatus === 'running'),
+                      onClick: () => toggleSessionArchive(item),
+                    }, busySet.has(`archive:${item.sessionId}`) ? '…' : (item.archived ? t('unarchiveSession') : t('archiveSession'))),
                   ),
                 ),
               )),
           handledData && handledData.items.length < handledData.total && h('div', { className: 'gta-load-more' },
             h(Button, { disabled: Boolean(handledBusy), onClick: () => fetchHandled(true) }, handledBusy ? '…' : t('loadMore'))),
-        ),
-        activeTab === 'sessions' && snapshot && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-sessions`, 'aria-labelledby': `${PANEL_ID}-tab-sessions` },
-          h('div', { className: 'gta-section-title' }, h('h2', null, t('sessionsTitle')), h('span', { className: 'gta-muted' },
-            sessionData ? `${sessionData.items.length}/${sessionData.total}` : `${(snapshot.sessions ?? []).length}`)),
-          sessionError && h('div', { className: 'gta-banner gta-warn', role: 'status' }, `${t('sessionsError')}${colon()}${sessionError}`),
-          !sessionData && !sessionError && h('div', { className: 'gta-empty' }, t('loading')),
-          sessionData && sessionData.total === 0 && h('div', { className: 'gta-empty' }, t('noSessions')),
-          sessionData && sessionData.items.length > 0 && h('div', { className: 'gta-list gta-scroll-list gta-session-list', role: 'list', 'aria-label': t('sessionsTitle') }, sessionData.items.map((record) =>
-                h('article', { className: 'gta-todo', key: record.sessionId },
-                  h('div', { className: 'gta-todo-main' },
-                    h('div', { className: 'gta-todo-title' },
-                      record.url
-                        ? h('a', { href: record.url, target: '_blank', rel: 'noreferrer', title: record.sessionId }, record.title)
-                        : h('span', { title: record.sessionId }, record.title),
-                      h('span', { className: `gta-tag ${record.executionStatus === 'completed' ? 'gta-tag-success' : ''}` },
-                        record.executionStatus === 'running' ? t('executionRunning')
-                          : record.executionStatus === 'completed' ? t('executionCompleted')
-                          : record.executionStatus === 'failed' ? t('executionFailed')
-                          : record.executionStatus === 'starting' ? t('sessionStarting')
-                          : t('sessionAccepted')),
-                      routedLabel(record, t) && h('span', { className: 'gta-tag gta-tag-routed' }, routedLabel(record, t)),
-                      closureLabel(record.closure, t) && h('span', { className: `gta-tag ${record.closure === 'closed' ? 'gta-tag-success' : ''}` }, closureLabel(record.closure, t)),
-                      h('span', { className: 'gta-tag gta-tag-mention' }, record.automatic ? t('autoDispatch') : t('manualDispatch')),
-                      record.archived && h('span', { className: 'gta-tag gta-tag-success' }, t('sessionArchived')),
-                    ),
-                    h('div', { className: 'gta-muted gta-meta' },
-                      [record.sessionTitle, record.project, record.executionError, ...closureMeta(record, t), record.archiveError].filter(Boolean).join(' · ')),
-                    h(ReplyPreview, { reply: record.lastReply, t }),
-                  ),
-                  h('div', { className: 'gta-todo-actions' },
-                    !record.archived && h(Button, { onClick: () => openSession(record.sessionId) }, t('openSession')),
-                    record.executionStatus !== 'starting' && record.routed !== true && h(Button, {
-                      disabled: busySet.has(`archive:${record.sessionId}`) || (record.archived !== true && record.executionStatus === 'running'),
-                      onClick: () => toggleSessionArchive(record),
-                    }, busySet.has(`archive:${record.sessionId}`) ? '…' : (record.archived ? t('unarchiveSession') : t('archiveSession'))),
-                  ),
-                ),
-              )),
-          sessionData && sessionData.items.length < sessionData.total && h('div', { className: 'gta-load-more' },
-            h(Button, { disabled: Boolean(sessionBusy), onClick: () => fetchSessions(true) }, sessionBusy ? '…' : t('loadMore'))),
         ),
         activeTab === 'workspaces' && h('section', { className: 'gta-section', role: 'tabpanel', id: `${PANEL_ID}-panel-workspaces`, 'aria-labelledby': `${PANEL_ID}-tab-workspaces` },
           h('div', { className: 'gta-section-title' }, h('h2', null, t('workspacesTitle')), h('span', { className: 'gta-muted' }, `${workspaceOptions.length}`)),
