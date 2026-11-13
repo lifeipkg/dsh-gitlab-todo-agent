@@ -38,7 +38,6 @@ import {
   normalizeTodos,
   publicState,
   selectPendingTodos,
-  sessionPage,
   SYSTEMONE_PRESETS,
   validateSettings,
   verdictFromJevAnswers,
@@ -262,24 +261,28 @@ test('session titles identify the target type, id and note', () => {
   assert.equal(title('', { target: {} }), `[协助]-todo-${sessionTodo.id}`);
 });
 
-test('session projection lists dispatched sessions with status', () => {
+test('handled projection lists session rows and skipped rows together (merged tabs)', () => {
   const base = initialState();
   base.handled.a = {
     id: 'a', sessionId: 'session-a', acceptedAt: 20, sessionTitle: '[协助]-issue-1-note-2',
     executionStatus: 'completed', automatic: true, title: 'A', url: 'https://gitlab.local/a', project: 'g/p',
   };
   base.handled.b = { id: 'b', sessionId: 'session-b', acceptedAt: 30, executionStatus: 'running', automatic: false, title: 'B', url: '', project: '' };
-  base.handled.mr = { id: 'mr', sessionId: null, outcome: 'merge-request-done', acceptedAt: 40, title: 'MR', url: '', project: '' };
+  base.handled.mr = { id: 'mr', sessionId: null, outcome: 'merge-request-done', acceptedAt: 40, title: 'MR', url: '', project: '', skipReason: 'MR 已清理' };
   base.pending.c = { sessionId: 'session-c', createdAt: 25, automatic: true, round: 3, item: normalizeTodos([{ ...sessionTodo, id: 'c' }])[0] };
-  const view = publicState(base, false, '106');
-  assert.deepEqual(view.sessions.map((record) => [record.sessionId, record.executionStatus]), [
-    ['session-b', 'running'],
-    ['session-c', 'starting'],
-    ['session-a', 'completed'],
+  const view = handledProjection(base);
+  // 活动时刻倒序：mr(40) > b(30) > c(25) > a(20)。
+  assert.deepEqual(view.map((item) => [item.todoId, item.sessionId, item.executionStatus]), [
+    ['mr', null, ''],
+    ['b', 'session-b', 'running'],
+    ['c', 'session-c', 'starting'],
+    ['a', 'session-a', 'completed'],
   ]);
-  assert.equal(view.sessions[2].sessionTitle, '[协助]-issue-1-note-2');
-  assert.equal(view.sessions[1].round, 3);
-  assert.equal(view.sessions.some((record) => record.sessionId === null), false);
+  const a = view.find((item) => item.todoId === 'a');
+  assert.equal(a.sessionTitle, '[协助]-issue-1-note-2');
+  assert.equal(view.find((item) => item.todoId === 'c').round, 3);
+  // 无会话记录用 skipReason 展示判定原因。
+  assert.equal(view.find((item) => item.todoId === 'mr').skipReason, 'MR 已清理');
 });
 
 test('judge prompt and reply parsing are conservative', () => {
@@ -1079,19 +1082,21 @@ test('session page paginates recent plugin sessions newest-first', () => {
       automatic: true, title: `T${index}`, url: '', project: '', round: 1, closure: 'closed',
     };
   }
-  // 没有 sessionId 的记录（规则跳过）不计入会话列表。
-  base.handled.skip = { id: 'skip', sessionId: null, outcome: 'rule-skipped', acceptedAt: 9999, title: 'x' };
-  const first = sessionPage(base);
-  assert.equal(first.total, 35);
+  // v2.29：会话分页并入“已处理”——有 sessionId 的记录在 handled 列表里带 sessionId，
+  // 无会话记录（规则跳过）也在列、由 skipReason 承担判定原因展示。
+  base.handled.skip = { id: 'skip', sessionId: null, outcome: 'rule-skipped', acceptedAt: 9999, title: 'x', skipReason: '规则判定无需处理' };
+  const first = handledPage(base, 0, 30);
+  assert.equal(first.total, 36);
   assert.equal(first.items.length, 30);
-  assert.equal(first.items[0].sessionId, 's34');
-  assert.equal(first.items[29].sessionId, 's5');
-  const second = sessionPage(base, 30, 30);
-  assert.equal(second.items.length, 5);
-  assert.equal(second.items[0].sessionId, 's4');
+  // 活动时刻倒序：skip(9999) 最前，其次 s34…s5。
+  assert.equal(first.items[0].todoId, 'skip');
+  assert.equal(first.items[0].sessionId, null);
+  assert.equal(first.items[1].sessionId, 's34');
+  const second = handledPage(base, 30, 30);
+  assert.equal(second.items.length, 6);
   // 越界与非法参数按默认处理，不抛错。
-  assert.equal(sessionPage(base, 100, 30).items.length, 0);
-  assert.equal(sessionPage(base, -5, 500).items.length, 35 > 100 ? 100 : 35);
+  assert.equal(handledPage(base, 100, 30).items.length, 0);
+  assert.equal(handledPage(base, -5, 500).items.length, 36 > 100 ? 100 : 36);
 });
 
 test('handled page includes skipped records and orders by activity newest-first', () => {
@@ -1156,7 +1161,7 @@ test('handled page paginates, clamps inputs and marks pending rows', () => {
   assert.equal(handledPage(base, 99999999).items.length, 0);
 });
 
-test('bridge sessions action serves the first page and archive toggling', async () => {
+test('bridge handled action serves session rows and archive toggling', async () => {
   const { runtime, calls } = runtimeWithPrompt(async () => ({ accepted: true }), { autoComplete: false });
   runtime.state.settings.enabled = true;
   runtime.state.settings.autoProcess = true;
@@ -1179,12 +1184,13 @@ test('bridge sessions action serves the first page and archive toggling', async 
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
   }));
-  const page1 = await (await post({ action: 'sessions' })).json();
+  const page1 = await (await post({ action: 'handled', offset: 0, limit: 30 })).json();
   assert.equal(page1.ok, true);
   assert.equal(page1.total, 32);
   assert.equal(page1.items.length, 30);
+  // 最新活动的记录排最前（direct 结算时刻最新），会话行带 sessionId。
   assert.equal(page1.items[0].sessionId, 'session-1');
-  const page2 = await (await post({ action: 'sessions', offset: 30, limit: 30 })).json();
+  const page2 = await (await post({ action: 'handled', offset: 30, limit: 30 })).json();
   assert.equal(page2.items.length, 2);
 
   // 归档切换：完成态会话可归档、可取消归档；状态随持久化记录保留。

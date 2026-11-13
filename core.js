@@ -1535,85 +1535,10 @@ export function buildWorkspaceOverview(workspaces, roster, pluginSessions = [], 
   return result;
 }
 
-export function sessionProjection(state, max = 50) {
-  const accepted = Object.values(state.handled)
-    .filter((record) => Boolean(record.sessionId))
-    .map((record) => ({
-      sessionId: record.sessionId,
-      todoId: record.id,
-      title: record.title,
-      sessionTitle: record.sessionTitle,
-      url: record.url,
-      project: record.project,
-      automatic: record.automatic !== false,
-      routed: record.routed === true,
-      routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
-      executionStatus: record.executionStatus ?? 'accepted',
-      acceptedAt: record.acceptedAt,
-      completedAt: record.completedAt ?? null,
-      executionError: record.executionError ?? '',
-      archived: record.archived === true,
-      round: record.round ?? 1,
-      reused: record.reused === true,
-      waitProbes: record.waitProbes ?? 0,
-      closure: record.closure ?? '',
-      closureNote: record.closureNote ?? '',
-      nextAttemptAt: record.nextAttemptAt ?? null,
-      replied: record.replied ?? null,
-      openMrs: Array.isArray(record.openMrs) ? [...record.openMrs] : [],
-      reportStatus: record.reportStatus ?? '',
-      pendingUnconfirmed: record.pendingUnconfirmed === true,
-      acknowledgedAt: record.acknowledgedAt ?? null,
-      lastReply: record.lastReply ? { ...record.lastReply } : null,
-    }));
-  const pending = Object.values(state.pending)
-    .filter((record) => Boolean(record.sessionId))
-    .map((record) => ({
-      sessionId: record.sessionId,
-      todoId: record.item.id,
-      title: record.item.title,
-      sessionTitle: '',
-      url: record.item.url,
-      project: record.item.project,
-      automatic: record.automatic !== false,
-      routed: record.routed === true,
-      routeMode: ROUTE_MODES.includes(record.routeMode) ? record.routeMode : '',
-      executionStatus: 'starting',
-      acceptedAt: record.createdAt,
-      completedAt: null,
-      executionError: '',
-      round: record.round ?? 1,
-      reused: record.reused === true,
-      waitProbes: 0,
-      closure: '',
-      closureNote: '',
-      nextAttemptAt: null,
-      replied: null,
-      openMrs: [],
-      reportStatus: '',
-      pendingUnconfirmed: false,
-      acknowledgedAt: null,
-      lastReply: null,
-    }));
-  // 同一 Todo 续办启动期间，handled（上一轮）与 pending（新一轮）会同时存在；两条都展示。
-  return [...accepted, ...pending].sort((a, b) => b.acceptedAt - a.acceptedAt).slice(0, max);
-}
-
 /**
- * “最近会话”分页：插件创建（handled+pending 中带 sessionId）的会话按接受时间倒序。
- * 首页默认 30 条，客户端“加载更多”按 offset 追加；total 为插件会话总数。
+ * “最近会话”Tab 已并入“已处理”Tab（v2.29）：有会话的已处理记录直接承担
+ * 会话入口/归档按钮，无会话记录展示判定原因；不再需要独立会话分页投影。
  */
-export function sessionPage(state, offset = 0, limit = 30) {
-  const safeOffset = Number.isSafeInteger(offset) && offset >= 0 ? Math.min(offset, 1000000) : 0;
-  const safeLimit = Number.isSafeInteger(limit) && limit >= 1 ? Math.min(limit, 100) : 30;
-  const items = sessionProjection(state, Number.MAX_SAFE_INTEGER);
-  return {
-    items: items.slice(safeOffset, safeOffset + safeLimit),
-    total: items.length,
-    offset: safeOffset,
-    limit: safeLimit,
-  };
-}
 
 /**
  * “已处理”分页投影：handled 里所有 Todo 记录 + pending 中已投递未结算的记录，
@@ -1641,6 +1566,9 @@ export function handledProjection(state) {
       reused: record.reused === true,
       executionStatus: record.executionStatus ?? '',
       executionError: record.executionError ?? '',
+      archiveError: record.archiveError ?? '',
+      waitProbes: record.waitProbes ?? 0,
+      replied: record.replied ?? null,
       closure: record.closure ?? '',
       closureNote: record.closureNote ?? '',
       reportStatus: record.reportStatus ?? '',
@@ -1815,7 +1743,7 @@ export function publicState(state, running = false, currentUserId = null) {
       nextAttemptAt: state.handled[todo.id]?.nextAttemptAt ?? null,
       lastReply: state.handled[todo.id]?.lastReply ? { ...state.handled[todo.id].lastReply } : null,
     })),
-    sessions: sessionProjection(state),
+    // v2.29：面板「最近会话」Tab 并入「已处理」，不再下发独立会话投影。
     closure: closureCounts(state),
     digest: buildDigest(state),
     // recent 只给前端做摘要，不带 Todo 原文与历史链路。

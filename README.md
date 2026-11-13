@@ -53,7 +53,7 @@
 1. 确保 `glab` 已登录且能访问目标 GitLab。
 2. 打开左侧 **GitLab Todo** 页面。插件默认停用，不会安装后立即创建 Session。
 3. 在 **设置** 中配置轮询间隔、每轮上限与自动处理并发数（默认 2）；也可直接用页头的模型下拉选择新会话模型。确认后再启用自动轮询。
-4. 状态栏下方通过 **收件箱 / Todo 列表 / 已处理 / 最近会话 / 工作区** Tab 切换：Todo 列表可区域滚动，带有 **评论中 @ 我** 标签的事项会进入自动处理范围；**已处理** 按活动时刻倒序展示全部处理记录（规则跳过、预检跳过、会话派发与投递中的 pending 都在列，不做任何过滤），默认每页 50 条可加载更多，跳过项直接显示判定理由与被折叠去向——预检结果在此透明可查；**最近会话** 按接受时间倒序展示插件创建的全部会话，分页加载（首页 30 条，**加载更多** 追加，打开该 Tab 期间每 10 秒静默刷新已加载范围），每行带执行状态、闭环标签与自动/手动来源，可点 **归档 / 取消归档** 快捷切换（仍执行中的会话不可归档），点击标题回源 GitLab，点击 **打开 Session** 进入对应会话。
+4. 状态栏下方通过 **收件箱 / Todo 列表 / 已处理 / 工作区** Tab 切换：Todo 列表可区域滚动，带有 **评论中 @ 我** 标签的事项会进入自动处理范围；**已处理**（v2.29 起并入原「最近会话」）按活动时刻倒序展示全部处理记录（规则跳过、预检跳过、会话派发与投递中的 pending 都在列，不做任何过滤），默认每页 50 条可加载更多——**有会话的记录**直接带「打开 Session」与「归档 / 取消归档」按钮（仍执行中的会话不可归档），**无会话的记录**（一般是规则/预检判定不需要处理）在行内显示判定理由与被折叠去向，预检结果在此透明可查；打开该 Tab 期间每 10 秒静默刷新已加载范围，点击标题回源 GitLab。
 5. Session 内的 Agent 只有在实际完成后，才会按提示调用 `POST /todos/:id/mark_as_done`。
 
 ## 内置轮询与识别规则
@@ -229,3 +229,4 @@ MIT License。发布到 npm（`npm publish`，scoped 包需公开访问，`publi
 - v2.25（状态版本不变）：修复预检/批量预检在 DeepSeek Messages 协议路由下`message.content`为字符串导致`content.some is not a function`的错误——把 `messages[].content` 改为 block 数组 `[{type:'text',text:'...'}]`。
 - v2.27（状态版本不变，纯结构重构）：`index.js` 巨型类按域拆分为 `host/` 下七个模块——`gitlab.js`（glab 子进程/Todo 分页/标记完成）、`precheck.js`（LLM 预检）、`slots.js`（并发槽/会话跟踪/对账结算）、`closures.js`（闭环裁决/归档/回复核对）、`followups.js`（MR 监视/等待探测/到期入队）、`dispatch.js`（派发管线/路由/手动动作）、`constants.js`+`util.js`（共享常量与工具）。方法体逐字搬迁、行为零变化；模块以 `attachRuntimeMethods` 挂到运行时原型，同名冲突在加载期即报错。
 - v2.28（状态版本不变）：**预检引擎可配置**，新增 `precheckEngine`（auto/jev/llm）。auto（默认）优先用 **Jev/System One 决策模型**判定——返回带概率的结构化答案而不是生成文本，判定字段映射：needsProcessing→noul、跳过理由→choice 枚举（固定文案）、priority→score(1..5)、preferSession→choice、批内去重→同目标成对 match。P(needs) 落入 0.35–0.65 不确定带的条目自动交给 LLM 复核；Jev 整体不可用或单条判定失败时 auto 自动回退/补齐 LLM 路径，`jev` 严格模式不可用则跳过本轮。分类器通道按序：宿主 llm.classify（未来 DSH 版本）→ PATH 上的 `jev` CLI（读 jevctl 凭证）→ System One HTTP 直连（api.typesafe.ai/OpenRouter/自建兼容端，凭证链：设置 apiKey → 环境变量 → `~/.config/jev/credentials.json`）。新模块 `host/precheck-jev.js`；`mapLimit` 移入 `host/util.js` 复用。
+- v2.29（状态版本不变）：**「最近会话」Tab 并入「已处理」**。两 Tab 数据同源（handled+pending 中带 sessionId 的记录），合并后：有会话的已处理行直接带「打开 Session」「归档/取消归档」按钮（原会话 Tab 的动作与条件全部保留）；无会话的行（规则/预检跳过）行内展示判定理由 skipReason 与折叠去向 mergedInto。删除 `sessionPage`/`sessionProjection` 与 bridge `sessions` action；`handledProjection` 补 `archiveError/waitProbes/replied` 字段。默认 50 条/页、加载更多不变。
